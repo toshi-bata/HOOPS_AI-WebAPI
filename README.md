@@ -24,7 +24,7 @@ See [mcp_server/README.md](mcp_server/README.md) for setup and usage.
 
 1. Start the WebAPI server:
 ```
-C:\Users\toshi\miniconda3\envs\hoops_ai_cpu39\python.exe -m uvicorn main:app --host 127.0.0.1 --port 8001
+C:\Users\user_name\miniconda3\envs\hoops_ai_cpu\python.exe -m uvicorn main:app --host 127.0.0.1 --port 8001
 ```
 *(run from the `webapi/` directory)*
 
