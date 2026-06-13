@@ -428,3 +428,19 @@ def create_CAD_viewer(cad_file_path: pathlib.Path) -> str:
 
     CAD_viewers.append(viewer)
     return viewer_url
+
+
+def terminate_CAD_viewer(terminate_all: bool = False) -> dict[str, Any]:
+    if not CAD_viewers:
+        raise RuntimeError("No active CAD viewer.")
+
+    if terminate_all:
+        count = len(CAD_viewers)
+        for viewer in CAD_viewers:
+            viewer.terminate()
+        CAD_viewers.clear()
+        return {"terminated": count}
+    else:
+        viewer = CAD_viewers.pop()
+        viewer.terminate()
+        return {"terminated": 1}

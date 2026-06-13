@@ -286,6 +286,33 @@ Open the returned `viewer_url` in your browser to view the model.
 
 ---
 
+#### CAD Viewer — Terminate
+
+Terminate the last active viewer, or all viewers.
+
+```
+DELETE /CAD/viewer
+DELETE /CAD/viewer?all=true
+```
+
+**Example:**
+
+```powershell
+# Terminate last viewer
+Invoke-RestMethod -Method Delete -Uri "http://127.0.0.1:8001/CAD/viewer"
+
+# Terminate all viewers
+Invoke-RestMethod -Method Delete -Uri "http://127.0.0.1:8001/CAD/viewer?all=true"
+```
+
+**Response:**
+
+```json
+{ "terminated": 1 }
+```
+
+---
+
 ### Running tests
 
 ```bash
@@ -335,6 +362,7 @@ The MCP server connects Claude Desktop to the HOOPS AI WebAPI.
 | `get_MFR_file_thumbnail` | Download the thumbnail PNG for a file ID, returns base64-encoded PNG |
 | `run_MFR_inference` | Run MFR inference on a local CAD file, launches viewer, returns predictions + viewer_url |
 | `colorize_MFR_viewer` | Apply MFR prediction colors to the last active viewer, returns color_map |
+| `terminate_CAD_viewer` | Terminate the last (or all) active CAD viewer(s) |
 
 ---
 

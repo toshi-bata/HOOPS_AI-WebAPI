@@ -4,7 +4,7 @@ from mcp.server.fastmcp import FastMCP
 
 API_BASE = "http://127.0.0.1:8001"
 
-mcp = FastMCP("HOOPS AI MCP Server", version="0.1")
+mcp = FastMCP("HOOPS AI MCP Server")
 
 @mcp.tool()
 def open_cad_viewer(cad_file_path: str) -> str:
@@ -105,6 +105,20 @@ def colorize_MFR_viewer() -> dict:
     Returns color_map: {label_id: {name, color_rgb}}.
     """
     response = httpx.post(f"{API_BASE}/MFR/viewer/colorize", timeout=120)
+    response.raise_for_status()
+    return response.json()
+
+
+@mcp.tool()
+def terminate_CAD_viewer(terminate_all: bool = False) -> dict:
+    """
+    Terminate the CAD viewer.
+    - terminate_all=False (default): terminate only the last active viewer.
+    - terminate_all=True: terminate all active viewers.
+    Returns the number of viewers terminated.
+    """
+    params = {"all": "true"} if terminate_all else {}
+    response = httpx.delete(f"{API_BASE}/CAD/viewer", params=params, timeout=30)
     response.raise_for_status()
     return response.json()
 

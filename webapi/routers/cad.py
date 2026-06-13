@@ -50,6 +50,16 @@ def CAD_viewer(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"CADViewer failed: {exc}") from exc
 
 
+@router.delete("/viewer")
+def CAD_viewer_terminate(all: bool = False):
+    try:
+        return core.terminate_CAD_viewer(terminate_all=all)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Terminate failed: {exc}") from exc
+
+
 @router.post("/viewer/from-path")
 def CAD_viewer_from_path(cad_file_path: str = Form(...)):
     try:
