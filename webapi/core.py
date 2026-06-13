@@ -50,6 +50,7 @@ DEFAULT_MFR_LABELS_DESCRIPTION: dict[int, dict[str, str]] = {
 }
 
 MFR_dataset_explorer = None
+MFR_inference_model = None
 CAD_viewers: list[Any] = []
 
 
@@ -58,6 +59,13 @@ def get_MFR_dataset_explorer():
     if MFR_dataset_explorer is None:
         MFR_dataset_explorer = create_MFR_dataset_explorer()
     return MFR_dataset_explorer
+
+
+def get_MFR_inference_model():
+    global MFR_inference_model
+    if MFR_inference_model is None:
+        MFR_inference_model = create_MFR_inference_model()
+    return MFR_inference_model
 
 
 def _json_safe(value: Any) -> Any:
@@ -241,6 +249,27 @@ def create_MFR_dataset_explorer():
         parquet_file_attribs=str(flow_root_dir.joinpath(f"{MFR_flow_name}.attribset")),
         dask_client_params={"processes": False},
     )
+
+
+def create_MFR_inference_model():
+    from hoops_ai.cadaccess import HOOPSLoader
+    from hoops_ai.ml.EXPERIMENTAL import FlowInference, GraphNodeClassification
+
+    load_env_file()
+
+    notebooks_dir = pathlib.Path(get_required_env("HOOPS_AI_NOTEBOOK_DIR"))
+    model_name = get_required_env("HOOPS_AI_MFR_MODEL_NAME")
+    trained_model = notebooks_dir.parent.joinpath("packages", "trained_ml_models", model_name)
+    output_dir = notebooks_dir.joinpath("out")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    loader = HOOPSLoader()
+    inference_model = FlowInference(
+        cad_loader=loader,
+        flowmodel=GraphNodeClassification(result_dir=str(output_dir)),
+    )
+    inference_model.load_from_checkpoint(trained_model)
+    return inference_model
 
 
 def search_MFR_files(feature_name: str) -> dict[str, Any]:

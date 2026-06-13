@@ -59,6 +59,7 @@ Open `.env` and set each variable:
 | `HOOPS_AI_LICENSE` | ✅ | Your HOOPS AI license key |
 | `HOOPS_AI_NOTEBOOK_DIR` | ✅ | Absolute path to your HOOPS AI notebooks directory |
 | `HOOPS_AI_MFR_FLOW_NAME` | ✅ | MFR flow name (dataset files are resolved relative to this) |
+| `HOOPS_AI_MFR_MODEL_NAME` | ✅ | MFR trained model checkpoint filename (e.g. `ts3d_162k_mfr.ckpt`) |
 | `HOOPS_AI_CAD_SHARED_DIR` | optional | Shared folder for CAD files (defaults to `./uploads`) |
 | `HOOPS_AI_MFR_LABELS_DESCRIPTION` | optional | Custom MFR label map (Python dict literal) |
 
