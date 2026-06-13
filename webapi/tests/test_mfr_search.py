@@ -36,7 +36,7 @@ class FakeDatasetExplorer:
 
 class MFRSearchTests(unittest.TestCase):
     def test_search_MFR_files_returns_file_names_and_list_for_feature_name(self):
-        with patch.object(core, "MFR_dataset_explorer", FakeDatasetExplorer()):
+        with patch.object(core, "get_MFR_dataset_explorer", return_value=FakeDatasetExplorer()):
             result = core.search_MFR_files("circular blind step")
 
         self.assertEqual(result["file_names"], ["bracket_a.stp", "housing_b.stp"])

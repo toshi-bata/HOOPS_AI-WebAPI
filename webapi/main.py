@@ -10,9 +10,9 @@ from routers import cad, mfr
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    core.MFR_dataset_explorer = core.create_MFR_dataset_explorer()
+    core.init_hoops_license()
     yield
-    if hasattr(core.MFR_dataset_explorer, "close"):
+    if core.MFR_dataset_explorer is not None and hasattr(core.MFR_dataset_explorer, "close"):
         core.MFR_dataset_explorer.close()
 
 

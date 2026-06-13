@@ -53,6 +53,13 @@ MFR_dataset_explorer = None
 CAD_viewers: list[Any] = []
 
 
+def get_MFR_dataset_explorer():
+    global MFR_dataset_explorer
+    if MFR_dataset_explorer is None:
+        MFR_dataset_explorer = create_MFR_dataset_explorer()
+    return MFR_dataset_explorer
+
+
 def _json_safe(value: Any) -> Any:
     if isinstance(value, dict):
         return {str(_json_safe(key)): _json_safe(item) for key, item in value.items()}
@@ -211,16 +218,18 @@ def import_MFR_dataset_explorer():
         ssl.SSLContext.load_default_certs = original_load_default_certs
 
 
-def create_MFR_dataset_explorer():
+def init_hoops_license() -> None:
     import hoops_ai
 
     load_env_file()
+    license_key = get_required_file_env("HOOPS_AI_LICENSE")
+    hoops_ai.set_license(license_key, validate=True)
+
+
+def create_MFR_dataset_explorer():
+    load_env_file()
 
     DatasetExplorer = import_MFR_dataset_explorer()
-
-    license_key = get_required_file_env("HOOPS_AI_LICENSE")
-
-    hoops_ai.set_license(license_key, validate=True)
 
     notebooks_dir = pathlib.Path(get_required_env("HOOPS_AI_NOTEBOOK_DIR"))
     MFR_flow_name = get_required_env("HOOPS_AI_MFR_FLOW_NAME")
@@ -235,13 +244,12 @@ def create_MFR_dataset_explorer():
 
 
 def search_MFR_files(feature_name: str) -> dict[str, Any]:
-    if MFR_dataset_explorer is None:
-        raise RuntimeError("DatasetExplorer is not initialized.")
+    explorer = get_MFR_dataset_explorer()
 
     face_label = get_MFR_face_labels(feature_name)
     label_matches = lambda ds: ds["face_labels"] == face_label
-    file_ids = MFR_dataset_explorer.get_file_list(group="Labels", where=label_matches)
-    file_info = MFR_dataset_explorer.get_file_info_all()
+    file_ids = explorer.get_file_list(group="Labels", where=label_matches)
+    file_info = explorer.get_file_info_all()
     file_names_by_id = dict(zip(file_info["id"].astype(str), file_info["description"]))
 
     matched: list[tuple[int, str]] = [
@@ -256,12 +264,9 @@ def search_MFR_files(feature_name: str) -> dict[str, Any]:
 
 
 def get_MFR_file_thumbnail(file_id: int) -> bytes:
-    if MFR_dataset_explorer is None:
-        raise RuntimeError("DatasetExplorer is not initialized.")
-
     from hoops_ai.insights import DatasetViewer
 
-    dataset_viewer = DatasetViewer.from_explorer(MFR_dataset_explorer)
+    dataset_viewer = DatasetViewer.from_explorer(get_MFR_dataset_explorer())
     fig = dataset_viewer.show_preview_as_image(
         [file_id],
         k=1,
@@ -277,12 +282,11 @@ def get_MFR_file_thumbnail(file_id: int) -> bytes:
 
 
 def get_MFR_table_of_contents() -> dict[str, Any]:
-    if MFR_dataset_explorer is None:
-        raise RuntimeError("DatasetExplorer is not initialized.")
+    explorer = get_MFR_dataset_explorer()
 
     output = io.StringIO()
     with redirect_stdout(output):
-        result = MFR_dataset_explorer.print_table_of_contents()
+        result = explorer.print_table_of_contents()
 
     response: dict[str, Any] = {"table_of_contents": output.getvalue()}
     if result is not None:
