@@ -152,5 +152,27 @@ def get_brep_adjacency_graph(cad_file_path: str) -> dict:
     return response.json()
 
 
+@mcp.tool()
+def get_brep_attributes(cad_file_path: str) -> dict:
+    """
+    Extract face and edge attributes from the B-rep model of a local CAD file.
+    Returns:
+    - faces: types, areas, centroids, loops, types_description
+    - edges: types, lengths, dihedrals, convexities, types_description
+    """
+    source_path = Path(cad_file_path).expanduser().resolve()
+    if not source_path.exists():
+        raise FileNotFoundError(f"CAD file not found: {source_path}")
+
+    with source_path.open("rb") as f:
+        response = httpx.post(
+            f"{API_BASE}/BRep/attributes",
+            files={"file": (source_path.name, f, "application/octet-stream")},
+            timeout=120,
+        )
+    response.raise_for_status()
+    return response.json()
+
+
 if __name__ == "__main__":
     mcp.run(transport="stdio")

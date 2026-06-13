@@ -346,6 +346,38 @@ curl.exe -X POST "http://127.0.0.1:8001/BRep/adjacency-graph" `
 
 ---
 
+#### B-Rep — Face and edge attributes
+
+Extract face and edge attributes from the B-rep model of a CAD file.
+
+```
+POST /BRep/attributes
+```
+
+**Example:**
+
+```powershell
+curl.exe -X POST "http://127.0.0.1:8001/BRep/attributes" `
+    -F "file=@C:\path\to\model.SLDPRT"
+```
+
+**Response:**
+
+```json
+{
+  "faces": {
+    "types": [...], "areas": [...], "centroids": [...],
+    "loops": [...], "types_description": {...}
+  },
+  "edges": {
+    "types": [...], "lengths": [...], "dihedrals": [...],
+    "convexities": [...], "types_description": {...}
+  }
+}
+```
+
+---
+
 ### Running tests
 
 ```bash
@@ -397,6 +429,7 @@ The MCP server connects Claude Desktop to the HOOPS AI WebAPI.
 | `colorize_MFR_viewer` | Apply MFR prediction colors to the last active viewer, returns color_map |
 | `terminate_CAD_viewer` | Terminate the last (or all) active CAD viewer(s) |
 | `get_brep_adjacency_graph` | Build B-rep face adjacency graph, returns graph data and base64 PNG |
+| `get_brep_attributes` | Extract B-rep face and edge attributes (types, areas, lengths, etc.) |
 
 ---
 

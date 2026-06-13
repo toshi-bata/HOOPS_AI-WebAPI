@@ -488,3 +488,36 @@ def build_brep_adjacency_graph(cad_file_path: pathlib.Path) -> dict[str, Any]:
         "graph": graph_data,
         "graph_image": graph_image_b64,
     }
+
+
+def get_brep_attributes(cad_file_path: pathlib.Path) -> dict[str, Any]:
+    from hoops_ai.cadaccess import HOOPSLoader, HOOPSTools
+    from hoops_ai.cadencoder import BrepEncoder
+
+    cad_loader = HOOPSLoader()
+    cad_model = cad_loader.create_from_file(str(cad_file_path))
+
+    hoopstools = HOOPSTools()
+    hoopstools.adapt_brep(cad_model)
+
+    brep_encoder = BrepEncoder(cad_model.get_brep())
+
+    [face_types, face_areas, face_centroids, face_loops], face_types_descr = brep_encoder.push_face_attributes()
+    [edge_types, edge_lengths, edge_dihedrals, edge_convexities], edge_types_descr = brep_encoder.push_edge_attributes()
+
+    return {
+        "faces": {
+            "types": _json_safe(face_types),
+            "areas": _json_safe(face_areas),
+            "centroids": _json_safe(face_centroids),
+            "loops": _json_safe(face_loops),
+            "types_description": _json_safe(face_types_descr),
+        },
+        "edges": {
+            "types": _json_safe(edge_types),
+            "lengths": _json_safe(edge_lengths),
+            "dihedrals": _json_safe(edge_dihedrals),
+            "convexities": _json_safe(edge_convexities),
+            "types_description": _json_safe(edge_types_descr),
+        },
+    }
