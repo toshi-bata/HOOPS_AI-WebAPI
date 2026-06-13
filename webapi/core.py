@@ -292,6 +292,16 @@ def search_MFR_files(feature_name: str) -> dict[str, Any]:
     }
 
 
+def run_MFR_inference(cad_file_path: pathlib.Path) -> dict[str, Any]:
+    inference_model = get_MFR_inference_model()
+    ml_input = inference_model.preprocess(str(cad_file_path))
+    predictions, probabilities = inference_model.predict_and_postprocess(ml_input)
+    return {
+        "predictions": _json_safe(predictions),
+        "probabilities": _json_safe(probabilities),
+    }
+
+
 def get_MFR_file_thumbnail(file_id: int) -> bytes:
     from hoops_ai.insights import DatasetViewer
 

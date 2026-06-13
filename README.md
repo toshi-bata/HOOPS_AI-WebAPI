@@ -171,6 +171,32 @@ curl.exe "http://127.0.0.1:8001/MFR/dataset/table-of-contents"
 
 ---
 
+#### MFR — Inference
+
+Upload a CAD file and run MFR inference. Returns predicted feature labels and their probabilities.
+
+```
+POST /MFR/inference
+```
+
+**Example:**
+
+```powershell
+curl.exe -X POST "http://127.0.0.1:8001/MFR/inference" `
+    -F "file=@C:\path\to\model.SLDPRT"
+```
+
+**Response:**
+
+```json
+{
+  "predictions": [...],
+  "probabilities": [...]
+}
+```
+
+---
+
 #### CAD Viewer — Browser UI
 
 Open the browser and navigate to:
@@ -277,6 +303,7 @@ The MCP server connects Claude Desktop to the HOOPS AI WebAPI.
 | `get_MFR_labels_description` | List all MFR label IDs, names, and descriptions |
 | `search_MFR_files` | Find CAD files that contain a given manufacturing feature |
 | `get_MFR_file_thumbnail` | Download the thumbnail PNG for a file ID, returns base64-encoded PNG |
+| `run_MFR_inference` | Run MFR inference on a local CAD file, returns predictions and probabilities |
 
 ---
 

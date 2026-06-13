@@ -1,7 +1,7 @@
 import io
 
 import core
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
 
 router = APIRouter(prefix="/MFR", tags=["MFR"])
@@ -38,5 +38,19 @@ def MFR_file_thumbnail(file_id: int):
         return StreamingResponse(io.BytesIO(png_bytes), media_type="image/png")
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/inference")
+def MFR_inference(file: UploadFile = File(...)):
+    try:
+        cad_file_path = core.save_uploaded_CAD_file(file)
+        try:
+            return core.run_MFR_inference(cad_file_path)
+        finally:
+            cad_file_path.unlink(missing_ok=True)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Inference failed: {exc}") from exc
 
 

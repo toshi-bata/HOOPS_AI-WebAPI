@@ -78,5 +78,25 @@ def get_MFR_file_thumbnail(file_id: int) -> str:
     return base64.b64encode(response.content).decode("utf-8")
 
 
+@mcp.tool()
+def run_MFR_inference(cad_file_path: str) -> dict:
+    """
+    Run MFR inference on a local CAD file.
+    Uploads the file to the server and returns predictions and probabilities arrays.
+    """
+    source_path = Path(cad_file_path).expanduser().resolve()
+    if not source_path.exists():
+        raise FileNotFoundError(f"CAD file not found: {source_path}")
+
+    with source_path.open("rb") as f:
+        response = httpx.post(
+            f"{API_BASE}/MFR/inference",
+            files={"file": (source_path.name, f, "application/octet-stream")},
+            timeout=300,
+        )
+    response.raise_for_status()
+    return response.json()
+
+
 if __name__ == "__main__":
     mcp.run(transport="stdio")
