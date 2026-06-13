@@ -35,9 +35,7 @@ def open_cad_viewer(cad_file_path: str) -> str:
 
 @mcp.tool()
 def get_MFR_table_of_contents():
-    """
-    HOOPS AIサーバーのManufacturing Feature Recognition (MFR) データベースの目次を取得する。
-    """
+    """Return a summary table of contents for the MFR dataset."""
 
     response = httpx.get(f"{API_BASE}/MFR/dataset/table-of-contents")
     return response.json()
