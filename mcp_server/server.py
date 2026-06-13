@@ -4,7 +4,7 @@ from mcp.server.fastmcp import FastMCP
 
 API_BASE = "http://127.0.0.1:8001"
 
-mcp = FastMCP("HOOPS AIサーバー")
+mcp = FastMCP("HOOPS AI MCP Server", version="0.1")
 
 @mcp.tool()
 def open_cad_viewer(cad_file_path: str) -> str:
