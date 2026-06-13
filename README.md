@@ -113,7 +113,8 @@ curl.exe "http://127.0.0.1:8001/MFR/files/search?feature_name=circular%20blind%2
 
 ```json
 {
-  "file_names": ["bracket_a.stp", "housing_b.stp"]
+  "file_names": ["bracket_a.stp", "housing_b.stp"],
+  "file_list": [1, 3]
 }
 ```
 

@@ -234,7 +234,7 @@ def create_MFR_dataset_explorer():
     )
 
 
-def search_MFR_file_names(feature_name: str) -> list[Any]:
+def search_MFR_files(feature_name: str) -> dict[str, Any]:
     if MFR_dataset_explorer is None:
         raise RuntimeError("DatasetExplorer is not initialized.")
 
@@ -243,11 +243,16 @@ def search_MFR_file_names(feature_name: str) -> list[Any]:
     file_ids = MFR_dataset_explorer.get_file_list(group="Labels", where=label_matches)
     file_info = MFR_dataset_explorer.get_file_info_all()
     file_names_by_id = dict(zip(file_info["id"].astype(str), file_info["description"]))
-    return [
-        _json_safe(file_names_by_id[str(_json_safe(file_id))])
+
+    matched: list[tuple[int, str]] = [
+        (int(_json_safe(file_id)), _json_safe(file_names_by_id[str(_json_safe(file_id))]))
         for file_id in file_ids
         if str(_json_safe(file_id)) in file_names_by_id
     ]
+    return {
+        "file_names": [name for _, name in matched],
+        "file_list": [fid for fid, _ in matched],
+    }
 
 
 def get_MFR_table_of_contents() -> dict[str, Any]:

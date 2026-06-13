@@ -52,7 +52,8 @@ def search_MFR_files(
         feature_name: str,
     ):
     """
-    Return CAD file names that contain the requested MFR feature name.
+    Return CAD file names and file IDs that contain the requested MFR feature name.
+    Response includes file_names (list of strings) and file_list (list of int file IDs).
     """
 
     params = {}

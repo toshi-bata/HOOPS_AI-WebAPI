@@ -7,7 +7,7 @@ router = APIRouter(prefix="/MFR", tags=["MFR"])
 @router.get("/files/search")
 def MFR_search_files(feature_name: str = Query(..., description="MFR feature name to search for.")):
     try:
-        return {"file_names": core.search_MFR_file_names(feature_name)}
+        return core.search_MFR_files(feature_name)
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 

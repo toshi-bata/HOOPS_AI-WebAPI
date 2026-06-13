@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 
-import main
+import core
 
 
 class FakeColumn(list):
@@ -35,11 +35,12 @@ class FakeDatasetExplorer:
 
 
 class MFRSearchTests(unittest.TestCase):
-    def test_search_MFR_file_names_returns_file_names_for_feature_name(self):
-        with patch.object(main, "MFR_dataset_explorer", FakeDatasetExplorer()):
-            file_names = main.search_MFR_file_names("circular blind step")
+    def test_search_MFR_files_returns_file_names_and_list_for_feature_name(self):
+        with patch.object(core, "MFR_dataset_explorer", FakeDatasetExplorer()):
+            result = core.search_MFR_files("circular blind step")
 
-        self.assertEqual(file_names, ["bracket_a.stp", "housing_b.stp"])
+        self.assertEqual(result["file_names"], ["bracket_a.stp", "housing_b.stp"])
+        self.assertEqual(result["file_list"], [101, 202])
 
 
 if __name__ == "__main__":
