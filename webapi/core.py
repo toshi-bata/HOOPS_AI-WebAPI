@@ -51,6 +51,7 @@ DEFAULT_MFR_LABELS_DESCRIPTION: dict[int, dict[str, str]] = {
 
 MFR_dataset_explorer = None
 MFR_inference_model = None
+MFR_last_predictions: list[Any] = []
 CAD_viewers: list[Any] = []
 
 
@@ -293,20 +294,61 @@ def search_MFR_files(feature_name: str) -> dict[str, Any]:
 
 
 def run_MFR_inference(cad_file_path: pathlib.Path) -> dict[str, Any]:
+    global MFR_last_predictions
+
     inference_model = get_MFR_inference_model()
     ml_input = inference_model.preprocess(str(cad_file_path))
     predictions, probabilities = inference_model.predict_and_postprocess(ml_input)
 
+    MFR_last_predictions = _json_safe(predictions)
+
+    viewer_url = None
     try:
         viewer_url = create_CAD_viewer(cad_file_path)
     except Exception:
-        viewer_url = None
+        pass
 
     return {
         "predictions": _json_safe(predictions),
         "probabilities": _json_safe(probabilities),
         "viewer_url": viewer_url,
     }
+
+
+def colorize_MFR_viewer() -> dict[str, Any]:
+    import hoops_ai.insights.utils
+    from hoops_ai.insights.utils import ColorPalette
+
+    if not CAD_viewers:
+        raise RuntimeError("No active CAD viewer.")
+    if not MFR_last_predictions:
+        raise RuntimeError("No inference results available. Run inference first.")
+
+    labels_description = get_MFR_labels_description()
+    color_palette = ColorPalette.from_labels(
+        labels_description,
+        reserved_colors={0: (200, 200, 200)},
+    )
+
+    viewer = CAD_viewers[-1]
+    import numpy as np
+    predictions_array = np.array(MFR_last_predictions)
+    face_groups = hoops_ai.insights.utils.group_predictions_by_label(
+        predictions_array, color_palette, exclude_labels={}
+    )
+    viewer.color_faces_by_groups(face_groups, delay=0.5, verbose=True)
+    all_zero_faces = [i for i, v in enumerate(MFR_last_predictions) if v == 0]
+    if all_zero_faces:
+        viewer.set_face_color(all_zero_faces, [255, 255, 255])
+
+    color_map = {
+        str(label_id): {
+            "name": info["name"],
+            "color_rgb": list(color_palette.get_color(label_id)),
+        }
+        for label_id, info in labels_description.items()
+    }
+    return {"color_map": color_map}
 
 
 def get_MFR_file_thumbnail(file_id: int) -> bytes:

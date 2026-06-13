@@ -81,8 +81,9 @@ def get_MFR_file_thumbnail(file_id: int) -> str:
 @mcp.tool()
 def run_MFR_inference(cad_file_path: str) -> dict:
     """
-    Run MFR inference on a local CAD file.
-    Uploads the file to the server and returns predictions and probabilities arrays.
+    Run MFR inference on a local CAD file and launch the CAD viewer.
+    Uploads the file to the server and returns predictions, probabilities, and viewer_url.
+    Call colorize_MFR_viewer() after the viewer has loaded to apply face colors.
     """
     source_path = Path(cad_file_path).expanduser().resolve()
     if not source_path.exists():
@@ -94,6 +95,18 @@ def run_MFR_inference(cad_file_path: str) -> dict:
             files={"file": (source_path.name, f, "application/octet-stream")},
             timeout=300,
         )
+    response.raise_for_status()
+    return response.json()
+
+
+@mcp.tool()
+def colorize_MFR_viewer() -> dict:
+    """
+    Apply MFR prediction colors to the last active CAD viewer.
+    Must be called after run_MFR_inference() and after the viewer has fully loaded.
+    Returns color_map: {label_id: {name, color_rgb}}.
+    """
+    response = httpx.post(f"{API_BASE}/MFR/viewer/colorize", timeout=120)
     response.raise_for_status()
     return response.json()
 

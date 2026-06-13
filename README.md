@@ -78,12 +78,14 @@ HOOPS_AI_MFR_FLOW_NAME=cadsynth_1000
 Run the following from the `webapi/` directory using the Python executable from your HOOPS AI conda environment:
 
 ```bash
+cd webapi
 C:\Users\user_name\miniconda3\envs\hoops_ai_cpu\python.exe -m uvicorn main:app --host 127.0.0.1 --port 8001
 ```
 
 For development with auto-reload:
 
 ```bash
+cd webapi
 C:\Users\user_name\miniconda3\envs\hoops_ai_cpu\python.exe -m uvicorn main:app --host 127.0.0.1 --port 8001 --reload
 ```
 
@@ -173,7 +175,7 @@ curl.exe "http://127.0.0.1:8001/MFR/dataset/table-of-contents"
 
 #### MFR — Inference
 
-Upload a CAD file and run MFR inference. Returns predicted feature labels and their probabilities.
+Upload a CAD file and run MFR inference. Launches the CAD viewer and returns predictions, probabilities, and viewer_url.
 
 ```
 POST /MFR/inference
@@ -193,6 +195,33 @@ curl.exe -X POST "http://127.0.0.1:8001/MFR/inference" `
   "predictions": [...],
   "probabilities": [...],
   "viewer_url": "http://127.0.0.1:<viewer_port>/index.html"
+}
+```
+
+---
+
+#### MFR — Colorize viewer
+
+Apply MFR prediction colors to the last active CAD viewer. Call this after the viewer has fully loaded.
+
+```
+POST /MFR/viewer/colorize
+```
+
+**Example:**
+
+```powershell
+Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8001/MFR/viewer/colorize"
+```
+
+**Response:**
+
+```json
+{
+  "color_map": {
+    "17": {"name": "through hole", "color_rgb": [255, 0, 0]},
+    "18": {"name": "circular blind step", "color_rgb": [0, 255, 0]}
+  }
 }
 ```
 
@@ -304,7 +333,8 @@ The MCP server connects Claude Desktop to the HOOPS AI WebAPI.
 | `get_MFR_labels_description` | List all MFR label IDs, names, and descriptions |
 | `search_MFR_files` | Find CAD files that contain a given manufacturing feature |
 | `get_MFR_file_thumbnail` | Download the thumbnail PNG for a file ID, returns base64-encoded PNG |
-| `run_MFR_inference` | Run MFR inference on a local CAD file, returns predictions and probabilities |
+| `run_MFR_inference` | Run MFR inference on a local CAD file, launches viewer, returns predictions + viewer_url |
+| `colorize_MFR_viewer` | Apply MFR prediction colors to the last active viewer, returns color_map |
 
 ---
 
