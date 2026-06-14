@@ -318,6 +318,9 @@ def load_shape_index():
 
 
 def search_by_shape(cad_file_path: pathlib.Path, top_k: int = 10) -> dict[str, Any]:
+    import matplotlib.pyplot as plt
+    from hoops_ai.insights import DatasetViewer
+
     get_shape_index()  # ensure FAISS index is loaded into the searcher
     searcher = get_cad_searcher()
     hits = searcher.search_by_shape(str(cad_file_path), top_k=top_k)
@@ -325,7 +328,18 @@ def search_by_shape(cad_file_path: pathlib.Path, top_k: int = 10) -> dict[str, A
         {"id": _json_safe(hit.id), "score": _json_safe(hit.score)}
         for hit in hits[0]
     ]
-    return {"hits": results, "count": len(results)}
+
+    ds_viewer = DatasetViewer([], [], [], reference_dir=CAD_VIEWER_OUTPUT_DIR)
+    fig = ds_viewer.show_search_results(hits, query_file=str(cad_file_path), grid_cols=3)
+    if fig is None:
+        fig = plt.gcf()
+    image_filename = f"{uuid.uuid4()}.png"
+    image_path = CAD_VIEWER_OUTPUT_DIR / image_filename
+    CAD_VIEWER_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    fig.savefig(str(image_path), format="png", bbox_inches="tight")
+    plt.close(fig)
+
+    return {"hits": results, "count": len(results), "image_url": f"/out/{image_filename}"}
 
 
 def search_MFR_files(feature_name: str) -> dict[str, Any]:

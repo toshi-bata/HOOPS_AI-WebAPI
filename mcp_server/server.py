@@ -180,6 +180,8 @@ def search_similar_shapes(cad_file_path: str, top_k: int = 10) -> dict:
     Search for similar CAD shapes using HOOPS Embeddings and a FAISS index.
     Uploads a local CAD file and returns the top-k most similar shapes from the indexed database.
     Each hit contains an id (file identifier in the database) and a similarity score.
+    Also returns image_url: a URL path to a PNG grid image of the search results
+    (e.g. http://127.0.0.1:8001/out/<uuid>.png).
     """
     source_path = Path(cad_file_path).expanduser().resolve()
     if not source_path.exists():
