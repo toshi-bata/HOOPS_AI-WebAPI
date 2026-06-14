@@ -50,14 +50,20 @@ Let's go ahead and access HOOPS AI from Claude Desktop.
 
 Let's ask: "Hello HOOPS AI, what can you do?" Claude accesses HOOPS AI via MCP and summarizes the information it retrieves.
 
-It looks like CAD viewing is available, so let's have it display a CAD file. The file is uploaded to the server and the viewer is launched. When the viewer starts, a URL is returned — opening that link displays the 3D model in the browser.
+It looks like CAD viewing is available, so let's have it display a CAD file. (`"C:\temp\helloworld.stp" Please display this CAD file.`)
+The file is uploaded to the server and the viewer is launched. When the viewer starts, a URL is returned — opening that link displays the 3D model in the browser.
 
-B-Rep analysis is also available, so let's have it look into another model. A separate viewer instance is launched. Claude takes the B-Rep data returned by HOOPS AI and presents it in a clear, organized way.
+B-Rep analysis is also available, so let's have it look into another model. (`"C:\temp\Flange287.stp" Please display this model and tell me about it.`)
+A separate viewer instance is launched. Claude takes the B-Rep data returned by HOOPS AI and presents it in a clear, organized way.
 
-Next, let's have it run manufacturing feature recognition, then launch the viewer and colorize the model by feature type. Claude also generates a color legend to make the results easy to understand.
+Let's ask for an overview of the manufacturing feature recognition dataset. (`Tell me about the manufacturing feature recognition dataset.`)
+HOOPS AI returns the data in a complex JSON format, but Claude summarizes it clearly.
 
-Let's ask for an overview of the manufacturing feature recognition dataset. HOOPS AI returns the data in a complex JSON format, but Claude summarizes it clearly.
+Next, let's have it run manufacturing feature recognition. (`"C:\temp\nist_ftc_06_asme1_rd_sw1802.SLDPRT" Please run manufacturing feature recognition on this model.`)
+Then let's launch the viewer and colorize the model by feature type. (`Please colorize it.`)
+Claude also generates a color legend to make the results easy to understand.
 
-Finally, let's run a shape similarity search. Claude explains the results returned by HOOPS AI in an easy-to-understand way.
+Finally, let's run a shape similarity search. (`"C:\temp\idler_sprocket.step" Please search for similar parts to this component.`)
+Claude explains the results returned by HOOPS AI in an easy-to-understand way.
 
 HOOPS AI — previously operated by AI engineers and data scientists using Python in Jupyter Notebooks — can now be used by anyone, without writing any code, simply by wrapping it in a Web API and exposing it through MCP to AI tools like Claude Desktop. Furthermore, the complex data returned by HOOPS AI is organized and communicated clearly by Claude's AI model, leading to significant improvements in workflow efficiency.
