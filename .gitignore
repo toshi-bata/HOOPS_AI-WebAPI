@@ -5,3 +5,4 @@ __pycache__/
 webapi/uploads/
 webapi/out/
 .venv/
+demo/

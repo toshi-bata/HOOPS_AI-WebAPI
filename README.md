@@ -34,8 +34,7 @@ Claude Desktop  ──(natural language)──▶  MCP Server
 ```
 HOOPS_AI-MCP/
 ├── webapi/         # FastAPI REST API  →  see webapi/README.md
-├── mcp_server/     # MCP server for Claude Desktop  →  see mcp_server/README.md
-└── demo/           # Demo slides and narration scripts
+└── mcp_server/     # MCP server for Claude Desktop  →  see mcp_server/README.md
 ```
 
 ---
@@ -82,26 +81,6 @@ Register the MCP server in `claude_desktop_config.json`:
   }
 }
 ```
-
----
-
-## Demo
-
-A slide deck and narration scripts are included in the [`demo/`](demo/) folder:
-
-- [`demo/narration_en.md`](demo/narration_en.md) — English narration
-- [`demo/narration_ja.md`](demo/narration_ja.md) — Japanese narration
-- [`demo/index_en.html`](demo/index_en.html) — English slide deck
-- [`demo/index_jp.html`](demo/index_jp.html) — Japanese slide deck
-
-### What the demo covers
-
-1. Ask Claude what HOOPS AI tools are available
-2. Display a 3D CAD file (`helloworld.stp`) in the browser viewer
-3. Run B-Rep analysis on a flange model and display organized results
-4. Query the MFR dataset overview in natural language
-5. Run MFR inference on a SOLIDWORKS part and colorize by feature type
-6. Perform shape similarity search and review results
 
 ---
 
