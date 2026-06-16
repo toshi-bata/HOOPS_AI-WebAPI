@@ -56,7 +56,6 @@ See **[webapi/README.md](webapi/README.md)** for full instructions.
 cd webapi
 pip install -r requirements.txt
 copy .env.example .env   # then edit .env with your HOOPS AI license key
-cd ..
 C:\Users\<user>\miniconda3\envs\hoops_ai_cpu\python.exe -m uvicorn main:app --host 127.0.0.1 --port 8001
 ```
 
