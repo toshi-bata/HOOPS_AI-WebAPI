@@ -12,19 +12,19 @@ It offers four key capabilities: native loading of 30+ formats in a Python envir
 
 ## Slide 2 — Title
 
-In this video, I'd like to introduce "HOOPS AI MCP" — a practical solution for putting HOOPS AI to work. It is a platform for intelligent 3D CAD data analysis, delivering four core capabilities: 3D CAD Viewer, B-Rep Analysis, Manufacturing Feature Recognition, and Shape Similarity Search. These are delivered through a FastAPI REST API wrapped by an MCP Server, enabling Claude Desktop to control everything using natural language.
+In this video, I'd like to introduce "HOOPS AI MCP" — a practical solution for putting HOOPS AI to work. It is a platform for intelligent 3D CAD data analysis, delivering four core capabilities: 3D CAD Viewer, B-Rep Analysis, Manufacturing Feature Recognition, and Shape Similarity Search. These are delivered a REST API using FastAPI, wrapped by an MCP Server, enabling Claude Desktop to control everything using natural language,.
 
 ---
 
 ## Slide 3 — Architecture
 
-The system is organized in four layers. At the foundation is HOOPS AI by Tech Soft 3D, which handles 3D CAD file loading, geometry encoding, and ML inference. On top of that sits the FastAPI WebAPI, which exposes those capabilities as REST endpoints. FastAPI is a high-performance Python web framework that lets us build the Web API while leveraging HOOPS AI's Python API directly — no additional bridge layer required. The MCP Server wraps the WebAPI and acts as a bridge, allowing Claude Desktop to invoke tools using natural language. Finally, Claude Desktop operates as the Chat AI — autonomously calling MCP tools to carry out end-to-end 3D CAD analysis tasks.
+The system is organized in four layers. At the foundation is HOOPS AI by Tech Soft 3D, which handles 3D CAD file loading, geometry encoding, and machine learning inference. On top of that sits the WebAPI using FastAPI, which exposes those capabilities as REST endpoints. FastAPI is a high-performance Python web framework that lets us build the Web API while leveraging HOOPS AI's Python API directly — no additional bridge layer required. The MCP Server wraps the WebAPI and acts as a bridge, allowing Claude Desktop to invoke tools using natural language. Finally, Claude Desktop operates as the Chat AI — autonomously calling MCP tools to carry out end-to-end 3D CAD analysis tasks.
 
 ---
 
 ## Slide 4 — Features
 
-Let me walk through the four features. First, the 3D CAD Viewer renders 30+ formats — including STEP, SolidWorks, CATIA, and NX — interactively in the browser. B-Rep Analysis generates face adjacency graphs and extracts face and edge attributes such as type, area, length, and dihedral angle. MFR uses a trained ML model to automatically recognize 24 machining feature types like holes, slots, and pockets, with results visualized as color overlays in the viewer. Finally, 3D Model Similar Parts Search converts shapes into feature vectors with HOOPS Embeddings and retrieves similar parts at high speed using a FAISS index.
+Let me walk through the four features. First, the 3D CAD Viewer renders 30+ formats — including STEP, SolidWorks, CATIA, and NX — interactively in the browser. B-Rep Analysis generates face adjacency graphs and extracts face and edge attributes such as type, area, length, and dihedral angle. MFR uses a trained machine learning model to automatically recognize 24 machining feature types like holes, slots, and pockets, with results visualized as color overlays in the viewer. Finally, 3D Model Similar Parts Search converts shapes into feature vectors with HOOPS Embeddings and retrieves similar parts at high speed using a FAISS index.
 
 ---
 
