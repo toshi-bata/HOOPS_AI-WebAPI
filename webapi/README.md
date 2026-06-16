@@ -10,6 +10,9 @@ See the root [README](../README.md) for an overview of the full HOOPS AI MCP pla
 - Python 3.9 (recommended: Miniconda/Anaconda environment)
 - A valid **HOOPS AI license key**
 - HOOPS AI Python package (`hoops_ai_cpu` or `hoops_ai_gpu`) installed in the environment
+- **HOOPS AI Tutorials** — the notebooks folder and its contents (ML datasets and pre-trained models) are required to run this server.  
+  The tutorials are available at [github.com/techsoft3d/HOOPS-AI-tutorials](https://github.com/techsoft3d/HOOPS-AI-tutorials/tree/main).  
+  Data packages (datasets and trained model checkpoints) must be obtained from the Tech Soft 3D File Transfer service by following the HOOPS AI installation instructions.
 
 ---
 
