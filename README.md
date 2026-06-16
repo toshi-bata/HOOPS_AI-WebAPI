@@ -1,6 +1,6 @@
 # HOOPS AI MCP
 
-**HOOPS AI MCP** is a platform for intelligent 3D CAD data analysis powered by [HOOPS AI](https://hoops.com/) (Tech Soft 3D). It wraps HOOPS AI capabilities as a FastAPI REST API and exposes them to Claude Desktop via an MCP Server, enabling engineers to perform advanced 3D CAD analysis through natural language — no code required.
+**HOOPS AI MCP** is a platform for intelligent 3D CAD data analysis powered by [HOOPS AI](https://www.techsoft3d.com/developers/products/hoops-ai/) (Tech Soft 3D). It wraps HOOPS AI capabilities as a FastAPI REST API and exposes them to Claude Desktop via an MCP Server, enabling engineers to perform advanced 3D CAD analysis through natural language — no code required.
 
 ## Features
 
@@ -108,5 +108,5 @@ A slide deck and narration scripts are included in the [`demo/`](demo/) folder:
 ## License
 
 This project uses the **HOOPS AI** library. A valid HOOPS AI license is required to run the server.  
-Contact [Tech Soft 3D](https://hoops.com/) for licensing information.
+Contact [Tech Soft 3D](https://www.techsoft3d.com/developers/products/hoops-ai/) for licensing information.
 

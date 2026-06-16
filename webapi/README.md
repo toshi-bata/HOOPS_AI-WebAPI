@@ -1,6 +1,6 @@
 # HOOPS AI WebAPI
 
-A FastAPI-based REST API that exposes [HOOPS AI](https://hoops.com/) (Tech Soft 3D) capabilities as HTTP endpoints.  
+A FastAPI-based REST API that exposes [HOOPS AI](https://www.techsoft3d.com/developers/products/hoops-ai/) (Tech Soft 3D) capabilities as HTTP endpoints.  
 See the root [README](../README.md) for an overview of the full HOOPS AI MCP platform.
 
 ---
