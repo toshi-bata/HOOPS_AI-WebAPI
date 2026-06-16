@@ -82,6 +82,15 @@ Register the MCP server in `claude_desktop_config.json`:
 ```
 
 ---
+
+## Tested Environment
+
+| Component | Version |
+|---|---|
+| HOOPS AI | V1.1 |
+| OS | Windows 11 |
+
+---
 
 ## License
 
