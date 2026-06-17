@@ -1,6 +1,7 @@
 import core
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import HTMLResponse
+from typing import Optional
 
 router = APIRouter(prefix="/CAD", tags=["CAD Viewer"])
 
@@ -40,10 +41,24 @@ def CAD_viewer_upload_page():
 
 
 @router.post("/viewer")
-def CAD_viewer(file: UploadFile = File(...)):
+def CAD_viewer(
+    file: Optional[UploadFile] = File(None),
+    file_id: Optional[str] = Query(None, description="file_id returned by POST /files/upload"),
+):
+    """Open a CAD file in the viewer.
+
+    Supply **either** a file upload *or* a ``file_id`` from a previous upload.
+    """
     try:
-        cad_file_path = core.save_uploaded_CAD_file(file)
+        if file_id:
+            cad_file_path = core.find_persistent_CAD_file(file_id)
+        elif file:
+            _, cad_file_path, _ = core.upload_CAD_file_persistent(file)
+        else:
+            raise HTTPException(status_code=422, detail="Either 'file' or 'file_id' is required.")
         return {"viewer_url": core.create_CAD_viewer(cad_file_path)}
+    except HTTPException:
+        raise
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     except Exception as exc:
@@ -68,3 +83,4 @@ def CAD_viewer_from_path(cad_file_path: str = Form(...)):
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"CADViewer failed: {exc}") from exc
+

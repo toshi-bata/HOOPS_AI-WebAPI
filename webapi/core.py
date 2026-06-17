@@ -1,4 +1,5 @@
 import ast
+import hashlib
 import io
 import os
 import pathlib
@@ -467,6 +468,72 @@ def save_uploaded_CAD_file(upload_file: UploadFile) -> pathlib.Path:
     with cad_file_path.open("wb") as file_object:
         shutil.copyfileobj(upload_file.file, file_object)
     return cad_file_path
+
+
+def upload_CAD_file_persistent(upload_file: UploadFile) -> tuple[str, pathlib.Path, bool]:
+    """Upload a CAD file and store it persistently using SHA-256 content hash as file_id.
+
+    Returns (file_id, path, already_existed). Uploading the same file twice is idempotent.
+    """
+    if not upload_file.filename:
+        raise RuntimeError("Uploaded CAD file must have a filename.")
+
+    data = upload_file.file.read()
+    file_id = hashlib.sha256(data).hexdigest()
+    safe_filename = pathlib.PurePath(upload_file.filename).name
+
+    CAD_shared_dir = get_CAD_shared_dir()
+    CAD_shared_dir.mkdir(parents=True, exist_ok=True)
+    dest_path = CAD_shared_dir / f"{file_id}_{safe_filename}"
+    existed = dest_path.exists()
+    if not existed:
+        dest_path.write_bytes(data)
+    return file_id, dest_path, existed
+
+
+def find_persistent_CAD_file(file_id: str) -> pathlib.Path:
+    """Look up a previously uploaded CAD file by its file_id (SHA-256 hash).
+
+    Raises RuntimeError if no matching file is found.
+    """
+    CAD_shared_dir = get_CAD_shared_dir()
+    matches = list(CAD_shared_dir.glob(f"{file_id}_*"))
+    if not matches:
+        raise RuntimeError(
+            f"No uploaded file found for file_id '{file_id}'. "
+            "Upload the file first via POST /files/upload."
+        )
+    return matches[0]
+
+
+def delete_persistent_CAD_file(file_id: str) -> bool:
+    """Delete a persistent CAD file by file_id. Returns True if a file was deleted."""
+    CAD_shared_dir = get_CAD_shared_dir()
+    matches = list(CAD_shared_dir.glob(f"{file_id}_*"))
+    for path in matches:
+        path.unlink(missing_ok=True)
+    return len(matches) > 0
+
+
+def list_persistent_CAD_files() -> list[dict[str, Any]]:
+    """Return metadata for all persistently uploaded CAD files."""
+    CAD_shared_dir = get_CAD_shared_dir()
+    if not CAD_shared_dir.exists():
+        return []
+    result = []
+    for path in sorted(CAD_shared_dir.iterdir()):
+        if not path.is_file():
+            continue
+        parts = path.name.split("_", 1)
+        if len(parts) == 2 and len(parts[0]) == 64:  # SHA-256 hex = 64 chars
+            result.append(
+                {
+                    "file_id": parts[0],
+                    "filename": parts[1],
+                    "size": path.stat().st_size,
+                }
+            )
+    return result
 
 
 def get_shared_CAD_file(cad_file_path: str) -> pathlib.Path:

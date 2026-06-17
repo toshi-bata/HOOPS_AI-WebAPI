@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 import core
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
-from routers import brep, cad, mfr, similarity
+from routers import brep, cad, files, mfr, similarity
 
 
 @asynccontextmanager
@@ -19,11 +19,11 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.include_router(files.router)
 app.include_router(mfr.router)
 app.include_router(cad.router)
 app.include_router(brep.router)
 app.include_router(similarity.router)
 
 app.mount("/out", StaticFiles(directory=str(core.CAD_VIEWER_OUTPUT_DIR)), name="out")
-
 

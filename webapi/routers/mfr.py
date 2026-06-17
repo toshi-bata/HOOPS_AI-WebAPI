@@ -1,4 +1,5 @@
 import io
+from typing import Optional
 
 import core
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
@@ -51,17 +52,28 @@ def MFR_viewer_colorize():
 
 
 @router.post("/inference")
-def MFR_inference(file: UploadFile = File(...)):
-    cad_file_path = None
+def MFR_inference(
+    file: Optional[UploadFile] = File(None),
+    file_id: Optional[str] = Query(None, description="file_id returned by POST /files/upload"),
+):
+    """Run MFR inference on a CAD file.
+
+    Supply **either** a file upload *or* a ``file_id`` from a previous upload.
+    When ``file_id`` is given the file is reused without re-uploading.
+    """
     try:
-        cad_file_path = core.save_uploaded_CAD_file(file)
+        if file_id:
+            cad_file_path = core.find_persistent_CAD_file(file_id)
+        elif file:
+            _, cad_file_path, _ = core.upload_CAD_file_persistent(file)
+        else:
+            raise HTTPException(status_code=422, detail="Either 'file' or 'file_id' is required.")
         return core.run_MFR_inference(cad_file_path)
+    except HTTPException:
+        raise
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Inference failed: {exc}") from exc
-    finally:
-        if cad_file_path is not None:
-            cad_file_path.unlink(missing_ok=True)
 
 
