@@ -329,7 +329,12 @@ def search_by_shape(cad_file_path: pathlib.Path, top_k: int = 10) -> dict[str, A
         for hit in hits[0]
     ]
 
-    ds_viewer = DatasetViewer([], [], [], reference_dir=CAD_VIEWER_OUTPUT_DIR)
+    notebooks_dir = pathlib.Path(get_required_env("HOOPS_AI_NOTEBOOK_DIR"))
+    embeddings_images_dir = pathlib.Path(
+        os.environ.get("HOOPS_AI_EMBEDDINGS_IMAGES_DIR")
+        or notebooks_dir / "out" / "images"
+    )
+    ds_viewer = DatasetViewer([], [], [], reference_dir=embeddings_images_dir)
     fig = ds_viewer.show_search_results(hits, query_file=str(cad_file_path), grid_cols=3)
     if fig is None:
         fig = plt.gcf()
