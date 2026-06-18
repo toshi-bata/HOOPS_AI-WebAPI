@@ -10,7 +10,7 @@ See the root [README](../README.md) for an overview of the full HOOPS AI MCP pla
 - Python 3.12
 - A valid **HOOPS AI license key**
 - HOOPS AI (CPU or GPU version) installed in the environment
-- **HOOPS AI Tutorials** — the notebooks folder and its contents (ML datasets and pre-trained models) are required to run this server.  
+- **HOOPS AI Tutorials**  Ethe notebooks folder and its contents (ML datasets and pre-trained models) are required to run this server.  
   The tutorials are available at [github.com/techsoft3d/HOOPS-AI-tutorials](https://github.com/techsoft3d/HOOPS-AI-tutorials/tree/main).  
   Data packages (datasets and trained model checkpoints) must be obtained from the Tech Soft 3D File Transfer service by following the HOOPS AI installation instructions.
 
@@ -41,8 +41,8 @@ cp .env.example .env
 
 | Variable | Required | Description |
 |---|---|---|
-| `HOOPS_AI_LICENSE` | ✅ | Your HOOPS AI license key |
-| `HOOPS_AI_NOTEBOOK_DIR` | ✅ | Absolute path to your HOOPS AI notebooks directory |
+| `HOOPS_AI_LICENSE` | ✁E| Your HOOPS AI license key |
+| `HOOPS_AI_NOTEBOOK_DIR` | ✁E| Absolute path to your HOOPS AI notebooks directory |
 | `HOOPS_AI_MFR_FLOW_NAME` | optional | MFR flow name (dataset files are resolved relative to this) |
 | `HOOPS_AI_MFR_MODEL_NAME` | optional | MFR trained model checkpoint filename (e.g. `ts3d_162k_mfr.ckpt`) |
 | `HOOPS_AI_EMBEDDINGS_MODEL_NAME` | optional | Embeddings trained model checkpoint filename (e.g. `ts3d_1M_hoops_embeddings.ckpt`) |
@@ -115,9 +115,16 @@ Upload a local CAD file and open an interactive browser viewer.
 POST /CAD/viewer
 ```
 
+**Windows (PowerShell):**
 ```powershell
 curl.exe -X POST "http://127.0.0.1:8001/CAD/viewer" `
          -F "file=@C:\path\to\model.stp"
+```
+
+**Linux:**
+```bash
+curl -X POST "http://127.0.0.1:8001/CAD/viewer" \
+     -F "file=@/path/to/model.stp"
 ```
 
 **Response:**
@@ -138,9 +145,16 @@ Open a CAD file already present in the shared folder (`HOOPS_AI_CAD_SHARED_DIR`)
 POST /CAD/viewer/from-path
 ```
 
+**Windows (PowerShell):**
 ```powershell
 curl.exe -X POST "http://127.0.0.1:8001/CAD/viewer/from-path" `
          -d "cad_file_path=model.stp"
+```
+
+**Linux:**
+```bash
+curl -X POST "http://127.0.0.1:8001/CAD/viewer/from-path" \
+     -d "cad_file_path=model.stp"
 ```
 
 **Response:** same as above.
@@ -154,9 +168,16 @@ DELETE /CAD/viewer          # terminate last active viewer
 DELETE /CAD/viewer?all=true # terminate all viewers
 ```
 
+**Windows (PowerShell):**
 ```powershell
 Invoke-RestMethod -Method Delete -Uri "http://127.0.0.1:8001/CAD/viewer"
 Invoke-RestMethod -Method Delete -Uri "http://127.0.0.1:8001/CAD/viewer?all=true"
+```
+
+**Linux:**
+```bash
+curl -X DELETE "http://127.0.0.1:8001/CAD/viewer"
+curl -X DELETE "http://127.0.0.1:8001/CAD/viewer?all=true"
 ```
 
 **Response:** `{ "terminated": 1 }`
@@ -173,9 +194,16 @@ Build a face adjacency graph from the B-Rep model. Returns graph data and a base
 POST /BRep/adjacency-graph
 ```
 
+**Windows (PowerShell):**
 ```powershell
 curl.exe -X POST "http://127.0.0.1:8001/BRep/adjacency-graph" `
     -F "file=@C:\path\to\model.SLDPRT"
+```
+
+**Linux:**
+```bash
+curl -X POST "http://127.0.0.1:8001/BRep/adjacency-graph" \
+    -F "file=@/path/to/model.SLDPRT"
 ```
 
 **Response:**
@@ -200,9 +228,16 @@ Extract face and edge attributes from the B-Rep model.
 POST /BRep/attributes
 ```
 
+**Windows (PowerShell):**
 ```powershell
 curl.exe -X POST "http://127.0.0.1:8001/BRep/attributes" `
     -F "file=@C:\path\to\model.SLDPRT"
+```
+
+**Linux:**
+```bash
+curl -X POST "http://127.0.0.1:8001/BRep/attributes" \
+    -F "file=@/path/to/model.SLDPRT"
 ```
 
 **Response:**
@@ -232,9 +267,9 @@ Returns a summary of the loaded MFR dataset.
 GET /MFR/dataset/table-of-contents
 ```
 
-```bash
-curl.exe "http://127.0.0.1:8001/MFR/dataset/table-of-contents"
-```
+**Windows (PowerShell):** `curl.exe "http://127.0.0.1:8001/MFR/dataset/table-of-contents"`
+
+**Linux:** `curl "http://127.0.0.1:8001/MFR/dataset/table-of-contents"`
 
 #### List label descriptions
 
@@ -244,9 +279,9 @@ Returns all MFR label IDs with their names and descriptions.
 GET /MFR/labels/description
 ```
 
-```bash
-curl.exe "http://127.0.0.1:8001/MFR/labels/description"
-```
+**Windows (PowerShell):** `curl.exe "http://127.0.0.1:8001/MFR/labels/description"`
+
+**Linux:** `curl "http://127.0.0.1:8001/MFR/labels/description"`
 
 #### Search files by feature
 
@@ -256,9 +291,9 @@ Returns CAD file names and IDs that contain a given manufacturing feature.
 GET /MFR/files/search?feature_name=<name>
 ```
 
-```bash
-curl.exe "http://127.0.0.1:8001/MFR/files/search?feature_name=through%20hole"
-```
+**Windows (PowerShell):** `curl.exe "http://127.0.0.1:8001/MFR/files/search?feature_name=through%20hole"`
+
+**Linux:** `curl "http://127.0.0.1:8001/MFR/files/search?feature_name=through%20hole"`
 
 **Response:**
 
@@ -277,8 +312,14 @@ Returns the thumbnail PNG image for a given file ID.
 GET /MFR/files/{file_id}/thumbnail
 ```
 
+**Windows (PowerShell):**
 ```powershell
 Invoke-RestMethod -Uri "http://127.0.0.1:8001/MFR/files/1/thumbnail" -OutFile "thumbnail.png"
+```
+
+**Linux:**
+```bash
+curl "http://127.0.0.1:8001/MFR/files/1/thumbnail" -o thumbnail.png
 ```
 
 **Response:** PNG image (`image/png`)
@@ -291,9 +332,16 @@ Upload a CAD file and run MFR inference. Launches the CAD viewer and returns pre
 POST /MFR/inference
 ```
 
+**Windows (PowerShell):**
 ```powershell
 curl.exe -X POST "http://127.0.0.1:8001/MFR/inference" `
     -F "file=@C:\path\to\model.SLDPRT"
+```
+
+**Linux:**
+```bash
+curl -X POST "http://127.0.0.1:8001/MFR/inference" \
+    -F "file=@/path/to/model.SLDPRT"
 ```
 
 **Response:**
@@ -314,8 +362,14 @@ Apply MFR prediction colors to the last active CAD viewer. Call this **after** t
 POST /MFR/viewer/colorize
 ```
 
+**Windows (PowerShell):**
 ```powershell
 Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8001/MFR/viewer/colorize"
+```
+
+**Linux:**
+```bash
+curl -X POST "http://127.0.0.1:8001/MFR/viewer/colorize"
 ```
 
 **Response:**
@@ -341,9 +395,16 @@ Upload a CAD file and retrieve the most similar parts from the indexed database 
 POST /similarity/search?top_k=<n>
 ```
 
+**Windows (PowerShell):**
 ```powershell
 curl.exe -X POST "http://127.0.0.1:8001/similarity/search?top_k=10" `
     -F "file=@C:\path\to\model.step"
+```
+
+**Linux:**
+```bash
+curl -X POST "http://127.0.0.1:8001/similarity/search?top_k=10" \
+    -F "file=@/path/to/model.step"
 ```
 
 **Response:**
