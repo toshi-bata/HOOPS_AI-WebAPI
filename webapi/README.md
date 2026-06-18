@@ -35,7 +35,7 @@ Copy `.env.example` to `.env` and fill in your values:
 # Windows
 copy .env.example .env
 
-# Linux / macOS
+# Linux
 cp .env.example .env
 ```
 
@@ -72,7 +72,7 @@ cd webapi
 <Path\to\HOOPS_AI\install\dir>\.venv\Scripts\python.exe -m uvicorn main:app --host 127.0.0.1 --port 8001
 ```
 
-**Linux / macOS:**
+**Linux:**
 
 ```bash
 cd webapi
@@ -91,7 +91,7 @@ cd webapi
 <Path\to\HOOPS_AI\install\dir>\.venv\Scripts\python.exe -m uvicorn main:app --host 127.0.0.1 --port 8001 --reload
 ```
 
-**Linux / macOS:**
+**Linux:**
 
 ```bash
 cd webapi

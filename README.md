@@ -60,7 +60,7 @@ copy .env.example .env   # then edit .env with your HOOPS AI license key
 <Path\to\HOOPS_AI\install\dir>\.venv\Scripts\python.exe -m uvicorn main:app --host 127.0.0.1 --port 8001
 ```
 
-**Linux / macOS:**
+**Linux:**
 ```bash
 cd webapi
 pip install -r requirements.txt
