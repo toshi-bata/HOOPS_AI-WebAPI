@@ -32,7 +32,11 @@ pip install -r requirements.txt
 Copy `.env.example` to `.env` and fill in your values:
 
 ```bash
+# Windows
 copy .env.example .env
+
+# Linux / macOS
+cp .env.example .env
 ```
 
 | Variable | Required | Description |
@@ -59,20 +63,39 @@ HOOPS_AI_FAISS_INDEX_PATH=fabwave_embeddings_store.faiss
 
 ### 3. Start the server
 
-Run from the `webapi/` directory using the Python executable from your HOOPS AI virtual environment:
+Run from the `webapi/` directory using the Python executable from your HOOPS AI virtual environment.
 
-```bash
+**Windows:**
+
+```bat
 cd webapi
 <Path\to\HOOPS_AI\install\dir>\.venv\Scripts\python.exe -m uvicorn main:app --host 127.0.0.1 --port 8001
 ```
 
-> Replace `<Path\to\HOOPS_AI\install\dir>` with the actual path where HOOPS AI is installed. The `.venv\Scripts\python.exe` executable will use the HOOPS AI packages installed in that virtual environment.
-
-For development with auto-reload:
+**Linux / macOS:**
 
 ```bash
 cd webapi
+/path/to/HOOPS_AI/install/dir/.venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8001
+```
+
+> Replace the path prefix with the actual directory where HOOPS AI is installed.
+> The venv Python executable ensures HOOPS AI packages from that environment are used.
+
+For development with auto-reload:
+
+**Windows:**
+
+```bat
+cd webapi
 <Path\to\HOOPS_AI\install\dir>\.venv\Scripts\python.exe -m uvicorn main:app --host 127.0.0.1 --port 8001 --reload
+```
+
+**Linux / macOS:**
+
+```bash
+cd webapi
+/path/to/HOOPS_AI/install/dir/.venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8001 --reload
 ```
 
 - API base URL: `http://127.0.0.1:8001`

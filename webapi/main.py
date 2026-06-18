@@ -25,5 +25,6 @@ app.include_router(cad.router)
 app.include_router(brep.router)
 app.include_router(similarity.router)
 
+core.CAD_VIEWER_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/out", StaticFiles(directory=str(core.CAD_VIEWER_OUTPUT_DIR)), name="out")
 
