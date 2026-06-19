@@ -50,17 +50,17 @@ Claude Desktop can call these 11 tools using natural language:
 
 | Tool | Description |
 |---|---|
-| `open_cad_viewer` | Upload a local CAD file to the server and open it in the interactive 3D browser viewer. Returns the viewer URL. |
+| `open_cad_viewer` | Upload a local CAD file to the server and open it in the interactive 3D browser viewer. Returns `viewer_url` and `image_url` (PNG preview). |
 | `terminate_CAD_viewer` | Terminate the last active viewer, or all viewers (`terminate_all=True`). |
-| `get_brep_adjacency_graph` | Build a face adjacency graph from a local CAD file. Returns graph data (nodes, edges, counts) and a base64-encoded PNG visualization. |
+| `get_brep_adjacency_graph` | Build a face adjacency graph from a local CAD file. Returns graph data (nodes, edges, counts) and `image_url` (PNG visualization URL). |
 | `get_brep_attributes` | Extract face and edge attributes (types, areas, lengths, dihedral angles, etc.) from a local CAD file. |
 | `get_MFR_table_of_contents` | Get a summary of the Manufacturing Feature Recognition (MFR) dataset. |
 | `get_MFR_labels_description` | List all MFR label IDs, feature names, and descriptions. |
 | `search_MFR_files` | Find CAD files in the MFR dataset that contain a given manufacturing feature. |
 | `get_MFR_file_thumbnail` | Download the thumbnail PNG for a given dataset file ID. Returns base64-encoded PNG. |
-| `run_MFR_inference` | Run MFR inference on a local CAD file. Launches the viewer and returns predictions, probabilities, and the viewer URL. |
+| `run_MFR_inference` | Run MFR inference on a local CAD file. Launches the viewer and returns predictions, probabilities, `viewer_url`, and `image_url` (PNG preview). |
 | `colorize_MFR_viewer` | Apply MFR prediction colors to the last active viewer. Returns the color map. Call only after the model has fully loaded in the browser. |
-| `search_similar_shapes` | Upload a local CAD file and find the top-k most similar parts using HOOPS Embeddings and a FAISS index. Returns match IDs, similarity scores, and a result grid image URL. |
+| `search_similar_shapes` | Upload a local CAD file and find the top-k most similar parts using HOOPS Embeddings and a FAISS index. Returns match IDs, similarity scores, and `image_url` (result grid image URL). |
 
 ---
 

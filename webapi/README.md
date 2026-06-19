@@ -130,12 +130,14 @@ curl -X POST "http://127.0.0.1:8001/CAD/viewer" \
 **Response:**
 
 ```json
-{ "viewer_url": "http://127.0.0.1:<viewer_port>/index.html" }
+{ "viewer_url": "http://127.0.0.1:<viewer_port>/index.html", "image_url": "http://127.0.0.1:8001/out/<stem>.png" }
 ```
 
-Open the returned `viewer_url` in your browser to view the model.
+Open the returned `viewer_url` in your browser to view the model. `image_url` is a PNG preview of the model.
 
 > The viewer runs on a **separate port** from the API server. Make sure that port is not blocked by a firewall.
+
+> **Note:** The `out/` and `uploads/` folders are automatically cleared on server startup.
 
 #### Launch viewer — Shared folder path
 
@@ -188,7 +190,7 @@ curl -X DELETE "http://127.0.0.1:8001/CAD/viewer?all=true"
 
 #### Face adjacency graph
 
-Build a face adjacency graph from the B-Rep model. Returns graph data and a base64-encoded PNG visualization.
+Build a face adjacency graph from the B-Rep model. Returns graph data and a PNG visualization URL.
 
 ```
 POST /BRep/adjacency-graph
@@ -216,7 +218,7 @@ curl -X POST "http://127.0.0.1:8001/BRep/adjacency-graph" \
     "num_nodes": 144,
     "num_edges": 210
   },
-  "graph_image": "<base64-encoded PNG>"
+  "image_url": "http://127.0.0.1:8001/out/<uuid>.png"
 }
 ```
 
@@ -350,7 +352,8 @@ curl -X POST "http://127.0.0.1:8001/MFR/inference" \
 {
   "predictions": [...],
   "probabilities": [...],
-  "viewer_url": "http://127.0.0.1:<viewer_port>/index.html"
+  "viewer_url": "http://127.0.0.1:<viewer_port>/index.html",
+  "image_url": "http://127.0.0.1:8001/out/<stem>.png"
 }
 ```
 
