@@ -559,11 +559,25 @@ def get_shared_CAD_file(cad_file_path: str) -> pathlib.Path:
 
 
 def create_CAD_viewer(cad_file_path: pathlib.Path) -> str:
+    from hoops_ai.cadaccess import HOOPSLoader, HOOPSTools
     from hoops_ai.insights import CADViewer
 
     CAD_VIEWER_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    cad_loader = HOOPSLoader()
+    model = cad_loader.create_from_file(str(cad_file_path))
+
+    tools = HOOPSTools()
+    scs_path = CAD_VIEWER_OUTPUT_DIR / (cad_file_path.stem + ".scs")
+    _png_path, scs_path = tools.exportStreamCache(
+        model,
+        filename=str(scs_path),
+        is_white_background=True,
+        overwrite=True,
+    )
+
     viewer = CADViewer(static_folder=CAD_VIEWER_OUTPUT_DIR)
-    viewer.load_cad_file(cad_file_path)
+    viewer.load_scs_file(scs_path)
     viewer.show()
 
     status = _json_safe(viewer.get_status())
