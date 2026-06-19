@@ -53,7 +53,7 @@ DEFAULT_MFR_LABELS_DESCRIPTION: dict[int, dict[str, str]] = {
 MFR_dataset_explorer = None
 MFR_inference_model = None
 MFR_last_predictions: list[Any] = []
-CAD_viewers: list[Any] = []
+CAD_viewers: dict[str, Any] = {}
 cad_searcher = None
 shape_index = None
 
@@ -413,7 +413,7 @@ def colorize_MFR_viewer() -> dict[str, Any]:
         reserved_colors={0: (200, 200, 200)},
     )
 
-    viewer = CAD_viewers[-1]
+    viewer = next(reversed(CAD_viewers.values()))
     import numpy as np
     predictions_array = np.array(MFR_last_predictions)
     face_groups = hoops_ai.insights.utils.group_predictions_by_label(
@@ -568,6 +568,23 @@ def create_CAD_viewer(cad_file_path: pathlib.Path) -> dict[str, Any]:
 
     CAD_VIEWER_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    file_key = str(cad_file_path.resolve())
+
+    # Reuse existing viewer for the same file if still alive
+    existing = CAD_viewers.get(file_key)
+    if existing is not None:
+        try:
+            status = _json_safe(existing.get_status())
+            viewer_url = existing._get_viewer_url()
+            if status.get("port") and viewer_url:
+                scs_path = CAD_VIEWER_OUTPUT_DIR / (cad_file_path.stem + ".scs")
+                png_path = str(scs_path).replace(".scs", "_white.png")
+                png_url = "/out/" + pathlib.Path(png_path).name if pathlib.Path(png_path).exists() else None
+                return {"viewer_url": viewer_url, "image_url": png_url}
+        except Exception:
+            pass
+        CAD_viewers.pop(file_key, None)
+
     cad_loader = HOOPSLoader()
     model = cad_loader.create_from_file(str(cad_file_path))
 
@@ -589,7 +606,7 @@ def create_CAD_viewer(cad_file_path: pathlib.Path) -> dict[str, Any]:
     if not status.get("port") or not viewer_url:
         raise RuntimeError("CADViewer did not start.")
 
-    CAD_viewers.append(viewer)
+    CAD_viewers[file_key] = viewer
 
     png_url = None
     if png_path and pathlib.Path(png_path).exists():
@@ -604,13 +621,14 @@ def terminate_CAD_viewer(terminate_all: bool = False) -> dict[str, Any]:
 
     if terminate_all:
         count = len(CAD_viewers)
-        for viewer in CAD_viewers:
+        for viewer in CAD_viewers.values():
             viewer.terminate()
         CAD_viewers.clear()
         return {"terminated": count}
     else:
-        viewer = CAD_viewers.pop()
+        file_key, viewer = next(reversed(CAD_viewers.items()))
         viewer.terminate()
+        del CAD_viewers[file_key]
         return {"terminated": 1}
 
 
