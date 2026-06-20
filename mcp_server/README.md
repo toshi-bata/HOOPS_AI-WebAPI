@@ -42,7 +42,8 @@ See the root [README](../README.md) for an overview of the full platform.
 
 **When the WebAPI server is on a different machine (client-server setup):**
 
-Set the `HOOPS_WEBAPI_URL` environment variable to point to the server's address:
+Add `"env": {"HOOPS_WEBAPI_URL": "..."}` to the config — no system environment variable is needed.  
+Claude Desktop passes this value to the MCP server process automatically:
 
 ```json
 {
@@ -63,7 +64,8 @@ Set the `HOOPS_WEBAPI_URL` environment variable to point to the server's address
 }
 ```
 
-> Replace `192.168.0.6` with the actual IP address of the machine running the WebAPI server.
+> Replace `192.168.0.6` with the actual IP address of the machine running the WebAPI server.  
+> This is the **only configuration change needed** on the client machine.
 
 4. Save the file and **restart Claude Desktop**.
 
