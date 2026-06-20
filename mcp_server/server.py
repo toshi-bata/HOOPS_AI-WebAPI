@@ -1,8 +1,14 @@
 import httpx
+import os
+import uuid
 from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 
-API_BASE = "http://127.0.0.1:8001"
+API_BASE = os.environ.get("HOOPS_WEBAPI_URL", "http://127.0.0.1:8000").rstrip("/")
+
+# Unique session ID per MCP server process — isolates this client's state from others
+SESSION_ID = uuid.uuid4().hex
+_SESSION_HEADERS = {"X-Session-ID": SESSION_ID}
 
 mcp = FastMCP("HOOPS AI MCP Server")
 
@@ -80,6 +86,7 @@ def open_cad_viewer(cad_file_path: str = "", file_id: str = "") -> dict:
     response = httpx.post(
         f"{API_BASE}/CAD/viewer",
         params={"file_id": fid},
+        headers=_SESSION_HEADERS,
         timeout=120,
     )
     response.raise_for_status()
@@ -148,6 +155,7 @@ def run_MFR_inference(cad_file_path: str = "", file_id: str = "") -> dict:
     response = httpx.post(
         f"{API_BASE}/MFR/inference",
         params={"file_id": fid},
+        headers=_SESSION_HEADERS,
         timeout=300,
     )
     response.raise_for_status()
@@ -163,7 +171,7 @@ def terminate_CAD_viewer(terminate_all: bool = False) -> dict:
     Returns the number of viewers terminated.
     """
     params = {"all": "true"} if terminate_all else {}
-    response = httpx.delete(f"{API_BASE}/CAD/viewer", params=params, timeout=30)
+    response = httpx.delete(f"{API_BASE}/CAD/viewer", params=params, headers=_SESSION_HEADERS, timeout=30)
     response.raise_for_status()
     return response.json()
 

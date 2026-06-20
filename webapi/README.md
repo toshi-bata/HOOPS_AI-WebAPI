@@ -91,18 +91,22 @@ Run from the `webapi/` directory using the Python executable from your HOOPS AI 
 
 ```bat
 cd webapi
-<Path\to\HOOPS_AI\install\dir>\.venv\Scripts\python.exe -m uvicorn main:app --host 127.0.0.1 --port 8001
+<Path\to\HOOPS_AI\install\dir>\.venv\Scripts\python.exe main.py --host 0.0.0.0 --port 8000
 ```
 
 **Linux:**
 
 ```bash
 cd webapi
-/path/to/HOOPS_AI/install/dir/.venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8001
+/path/to/HOOPS_AI/install/dir/.venv/bin/python main.py --host 0.0.0.0 --port 8000
 ```
 
 > Replace the path prefix with the actual directory where HOOPS AI is installed.
 > The venv Python executable ensures HOOPS AI packages from that environment are used.
+
+> **Note:** Port `8000` is the default. If port 8000 is already in use, the server will print an error and exit — simply retry with a different port (e.g. `--port 8001`) and update `HOOPS_WEBAPI_URL` in the MCP server config accordingly.
+
+> **Note (Windows):** To allow connections from other machines on the LAN, add a Windows Firewall inbound rule for port 8000 (TCP).
 
 For development with auto-reload:
 
@@ -110,18 +114,23 @@ For development with auto-reload:
 
 ```bat
 cd webapi
-<Path\to\HOOPS_AI\install\dir>\.venv\Scripts\python.exe -m uvicorn main:app --host 127.0.0.1 --port 8001 --reload
+<Path\to\HOOPS_AI\install\dir>\.venv\Scripts\python.exe main.py --host 0.0.0.0 --port 8000 --reload
 ```
 
 **Linux:**
 
 ```bash
 cd webapi
-/path/to/HOOPS_AI/install/dir/.venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8001 --reload
+/path/to/HOOPS_AI/install/dir/.venv/bin/python main.py --host 0.0.0.0 --port 8000 --reload
 ```
 
-- API base URL: `http://127.0.0.1:8001`
-- Interactive docs (Swagger UI): `http://127.0.0.1:8001/docs`
+- API base URL: `http://<server-ip>:8000`
+- Interactive docs (Swagger UI): `http://<server-ip>:8000/docs`
+
+> **`<server-ip>` substitution:**  
+> - **Same machine** — use `127.0.0.1` (e.g. `http://127.0.0.1:8000`). No IP lookup needed.  
+> - **Different machine** — use the LAN IP of the server machine (e.g. `http://192.168.0.6:8000`).  
+>   On Windows, run `ipconfig` on the server to find its IP address.
 
 ---
 
@@ -129,7 +138,7 @@ cd webapi
 
 ### 3D CAD Viewer
 
-#### Launch viewer — Upload file
+#### Launch viewer  EUpload file
 
 Upload a local CAD file and open an interactive browser viewer.
 
@@ -139,20 +148,20 @@ POST /CAD/viewer
 
 **Windows (PowerShell):**
 ```powershell
-curl.exe -X POST "http://127.0.0.1:8001/CAD/viewer" `
+curl.exe -X POST "http://<server-ip>:8000/CAD/viewer" `
          -F "file=@C:\path\to\model.stp"
 ```
 
 **Linux:**
 ```bash
-curl -X POST "http://127.0.0.1:8001/CAD/viewer" \
+curl -X POST "http://<server-ip>:8000/CAD/viewer" \
      -F "file=@/path/to/model.stp"
 ```
 
 **Response:**
 
 ```json
-{ "viewer_url": "http://127.0.0.1:<viewer_port>/index.html", "image_url": "http://127.0.0.1:8001/out/<stem>.png" }
+{ "viewer_url": "http://<server-ip>:<viewer_port>/index.html", "image_url": "http://<server-ip>:8000/out/<stem>.png" }
 ```
 
 Open the returned `viewer_url` in your browser to view the model. `image_url` is a PNG preview of the model.
@@ -161,7 +170,7 @@ Open the returned `viewer_url` in your browser to view the model. `image_url` is
 
 > **Note:** The `out/` and `uploads/` folders are automatically cleared on server startup.
 
-#### Launch viewer — Shared folder path
+#### Launch viewer  EShared folder path
 
 Open a CAD file already present in the shared folder (`HOOPS_AI_CAD_SHARED_DIR`).
 
@@ -171,19 +180,19 @@ POST /CAD/viewer/from-path
 
 **Windows (PowerShell):**
 ```powershell
-curl.exe -X POST "http://127.0.0.1:8001/CAD/viewer/from-path" `
+curl.exe -X POST "http://<server-ip>:8000/CAD/viewer/from-path" `
          -d "cad_file_path=model.stp"
 ```
 
 **Linux:**
 ```bash
-curl -X POST "http://127.0.0.1:8001/CAD/viewer/from-path" \
+curl -X POST "http://<server-ip>:8000/CAD/viewer/from-path" \
      -d "cad_file_path=model.stp"
 ```
 
 **Response:** same as above.
 
-> This endpoint is also used by the browser UI at `http://127.0.0.1:8001/CAD/viewer`.
+> This endpoint is also used by the browser UI at `http://<server-ip>:8000/CAD/viewer`.
 
 #### Terminate viewer
 
@@ -194,14 +203,14 @@ DELETE /CAD/viewer?all=true # terminate all viewers
 
 **Windows (PowerShell):**
 ```powershell
-Invoke-RestMethod -Method Delete -Uri "http://127.0.0.1:8001/CAD/viewer"
-Invoke-RestMethod -Method Delete -Uri "http://127.0.0.1:8001/CAD/viewer?all=true"
+Invoke-RestMethod -Method Delete -Uri "http://<server-ip>:8000/CAD/viewer"
+Invoke-RestMethod -Method Delete -Uri "http://<server-ip>:8000/CAD/viewer?all=true"
 ```
 
 **Linux:**
 ```bash
-curl -X DELETE "http://127.0.0.1:8001/CAD/viewer"
-curl -X DELETE "http://127.0.0.1:8001/CAD/viewer?all=true"
+curl -X DELETE "http://<server-ip>:8000/CAD/viewer"
+curl -X DELETE "http://<server-ip>:8000/CAD/viewer?all=true"
 ```
 
 **Response:** `{ "terminated": 1 }`
@@ -220,13 +229,13 @@ POST /BRep/adjacency-graph
 
 **Windows (PowerShell):**
 ```powershell
-curl.exe -X POST "http://127.0.0.1:8001/BRep/adjacency-graph" `
+curl.exe -X POST "http://<server-ip>:8000/BRep/adjacency-graph" `
     -F "file=@C:\path\to\model.SLDPRT"
 ```
 
 **Linux:**
 ```bash
-curl -X POST "http://127.0.0.1:8001/BRep/adjacency-graph" \
+curl -X POST "http://<server-ip>:8000/BRep/adjacency-graph" \
     -F "file=@/path/to/model.SLDPRT"
 ```
 
@@ -240,7 +249,7 @@ curl -X POST "http://127.0.0.1:8001/BRep/adjacency-graph" \
     "num_nodes": 144,
     "num_edges": 210
   },
-  "image_url": "http://127.0.0.1:8001/out/<uuid>.png"
+  "image_url": "http://<server-ip>:8000/out/<uuid>.png"
 }
 ```
 
@@ -254,13 +263,13 @@ POST /BRep/attributes
 
 **Windows (PowerShell):**
 ```powershell
-curl.exe -X POST "http://127.0.0.1:8001/BRep/attributes" `
+curl.exe -X POST "http://<server-ip>:8000/BRep/attributes" `
     -F "file=@C:\path\to\model.SLDPRT"
 ```
 
 **Linux:**
 ```bash
-curl -X POST "http://127.0.0.1:8001/BRep/attributes" \
+curl -X POST "http://<server-ip>:8000/BRep/attributes" \
     -F "file=@/path/to/model.SLDPRT"
 ```
 
@@ -291,9 +300,9 @@ Returns a summary of the loaded MFR dataset.
 GET /MFR/dataset/table-of-contents
 ```
 
-**Windows (PowerShell):** `curl.exe "http://127.0.0.1:8001/MFR/dataset/table-of-contents"`
+**Windows (PowerShell):** `curl.exe "http://<server-ip>:8000/MFR/dataset/table-of-contents"`
 
-**Linux:** `curl "http://127.0.0.1:8001/MFR/dataset/table-of-contents"`
+**Linux:** `curl "http://<server-ip>:8000/MFR/dataset/table-of-contents"`
 
 #### List label descriptions
 
@@ -303,9 +312,9 @@ Returns all MFR label IDs with their names and descriptions.
 GET /MFR/labels/description
 ```
 
-**Windows (PowerShell):** `curl.exe "http://127.0.0.1:8001/MFR/labels/description"`
+**Windows (PowerShell):** `curl.exe "http://<server-ip>:8000/MFR/labels/description"`
 
-**Linux:** `curl "http://127.0.0.1:8001/MFR/labels/description"`
+**Linux:** `curl "http://<server-ip>:8000/MFR/labels/description"`
 
 #### Search files by feature
 
@@ -315,9 +324,9 @@ Returns CAD file names and IDs that contain a given manufacturing feature.
 GET /MFR/files/search?feature_name=<name>
 ```
 
-**Windows (PowerShell):** `curl.exe "http://127.0.0.1:8001/MFR/files/search?feature_name=through%20hole"`
+**Windows (PowerShell):** `curl.exe "http://<server-ip>:8000/MFR/files/search?feature_name=through%20hole"`
 
-**Linux:** `curl "http://127.0.0.1:8001/MFR/files/search?feature_name=through%20hole"`
+**Linux:** `curl "http://<server-ip>:8000/MFR/files/search?feature_name=through%20hole"`
 
 **Response:**
 
@@ -338,12 +347,12 @@ GET /MFR/files/{file_id}/thumbnail
 
 **Windows (PowerShell):**
 ```powershell
-Invoke-RestMethod -Uri "http://127.0.0.1:8001/MFR/files/1/thumbnail" -OutFile "thumbnail.png"
+Invoke-RestMethod -Uri "http://<server-ip>:8000/MFR/files/1/thumbnail" -OutFile "thumbnail.png"
 ```
 
 **Linux:**
 ```bash
-curl "http://127.0.0.1:8001/MFR/files/1/thumbnail" -o thumbnail.png
+curl "http://<server-ip>:8000/MFR/files/1/thumbnail" -o thumbnail.png
 ```
 
 **Response:** PNG image (`image/png`)
@@ -358,13 +367,13 @@ POST /MFR/inference
 
 **Windows (PowerShell):**
 ```powershell
-curl.exe -X POST "http://127.0.0.1:8001/MFR/inference" `
+curl.exe -X POST "http://<server-ip>:8000/MFR/inference" `
     -F "file=@C:\path\to\model.SLDPRT"
 ```
 
 **Linux:**
 ```bash
-curl -X POST "http://127.0.0.1:8001/MFR/inference" \
+curl -X POST "http://<server-ip>:8000/MFR/inference" \
     -F "file=@/path/to/model.SLDPRT"
 ```
 
@@ -374,8 +383,8 @@ curl -X POST "http://127.0.0.1:8001/MFR/inference" \
 {
   "predictions": [...],
   "probabilities": [...],
-  "viewer_url": "http://127.0.0.1:<viewer_port>/index.html",
-  "image_url": "http://127.0.0.1:8001/out/<stem>.png"
+  "viewer_url": "http://<server-ip>:<viewer_port>/index.html",
+  "image_url": "http://<server-ip>:8000/out/<stem>.png"
 }
 ```
 
@@ -389,12 +398,12 @@ POST /MFR/viewer/colorize
 
 **Windows (PowerShell):**
 ```powershell
-Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8001/MFR/viewer/colorize"
+Invoke-RestMethod -Method Post -Uri "http://<server-ip>:8000/MFR/viewer/colorize"
 ```
 
 **Linux:**
 ```bash
-curl -X POST "http://127.0.0.1:8001/MFR/viewer/colorize"
+curl -X POST "http://<server-ip>:8000/MFR/viewer/colorize"
 ```
 
 **Response:**
@@ -422,13 +431,13 @@ POST /similarity/search?top_k=<n>
 
 **Windows (PowerShell):**
 ```powershell
-curl.exe -X POST "http://127.0.0.1:8001/similarity/search?top_k=10" `
+curl.exe -X POST "http://<server-ip>:8000/similarity/search?top_k=10" `
     -F "file=@C:\path\to\model.step"
 ```
 
 **Linux:**
 ```bash
-curl -X POST "http://127.0.0.1:8001/similarity/search?top_k=10" \
+curl -X POST "http://<server-ip>:8000/similarity/search?top_k=10" \
     -F "file=@/path/to/model.step"
 ```
 
@@ -440,12 +449,12 @@ curl -X POST "http://127.0.0.1:8001/similarity/search?top_k=10" \
     {"id": "part_042", "score": 0.997},
     {"id": "part_018", "score": 0.991}
   ],
-  "image_url": "http://127.0.0.1:8001/out/<uuid>.png"
+  "image_url": "http://<server-ip>:8000/out/<uuid>.png"
 }
 ```
 
-- `results` — top-k matches sorted by similarity score (higher = more similar)
-- `image_url` — URL to a PNG grid image of the search results
+- `results`  Etop-k matches sorted by similarity score (higher = more similar)
+- `image_url`  EURL to a PNG grid image of the search results
 
 ---
 

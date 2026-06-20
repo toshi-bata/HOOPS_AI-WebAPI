@@ -52,8 +52,7 @@ DEFAULT_MFR_LABELS_DESCRIPTION: dict[int, dict[str, str]] = {
 
 MFR_dataset_explorer = None
 MFR_inference_model = None
-MFR_last_predictions: list[Any] = []
-CAD_viewers: dict[str, Any] = {}
+CAD_viewers: dict[str, dict[str, Any]] = {}  # session_id -> {file_key -> viewer_info}
 CAD_face_colors: dict[str, list] = {}  # scs_filename -> [[r,g,b], ...] indexed by face_id
 cad_searcher = None
 shape_index = None
@@ -373,23 +372,23 @@ def search_MFR_files(feature_name: str) -> dict[str, Any]:
     }
 
 
-def run_MFR_inference(cad_file_path: pathlib.Path) -> dict[str, Any]:
+def run_MFR_inference(cad_file_path: pathlib.Path, session_id: Optional[str] = None) -> dict[str, Any]:
     from hoops_ai.insights.utils import ColorPalette
-
-    global MFR_last_predictions
 
     inference_model = get_MFR_inference_model()
     ml_input = inference_model.preprocess(str(cad_file_path))
     predictions, probabilities = inference_model.predict_and_postprocess(ml_input)
 
-    MFR_last_predictions = _json_safe(predictions)
+    session_preds = _json_safe(predictions)
 
     viewer_url = None
     image_url = None
+    scs_filename = None
     try:
-        viewer_result = create_CAD_viewer(cad_file_path)
+        viewer_result = create_CAD_viewer(cad_file_path, session_id)
         viewer_url = viewer_result.get("viewer_url")
         image_url = viewer_result.get("image_url")
+        scs_filename = viewer_result.get("_scs_filename")
     except Exception:
         pass
 
@@ -401,18 +400,15 @@ def run_MFR_inference(cad_file_path: pathlib.Path) -> dict[str, Any]:
     )
 
     face_colors: list[list[int]] = []
-    for label_id in MFR_last_predictions:
+    for label_id in session_preds:
         rgb = color_palette.get_color(int(label_id))
         face_colors.append([int(rgb[0]), int(rgb[1]), int(rgb[2])])
 
-    if CAD_viewers:
-        last_viewer_info = next(reversed(CAD_viewers.values()))
-        scs_filename = last_viewer_info.get("scs_filename")
-        if scs_filename:
-            CAD_face_colors[scs_filename] = face_colors
+    if scs_filename:
+        CAD_face_colors[scs_filename] = face_colors
 
     # Build color legend for only the labels present in this model
-    present_label_ids = set(int(lid) for lid in MFR_last_predictions)
+    present_label_ids = set(int(lid) for lid in session_preds)
     color_map = {
         str(label_id): {
             "name": info["name"],
@@ -559,18 +555,31 @@ def get_shared_CAD_file(cad_file_path: str) -> pathlib.Path:
     return resolved_path
 
 
-def create_CAD_viewer(cad_file_path: pathlib.Path) -> dict[str, Any]:
+def create_CAD_viewer(cad_file_path: pathlib.Path, session_id: Optional[str] = None) -> dict[str, Any]:
     from hoops_ai.cadaccess import HOOPSLoader, HOOPSTools
 
     CAD_VIEWER_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     file_key = str(cad_file_path.resolve())
 
-    # Reuse if SCS already exists for this file
-    scs_path = CAD_VIEWER_OUTPUT_DIR / (cad_file_path.stem + ".scs")
-    existing = CAD_viewers.get(file_key)
-    if existing and scs_path.exists():
-        png_url = f"/out/{existing['png_filename']}" if existing.get("png_filename") else None
-        return {"viewer_url": f"/CAD/viewer/show?scs={scs_path.name}", "image_url": png_url}
+    # Reuse existing SCS only when a stable session_id is provided and the file was
+    # already converted for that session.  Without a session_id every call is treated
+    # as a fresh request so different clients never share the same SCS file.
+    if session_id:
+        session_viewers = CAD_viewers.setdefault(session_id, {})
+        existing = session_viewers.get(file_key)
+        if existing:
+            scs_path = CAD_VIEWER_OUTPUT_DIR / existing["scs_filename"]
+            if scs_path.exists():
+                png_url = f"/out/{existing['png_filename']}" if existing.get("png_filename") else None
+                return {"viewer_url": f"/CAD/viewer/show?scs={scs_path.name}", "image_url": png_url, "_scs_filename": scs_path.name}
+    else:
+        session_viewers = None
+
+    # Always generate a UUID-based SCS filename so that different clients (or
+    # different sessions) never collide even when opening the same source file.
+    unique_id = uuid.uuid4().hex[:12]
+    scs_name = f"{unique_id}_{cad_file_path.stem}.scs"
+    scs_path = CAD_VIEWER_OUTPUT_DIR / scs_name
 
     cad_loader = HOOPSLoader()
     model = cad_loader.create_from_file(str(cad_file_path))
@@ -586,23 +595,25 @@ def create_CAD_viewer(cad_file_path: pathlib.Path) -> dict[str, Any]:
     png_path = pathlib.Path(png_path) if png_path else None
 
     png_filename = png_path.name if png_path and png_path.exists() else None
-    CAD_viewers[file_key] = {"scs_filename": scs_path.name, "png_filename": png_filename}
+    if session_viewers is not None:
+        session_viewers[file_key] = {"scs_filename": scs_path.name, "png_filename": png_filename}
 
     png_url = f"/out/{png_filename}" if png_filename else None
-    return {"viewer_url": f"/CAD/viewer/show?scs={scs_path.name}", "image_url": png_url}
+    return {"viewer_url": f"/CAD/viewer/show?scs={scs_path.name}", "image_url": png_url, "_scs_filename": scs_path.name}
 
 
-def terminate_CAD_viewer(terminate_all: bool = False) -> dict[str, Any]:
-    if not CAD_viewers:
+def terminate_CAD_viewer(session_id: Optional[str] = None, terminate_all: bool = False) -> dict[str, Any]:
+    session_viewers = CAD_viewers.get(session_id or "", {})
+    if not session_viewers:
         raise RuntimeError("No active CAD viewer.")
 
     if terminate_all:
-        count = len(CAD_viewers)
-        CAD_viewers.clear()
+        count = len(session_viewers)
+        session_viewers.clear()
         return {"terminated": count}
     else:
-        file_key = next(reversed(CAD_viewers))
-        del CAD_viewers[file_key]
+        file_key = next(reversed(session_viewers))
+        del session_viewers[file_key]
         return {"terminated": 1}
 
 

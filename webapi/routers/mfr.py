@@ -8,6 +8,10 @@ from fastapi.responses import StreamingResponse
 router = APIRouter(prefix="/MFR", tags=["MFR"])
 
 
+def _get_session_id(request: Request) -> Optional[str]:
+    return request.headers.get("X-Session-ID") or None
+
+
 @router.get("/files/search")
 def MFR_search_files(feature_name: str = Query(..., description="MFR feature name to search for.")):
     try:
@@ -59,10 +63,11 @@ def MFR_inference(
             _, cad_file_path, _ = core.upload_CAD_file_persistent(file)
         else:
             raise HTTPException(status_code=422, detail="Either 'file' or 'file_id' is required.")
-        result = core.run_MFR_inference(cad_file_path)
+        result = core.run_MFR_inference(cad_file_path, _get_session_id(request))
         for key in ("viewer_url", "image_url"):
             if result.get(key) and result[key].startswith("/"):
                 result[key] = str(request.base_url).rstrip("/") + result[key]
+        result.pop("_scs_filename", None)
         return result
     except HTTPException:
         raise
