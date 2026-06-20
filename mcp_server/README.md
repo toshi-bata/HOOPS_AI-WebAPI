@@ -9,7 +9,7 @@ See the root [README](../README.md) for an overview of the full platform.
 ## Prerequisites
 
 - [uv](https://github.com/astral-sh/uv) installed on the **Claude Desktop machine** (Claude Desktop uses `uv` to launch the MCP server process)
-- The **WebAPI server** running and accessible (default: `http://127.0.0.1:8001`)  
+- The **WebAPI server** running and accessible (default: `http://127.0.0.1:8000`)  
   → See [webapi/README.md](../webapi/README.md) for setup instructions
 
 ---
@@ -43,7 +43,7 @@ See the root [README](../README.md) for an overview of the full platform.
 **Same machine (default):**
 
 No additional configuration is needed.  
-The MCP server defaults to `http://127.0.0.1:8001`, so if the WebAPI server is running on the same machine, the basic config above works as-is.
+The MCP server defaults to `http://127.0.0.1:8000`, so if the WebAPI server is running on the same machine, the basic config above works as-is.
 
 **When the WebAPI server is on a different machine (client-server setup):**
 
@@ -62,7 +62,7 @@ Claude Desktop passes this value to the MCP server process automatically:
         "server.py"
       ],
       "env": {
-        "HOOPS_WEBAPI_URL": "http://192.168.0.6:8001"
+        "HOOPS_WEBAPI_URL": "http://192.168.0.6:8000"
       }
     }
   }

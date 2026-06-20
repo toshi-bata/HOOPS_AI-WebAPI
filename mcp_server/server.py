@@ -3,7 +3,7 @@ import os
 from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 
-API_BASE = os.environ.get("HOOPS_WEBAPI_URL", "http://127.0.0.1:8001").rstrip("/")
+API_BASE = os.environ.get("HOOPS_WEBAPI_URL", "http://127.0.0.1:8000").rstrip("/")
 
 mcp = FastMCP("HOOPS AI MCP Server")
 

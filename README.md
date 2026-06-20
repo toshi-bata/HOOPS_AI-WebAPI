@@ -57,7 +57,7 @@ See **[webapi/README.md](webapi/README.md)** for full instructions.
 cd webapi
 pip install -r requirements.txt
 copy .env.example .env   # then edit .env with your HOOPS AI license key
-<Path\to\HOOPS_AI\install\dir>\.venv\Scripts\python.exe -m uvicorn main:app --host 0.0.0.0 --port 8001
+<Path\to\HOOPS_AI\install\dir>\.venv\Scripts\python.exe -m uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
 **Linux:**
@@ -65,7 +65,7 @@ copy .env.example .env   # then edit .env with your HOOPS AI license key
 cd webapi
 pip install -r requirements.txt
 cp .env.example .env     # then edit .env with your HOOPS AI license key
-/path/to/HOOPS_AI/install/dir/.venv/bin/python -m uvicorn main:app --host 0.0.0.0 --port 8001
+/path/to/HOOPS_AI/install/dir/.venv/bin/python -m uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
 ### 3. Set up the MCP server (Claude Desktop)
@@ -90,8 +90,8 @@ Register the MCP server in `claude_desktop_config.json`:
 }
 ```
 
-> **Same machine:** The config above works as-is — the MCP server defaults to `http://127.0.0.1:8001`.  
-> **Different machine:** Add `"env": {"HOOPS_WEBAPI_URL": "http://<server-ip>:8001"}` to the config.  
+> **Same machine:** The config above works as-is — the MCP server defaults to `http://127.0.0.1:8000`.  
+> **Different machine:** Add `"env": {"HOOPS_WEBAPI_URL": "http://<server-ip>:8000"}` to the config.  
 > See **[mcp_server/README.md](mcp_server/README.md)** for details.
 
 ---
