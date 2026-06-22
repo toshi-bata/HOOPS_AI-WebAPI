@@ -1,7 +1,10 @@
+import os
+import pathlib
 from typing import Optional
 
 import core
 from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
+from fastapi.responses import FileResponse
 
 router = APIRouter(prefix="/similarity", tags=["CAD Similarity Search"])
 
@@ -34,4 +37,35 @@ def similarity_search(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Similarity search failed: {exc}") from exc
+
+
+@router.get("/part-image")
+def get_part_image(
+    filename: str = Query(..., description="CAD filename (with or without extension) returned by similarity search."),
+):
+    """Return the pre-generated PNG thumbnail for a trained part as a direct PNG image response."""
+    stem = pathlib.Path(filename).stem
+
+    notebooks_dir = pathlib.Path(core.get_required_env("HOOPS_AI_NOTEBOOK_DIR"))
+    images_base_dir = pathlib.Path(
+        os.environ.get("HOOPS_AI_EMBEDDINGS_IMAGES_DIR")
+        or notebooks_dir / "out" / "images"
+    )
+
+    # Search order: STEP/_white.png → STEP/.png → base/_white.png → base/.png
+    candidates = [
+        images_base_dir / "STEP" / f"{stem}_white.png",
+        images_base_dir / "STEP" / f"{stem}.png",
+        images_base_dir / f"{stem}_white.png",
+        images_base_dir / f"{stem}.png",
+    ]
+
+    for candidate in candidates:
+        if candidate.exists():
+            return FileResponse(str(candidate), media_type="image/png")
+
+    raise HTTPException(
+        status_code=404,
+        detail=f"PNG image not found for '{filename}'. Searched: {[str(c) for c in candidates]}",
+    )
 

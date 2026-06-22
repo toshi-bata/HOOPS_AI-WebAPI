@@ -25,7 +25,7 @@ Claude Desktop  ──(natural language)──▶  MCP Server
 ```
 
 - **HOOPS AI** — 3D CAD file loading, geometry encoding, ML inference
-- **WebAPI (FastAPI)** — Exposes HOOPS AI as 11 REST endpoints; leverages HOOPS AI's Python API directly
+- **WebAPI (FastAPI)** — Exposes HOOPS AI as 12 REST endpoints; leverages HOOPS AI's Python API directly
 - **MCP Server** — Wraps the WebAPI; bridges Claude Desktop via the MCP protocol
 - **Claude Desktop** — Chat AI that autonomously calls MCP tools to carry out end-to-end analysis
 

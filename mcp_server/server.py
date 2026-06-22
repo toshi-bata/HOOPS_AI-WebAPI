@@ -28,6 +28,7 @@ def _upload_file(cad_file_path: str) -> str:
     return response.json()["file_id"]
 
 
+
 def _resolve_file_id(cad_file_path: str = "", file_id: str = "") -> str:
     """Return file_id: use existing one or upload the file if not yet uploaded."""
     if file_id:
@@ -131,13 +132,10 @@ def search_MFR_files(
 @mcp.tool()
 def get_MFR_file_thumbnail(file_id: int) -> str:
     """
-    Download the thumbnail PNG image for a given file ID and return it as a base64-encoded string.
+    Return the URL of the thumbnail PNG image for a given file ID.
+    The URL points directly to the PNG and can be used in HTML: <img src="{result}">
     """
-    import base64
-
-    response = httpx.get(f"{API_BASE}/MFR/files/{file_id}/thumbnail", timeout=60)
-    response.raise_for_status()
-    return base64.b64encode(response.content).decode("utf-8")
+    return f"{API_BASE}/MFR/files/{file_id}/thumbnail"
 
 
 @mcp.tool()
@@ -231,7 +229,9 @@ def search_similar_shapes(cad_file_path: str = "", file_id: str = "", top_k: int
 
     Returns the top-k most similar shapes from the indexed database.
     Each hit contains an id (file identifier in the database) and a similarity score.
-    Also returns image_url: a URL path to a PNG grid image of the search results.
+    Also returns image_url: a URL path to a PNG grid image of the search results,
+    and image_base64: the grid image as a base64-encoded PNG string for HTML embedding:
+      <img src="data:image/png;base64,{image_base64}">
     """
     fid = _resolve_file_id(cad_file_path, file_id)
     response = httpx.post(
@@ -240,7 +240,21 @@ def search_similar_shapes(cad_file_path: str = "", file_id: str = "", top_k: int
         timeout=300,
     )
     response.raise_for_status()
-    return response.json()
+    data = response.json()
+
+    image_url = data.get("image_url", "")
+    return data
+
+
+@mcp.tool()
+def get_similar_part_image(filename: str) -> str:
+    """Return the URL of the pre-generated PNG thumbnail for a trained part.
+
+    Pass the CAD filename (with or without extension) returned by search_similar_shapes.
+    The returned URL points directly to the PNG image and can be used in HTML:
+      <img src="{result}">
+    """
+    return f"{API_BASE}/similarity/part-image?filename={filename}"
 
 
 if __name__ == "__main__":

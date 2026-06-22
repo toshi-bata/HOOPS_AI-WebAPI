@@ -78,21 +78,22 @@ Claude Desktop passes this value to the MCP server process automatically:
 
 ## Available MCP Tools
 
-Claude Desktop can call these 11 tools using natural language:
+Claude Desktop can call these 12 tools using natural language:
 
 | Tool | Description |
 |---|---|
-| `open_cad_viewer` | Upload a local CAD file to the server and open it in the interactive 3D browser viewer. Returns `viewer_url` and `image_url` (PNG preview). |
+| `upload_cad_model` | Upload a local CAD file to the server. Returns `file_id`, `filename`, and `already_existed`. Pass `file_id` to other tools to avoid re-uploading. |
+| `open_cad_viewer` | Open a CAD file in the interactive 3D browser viewer. Returns `viewer_url` and `image_url` (PNG preview). |
 | `terminate_CAD_viewer` | Terminate the last active viewer, or all viewers (`terminate_all=True`). |
-| `get_brep_adjacency_graph` | Build a face adjacency graph from a local CAD file. Returns graph data (nodes, edges, counts) and `image_url` (PNG visualization URL). |
-| `get_brep_attributes` | Extract face and edge attributes (types, areas, lengths, dihedral angles, etc.) from a local CAD file. |
+| `get_brep_adjacency_graph` | Build a face adjacency graph from a CAD file. Returns graph data (nodes, edges, counts) and `image_url` (PNG visualization URL). |
+| `get_brep_attributes` | Extract face and edge attributes (types, areas, lengths, dihedral angles, etc.) from a CAD file. |
 | `get_MFR_table_of_contents` | Get a summary of the Manufacturing Feature Recognition (MFR) dataset. |
 | `get_MFR_labels_description` | List all MFR label IDs, feature names, and descriptions. |
 | `search_MFR_files` | Find CAD files in the MFR dataset that contain a given manufacturing feature. |
-| `get_MFR_file_thumbnail` | Download the thumbnail PNG for a given dataset file ID. Returns base64-encoded PNG. |
-| `run_MFR_inference` | Run MFR inference on a local CAD file. Launches the viewer and returns predictions, probabilities, `viewer_url`, and `image_url` (PNG preview). |
-| `colorize_MFR_viewer` | Apply MFR prediction colors to the last active viewer. Returns the color map. Call only after the model has fully loaded in the browser. |
-| `search_similar_shapes` | Upload a local CAD file and find the top-k most similar parts using HOOPS Embeddings and a FAISS index. Returns match IDs, similarity scores, and `image_url` (result grid image URL). |
+| `get_MFR_file_thumbnail` | Return the URL of the thumbnail PNG for a given dataset file ID. |
+| `run_MFR_inference` | Run MFR inference on a CAD file. Launches the viewer and returns predictions, probabilities, `viewer_url`, and `image_url` (PNG preview). |
+| `search_similar_shapes` | Find the top-k most similar parts using HOOPS Embeddings and a FAISS index. Returns match IDs, similarity scores, and `image_url` (result grid image URL). |
+| `get_similar_part_image` | Return the URL of the pre-generated PNG thumbnail for a part filename returned by `search_similar_shapes`. |
 
 ---
 

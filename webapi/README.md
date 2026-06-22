@@ -10,7 +10,7 @@ See the root [README](../README.md) for an overview of the full HOOPS AI MCP pla
 - Python 3.12
 - A valid **HOOPS AI license key**
 - HOOPS AI (CPU or GPU version) installed in the environment
-- **HOOPS AI Tutorials**  Ethe notebooks folder and its contents (ML datasets and pre-trained models) are required to run this server.  
+- **HOOPS AI Tutorials** — the notebooks folder and its contents (ML datasets and pre-trained models) are required to run this server.  
   The tutorials are available at [github.com/techsoft3d/HOOPS-AI-tutorials](https://github.com/techsoft3d/HOOPS-AI-tutorials/tree/main).  
   Data packages (datasets and trained model checkpoints) must be obtained from the Tech Soft 3D File Transfer service by following the HOOPS AI installation instructions.  
   > **Note:** The `notebooks/` and `packages/` folders must both reside directly under the HOOPS AI install directory:  
@@ -63,8 +63,8 @@ cp .env.example .env
 
 | Variable | Required | Description |
 |---|---|---|
-| `HOOPS_AI_LICENSE` | ✁E| Your HOOPS AI license key |
-| `HOOPS_AI_NOTEBOOK_DIR` | ✁E| Absolute path to your HOOPS AI notebooks directory |
+| `HOOPS_AI_LICENSE` | ✅ | Your HOOPS AI license key |
+| `HOOPS_AI_NOTEBOOK_DIR` | ✅ | Absolute path to your HOOPS AI notebooks directory |
 | `HOOPS_AI_MFR_FLOW_NAME` | optional | MFR flow name (dataset files are resolved relative to this) |
 | `HOOPS_AI_MFR_MODEL_NAME` | optional | MFR trained model checkpoint filename (e.g. `ts3d_162k_mfr.ckpt`) |
 | `HOOPS_AI_EMBEDDINGS_MODEL_NAME` | optional | Embeddings trained model checkpoint filename (e.g. `ts3d_1M_hoops_embeddings.ckpt`) |
@@ -136,9 +136,42 @@ cd webapi
 
 ## API Endpoints
 
+### File Management
+
+#### Upload CAD file
+
+Upload a local CAD file to the server. Returns a `file_id` derived from the file's SHA-256 hash.
+Uploading the same file again returns the same `file_id` without re-storing the file.
+
+```
+POST /files/upload
+```
+
+**Windows (PowerShell):**
+```powershell
+curl.exe -X POST "http://<server-ip>:8000/files/upload" `
+         -F "file=@C:\path\to\model.stp"
+```
+
+**Linux:**
+```bash
+curl -X POST "http://<server-ip>:8000/files/upload" \
+     -F "file=@/path/to/model.stp"
+```
+
+**Response:**
+
+```json
+{ "file_id": "a3f8c2...", "filename": "model.stp", "already_existed": false }
+```
+
+Pass the returned `file_id` to any processing endpoint instead of re-uploading the same file.
+
+---
+
 ### 3D CAD Viewer
 
-#### Launch viewer  EUpload file
+#### Launch viewer — Upload file
 
 Upload a local CAD file and open an interactive browser viewer.
 
@@ -170,7 +203,7 @@ Open the returned `viewer_url` in your browser to view the model. `image_url` is
 
 > **Note:** The `out/` and `uploads/` folders are automatically cleared on server startup.
 
-#### Launch viewer  EShared folder path
+#### Launch viewer — Shared folder path
 
 Open a CAD file already present in the shared folder (`HOOPS_AI_CAD_SHARED_DIR`).
 
@@ -453,8 +486,28 @@ curl -X POST "http://<server-ip>:8000/similarity/search?top_k=10" \
 }
 ```
 
-- `results`  Etop-k matches sorted by similarity score (higher = more similar)
-- `image_url`  EURL to a PNG grid image of the search results
+- `results` — top-k matches sorted by similarity score (higher = more similar)
+- `image_url` — URL to a PNG grid image of the search results
+
+#### Part thumbnail image
+
+Return the pre-generated PNG thumbnail for a trained part by filename.
+
+```
+GET /similarity/part-image?filename=<name>
+```
+
+**Windows (PowerShell):**
+```powershell
+curl.exe "http://<server-ip>:8000/similarity/part-image?filename=part_042.stp" -o part_042.png
+```
+
+**Linux:**
+```bash
+curl "http://<server-ip>:8000/similarity/part-image?filename=part_042.stp" -o part_042.png
+```
+
+**Response:** PNG image (`image/png`)
 
 ---
 
