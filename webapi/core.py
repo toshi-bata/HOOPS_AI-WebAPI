@@ -319,6 +319,17 @@ def load_shape_index():
     faiss_file_name = get_required_env("HOOPS_AI_FAISS_INDEX_PATH")
     faiss_index_path = notebooks_dir.joinpath(faiss_file_name)
     searcher = get_cad_searcher()
+    # The FAISS index may have been pickled on Windows and contain WindowsPath objects.
+    # Patch WindowsPath → PosixPath so it can be unpickled on Linux.
+    if not hasattr(pathlib, "WindowsPath") or not issubclass(pathlib.WindowsPath, pathlib.Path):
+        pathlib.WindowsPath = pathlib.PurePosixPath  # type: ignore[attr-defined]
+    else:
+        _orig = pathlib.WindowsPath
+        try:
+            pathlib.WindowsPath = pathlib.PosixPath  # type: ignore[misc]
+            return searcher.load_shape_index(path=str(faiss_index_path))
+        finally:
+            pathlib.WindowsPath = _orig
     return searcher.load_shape_index(path=str(faiss_index_path))
 
 

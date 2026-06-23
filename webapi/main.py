@@ -16,7 +16,7 @@ async def lifespan(app: FastAPI):
     import shutil
     for folder in (core.CAD_UPLOAD_DIR, core.CAD_VIEWER_OUTPUT_DIR):
         if folder.exists():
-            shutil.rmtree(folder)
+            shutil.rmtree(folder, ignore_errors=True)
         folder.mkdir(parents=True, exist_ok=True)
     core.init_hoops_license()
     yield

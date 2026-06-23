@@ -166,6 +166,36 @@ HOOPS_AI_VENV=/custom/path/.venv ./webapi/start_server.sh
 > Replace the path prefix with the actual directory where HOOPS AI is installed.
 > The venv Python executable ensures HOOPS AI packages from that environment are used.
 
+> **Tip — Auto-start on boot (systemd) and file permission issues:**
+>
+> If you run the server as a systemd service, make sure the service runs as the **same user** you use for manual testing (typically `ubuntu`), not as `root`.  
+> Running as `root` causes uploaded files to be owned by `root`, which then triggers a `PermissionError` when the server tries to clean the `uploads/` folder on the next startup by a non-root user.
+>
+> Use `User=` and `Group=` in the `[Service]` section of your unit file:
+>
+> ```ini
+> [Unit]
+> Description=HOOPS AI WebAPI Server
+> After=network.target
+>
+> [Service]
+> Type=simple
+> User=ubuntu
+> Group=ubuntu
+> WorkingDirectory=/var/HOOPS_AI-MCP/webapi
+> ExecStart=/var/HOOPS_AI-MCP/webapi/start_server.sh --host 0.0.0.0 --port 8000
+> Restart=on-failure
+> RestartSec=5
+>
+> [Install]
+> WantedBy=multi-user.target
+> ```
+>
+> If you already have files owned by `root` in `uploads/`, fix ownership once with:
+> ```bash
+> sudo chown -R ubuntu:ubuntu /var/HOOPS_AI-MCP/webapi/uploads
+> ```
+
 > **Note:** Port `8000` is the default. If port 8000 is already in use, the server will print an error and exit — simply retry with a different port (e.g. `--port 8001`) and update `HOOPS_WEBAPI_URL` in the MCP server config accordingly.
 
 > **Note (Windows):** To allow connections from other machines on the LAN, add a Windows Firewall inbound rule for port 8000 (TCP).
