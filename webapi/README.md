@@ -28,12 +28,42 @@ See the root [README](../README.md) for an overview of the full HOOPS AI MCP pla
 
 ### 1. Install dependencies
 
-```bash
+Install HOOPS AI (CPU or GPU version) separately according to your HOOPS AI distribution instructions.
+Then install the WebAPI dependencies into the **HOOPS AI virtual environment**:
+
+**Windows:**
+```bat
 cd webapi
-pip install -r requirements.txt
+<Path\to\HOOPS_AI\install\dir>\.venv\Scripts\pip.exe install -r requirements.txt
 ```
 
-> Install HOOPS AI (CPU or GPU version) separately according to your HOOPS AI distribution instructions.
+**Linux:**
+```bash
+cd webapi
+/path/to/HOOPS_AI/install/dir/.venv/bin/pip install -r requirements.txt
+```
+
+> On Ubuntu 22.04+ the system Python is externally managed (PEP 668) and will reject bare `pip install`.
+> Using the HOOPS AI venv's pip avoids this restriction and ensures the same Python that runs the server has all required packages.
+
+#### Additional steps for headless Linux (Ubuntu 22.04)
+
+HOOPS AI requires OpenGL and a display to validate its license and render CAD files.
+On a headless server (no GPU, no monitor), install the following system packages:
+
+```bash
+sudo apt-get install -y libglu1-mesa libgl1 libgl1-mesa-dri libosmesa6 xvfb
+```
+
+| Package | Purpose |
+|---|---|
+| `libglu1-mesa` | OpenGL Utility Library |
+| `libgl1` | OpenGL runtime |
+| `libgl1-mesa-dri` | Mesa software renderer (swrast) |
+| `libosmesa6` | Off-screen Mesa rendering |
+| `xvfb` | Virtual framebuffer (headless display) |
+
+Then start a virtual display before launching the server (see [Step 4](#4-start-the-server)).
 
 ### 2. Place the web viewer JS file
 
@@ -99,6 +129,38 @@ cd webapi
 ```bash
 cd webapi
 /path/to/HOOPS_AI/install/dir/.venv/bin/python main.py --host 0.0.0.0 --port 8000
+```
+
+**Linux (headless — Ubuntu 22.04 without display):**
+
+HOOPS AI requires a display for license validation and 3D rendering. Start a virtual framebuffer first:
+
+```bash
+# Start virtual display (if not already running)
+Xvfb :99 -screen 0 1280x960x24 &
+
+# Launch the server with DISPLAY set
+DISPLAY=:99 /path/to/HOOPS_AI/install/dir/.venv/bin/python /path/to/HOOPS_AI-MCP/webapi/main.py --host 0.0.0.0 --port 8000
+```
+
+> The xkbcomp warnings printed by Xvfb (`Could not resolve keysym XF86...`) are harmless and can be ignored.
+
+> If Xvfb fails with `Server is already active for display 99`, the virtual display is already running — skip the `Xvfb` line and proceed directly to the `DISPLAY=:99 python ...` command.
+
+Alternatively, use the provided startup script which handles Xvfb automatically:
+
+```bash
+# Make executable (first time only)
+chmod +x webapi/start_server.sh
+
+# Run (default: --host 0.0.0.0 --port 8000)
+./webapi/start_server.sh
+
+# Custom port
+./webapi/start_server.sh --port 8001
+
+# Custom HOOPS AI venv path
+HOOPS_AI_VENV=/custom/path/.venv ./webapi/start_server.sh
 ```
 
 > Replace the path prefix with the actual directory where HOOPS AI is installed.
