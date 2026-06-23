@@ -30,8 +30,8 @@ See the root [README](../README.md) for an overview of the full platform.
       "args": [
         "run",
         "--directory",
-        "C:\\path\\to\\HOOPS_AI-MCP",
-        "mcp_server/server.py"
+        "C:\\path\\to\\HOOPS_AI-MCP\\mcp_server",
+        "server.py"
       ]
     }
   }
@@ -39,6 +39,16 @@ See the root [README](../README.md) for an overview of the full platform.
 ```
 
 > Replace `C:\\path\\to\\HOOPS_AI-MCP` with the actual path where you cloned this repository.
+
+> **Troubleshooting — `uv` not found:** Claude Desktop launches with a limited PATH and may fail to find `uv` even if it works in your terminal.  
+> If the MCP server does not appear in Claude Desktop, use the **full path** to `uv.exe` instead of `"uv"`:
+> ```powershell
+> where.exe uv   # find the full path, e.g. C:\Users\<you>\.local\bin\uv.exe
+> ```
+> Then update `"command"` in the config:
+> ```json
+> "command": "C:\\Users\\<you>\\.local\\bin\\uv.exe"
+> ```
 
 **Same machine (default):**
 

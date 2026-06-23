@@ -82,8 +82,8 @@ Register the MCP server in `claude_desktop_config.json`:
       "args": [
         "run",
         "--directory",
-        "C:\\path\\to\\HOOPS_AI-MCP",
-        "mcp_server/server.py"
+        "C:\\path\\to\\HOOPS_AI-MCP\\mcp_server",
+        "server.py"
       ]
     }
   }
