@@ -33,9 +33,11 @@ Claude Desktop  ──(natural language)──▶  MCP Server
 
 ```
 HOOPS_AI-MCP/
-├── webapi/         # FastAPI REST API  →  see webapi/README.md
-└── mcp_server/     # MCP server for Claude Desktop  →  see mcp_server/README.md
+└── webapi/         # FastAPI REST API  →  see webapi/README.md
 ```
+
+> The MCP server for Claude Desktop is maintained in a separate repository:  
+> **[HOOPS_AI-MCP-client](https://github.com/toshi-bata/HOOPS_AI-MCP-client)**
 
 ---
 
@@ -70,7 +72,13 @@ cp .env.example .env     # then edit .env with your HOOPS AI license key
 
 ### 3. Set up the MCP server (Claude Desktop)
 
-See **[mcp_server/README.md](mcp_server/README.md)** for full instructions.
+Clone the MCP server repository and register it in Claude Desktop:
+
+```bash
+git clone https://github.com/toshi-bata/HOOPS_AI-MCP-client.git
+```
+
+See **[HOOPS_AI-MCP-client](https://github.com/toshi-bata/HOOPS_AI-MCP-client)** for full instructions.
 
 Register the MCP server in `claude_desktop_config.json`:
 
@@ -82,7 +90,7 @@ Register the MCP server in `claude_desktop_config.json`:
       "args": [
         "run",
         "--directory",
-        "C:\\path\\to\\HOOPS_AI-MCP\\mcp_server",
+        "C:\\path\\to\\HOOPS_AI-MCP-client",
         "server.py"
       ]
     }
@@ -92,7 +100,7 @@ Register the MCP server in `claude_desktop_config.json`:
 
 > **Same machine:** The config above works as-is — the MCP server defaults to `http://127.0.0.1:8000`.  
 > **Different machine:** Add `"env": {"HOOPS_WEBAPI_URL": "http://<server-ip>:8000"}` to the config.  
-> See **[mcp_server/README.md](mcp_server/README.md)** for details.
+> See **[HOOPS_AI-MCP-client](https://github.com/toshi-bata/HOOPS_AI-MCP-client)** for details.
 
 ---
 
