@@ -1,4 +1,4 @@
-﻿# HOOPS AI WebAPI
+# HOOPS AI WebAPI
 
 A FastAPI-based REST API that exposes [HOOPS AI](https://www.techsoft3d.com/developers/products/hoops-ai/) (Tech Soft 3D) capabilities as HTTP endpoints.
 
@@ -9,16 +9,16 @@ A FastAPI-based REST API that exposes [HOOPS AI](https://www.techsoft3d.com/deve
 - Python 3.12
 - A valid **HOOPS AI license key**
 - HOOPS AI (CPU or GPU version) installed in the environment
-- **HOOPS AI Tutorials** 窶・the notebooks folder and its contents (ML datasets and pre-trained models) are required to run this server.  
+- **HOOPS AI Tutorials** – the notebooks folder and its contents (ML datasets and pre-trained models) are required to run this server.  
   The tutorials are available at [github.com/techsoft3d/HOOPS-AI-tutorials](https://github.com/techsoft3d/HOOPS-AI-tutorials/tree/main).  
   Data packages (datasets and trained model checkpoints) must be obtained from the Tech Soft 3D File Transfer service by following the HOOPS AI installation instructions.  
   > **Note:** The `notebooks/` and `packages/` folders must both reside directly under the HOOPS AI install directory:  
   > ```
   > <HOOPS_AI_INSTALL_DIR>/
-  > 笏懌楳笏 notebooks/
-  > 笏披楳笏 packages/
-  >     笏懌楳笏 flows/
-  >     笏披楳笏 trained_ml_models/
+  > ├── notebooks/
+  > └── packages/
+  >     ├── flows/
+  >     └── trained_ml_models/
   > ```
 
 ---
@@ -92,8 +92,8 @@ cp .env.example .env
 
 | Variable | Required | Description |
 |---|---|---|
-| `HOOPS_AI_LICENSE` | 笨・| Your HOOPS AI license key |
-| `HOOPS_AI_NOTEBOOK_DIR` | 笨・| Absolute path to your HOOPS AI notebooks directory |
+| `HOOPS_AI_LICENSE` | ✓ | Your HOOPS AI license key |
+| `HOOPS_AI_NOTEBOOK_DIR` | ✓ | Absolute path to your HOOPS AI notebooks directory |
 | `HOOPS_AI_MFR_FLOW_NAME` | optional | MFR flow name (dataset files are resolved relative to this) |
 | `HOOPS_AI_MFR_MODEL_NAME` | optional | MFR trained model checkpoint filename (e.g. `ts3d_162k_mfr.ckpt`) |
 | `HOOPS_AI_EMBEDDINGS_MODEL_NAME` | optional | Embeddings trained model checkpoint filename (e.g. `ts3d_1M_hoops_embeddings.ckpt`) |
@@ -130,7 +130,7 @@ cd webapi
 /path/to/HOOPS_AI/install/dir/.venv/bin/python main.py --host 0.0.0.0 --port 8000
 ```
 
-**Linux (headless 窶・Ubuntu 22.04 without display):**
+**Linux (headless – Ubuntu 22.04 without display):**
 
 HOOPS AI requires a display for license validation and 3D rendering. Start a virtual framebuffer first:
 
@@ -144,7 +144,7 @@ DISPLAY=:99 /path/to/HOOPS_AI/install/dir/.venv/bin/python /path/to/HOOPS_AI-MCP
 
 > The xkbcomp warnings printed by Xvfb (`Could not resolve keysym XF86...`) are harmless and can be ignored.
 
-> If Xvfb fails with `Server is already active for display 99`, the virtual display is already running 窶・skip the `Xvfb` line and proceed directly to the `DISPLAY=:99 python ...` command.
+> If Xvfb fails with `Server is already active for display 99`, the virtual display is already running – skip the `Xvfb` line and proceed directly to the `DISPLAY=:99 python ...` command.
 
 Alternatively, use the provided startup script which handles Xvfb automatically:
 
@@ -165,7 +165,7 @@ HOOPS_AI_VENV=/custom/path/.venv ./start_server.sh
 > Replace the path prefix with the actual directory where HOOPS AI is installed.
 > The venv Python executable ensures HOOPS AI packages from that environment are used.
 
-> **Tip 窶・Auto-start on boot (systemd) and file permission issues:**
+> **Tip – Auto-start on boot (systemd) and file permission issues:**
 >
 > If you run the server as a systemd service, make sure the service runs as the **same user** you use for manual testing (typically `ubuntu`), not as `root`.  
 > Running as `root` causes uploaded files to be owned by `root`, which then triggers a `PermissionError` when the server tries to clean the `uploads/` folder on the next startup by a non-root user.
@@ -195,7 +195,7 @@ HOOPS_AI_VENV=/custom/path/.venv ./start_server.sh
 > sudo chown -R ubuntu:ubuntu /var/HOOPS_AI-MCP/uploads
 > ```
 
-> **Note:** Port `8000` is the default. If port 8000 is already in use, the server will print an error and exit 窶・simply retry with a different port (e.g. `--port 8001`) and update `HOOPS_WEBAPI_URL` in the MCP server config accordingly.
+> **Note:** Port `8000` is the default. If port 8000 is already in use, the server will print an error and exit – simply retry with a different port (e.g. `--port 8001`) and update `HOOPS_WEBAPI_URL` in the MCP server config accordingly.
 
 > **Note (Windows):** To allow connections from other machines on the LAN, add a Windows Firewall inbound rule for port 8000 (TCP).
 
@@ -219,8 +219,8 @@ cd webapi
 - Interactive docs (Swagger UI): `http://<server-ip>:8000/docs`
 
 > **`<server-ip>` substitution:**  
-> - **Same machine** 窶・use `127.0.0.1` (e.g. `http://127.0.0.1:8000`). No IP lookup needed.  
-> - **Different machine** 窶・use the LAN IP of the server machine (e.g. `http://192.168.0.6:8000`).  
+> - **Same machine** – use `127.0.0.1` (e.g. `http://127.0.0.1:8000`). No IP lookup needed.  
+> - **Different machine** – use the LAN IP of the server machine (e.g. `http://192.168.0.6:8000`).  
 >   On Windows, run `ipconfig` on the server to find its IP address.
 
 ---
@@ -262,7 +262,7 @@ Pass the returned `file_id` to any processing endpoint instead of re-uploading t
 
 ### 3D CAD Viewer
 
-#### Launch viewer 窶・Upload file
+#### Launch viewer – Upload file
 
 Upload a local CAD file and open an interactive browser viewer.
 
@@ -294,7 +294,7 @@ Open the returned `viewer_url` in your browser to view the model. `image_url` is
 
 > **Note:** The `out/` and `uploads/` folders are automatically cleared on server startup.
 
-#### Launch viewer 窶・Shared folder path
+#### Launch viewer – Shared folder path
 
 Open a CAD file already present in the shared folder (`HOOPS_AI_CAD_SHARED_DIR`).
 
@@ -577,8 +577,8 @@ curl -X POST "http://<server-ip>:8000/similarity/search?top_k=10" \
 }
 ```
 
-- `results` 窶・top-k matches sorted by similarity score (higher = more similar)
-- `image_url` 窶・URL to a PNG grid image of the search results
+- `results` – top-k matches sorted by similarity score (higher = more similar)
+- `image_url` – URL to a PNG grid image of the search results
 
 #### Part thumbnail image
 
