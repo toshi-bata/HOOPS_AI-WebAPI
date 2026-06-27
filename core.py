@@ -320,17 +320,18 @@ def load_shape_index():
     faiss_index_path = notebooks_dir.joinpath(faiss_file_name)
     searcher = get_cad_searcher()
     # The FAISS index may have been pickled on Windows and contain WindowsPath objects.
-    # Patch WindowsPath → PosixPath so it can be unpickled on Linux.
     if not hasattr(pathlib, "WindowsPath") or not issubclass(pathlib.WindowsPath, pathlib.Path):
+        # Linux/Mac: patch WindowsPath → PurePosixPath so Windows-pickled data can be unpickled.
         pathlib.WindowsPath = pathlib.PurePosixPath  # type: ignore[attr-defined]
+        return searcher.load_shape_index(path=str(faiss_index_path))
     else:
-        _orig = pathlib.WindowsPath
+        # Windows: patch PosixPath → WindowsPath so Linux-pickled data can be unpickled.
+        _orig = pathlib.PosixPath
         try:
-            pathlib.WindowsPath = pathlib.PosixPath  # type: ignore[misc]
+            pathlib.PosixPath = pathlib.WindowsPath  # type: ignore[misc]
             return searcher.load_shape_index(path=str(faiss_index_path))
         finally:
-            pathlib.WindowsPath = _orig
-    return searcher.load_shape_index(path=str(faiss_index_path))
+            pathlib.PosixPath = _orig
 
 
 def search_by_shape(cad_file_path: pathlib.Path, top_k: int = 10) -> dict[str, Any]:
