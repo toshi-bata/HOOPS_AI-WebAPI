@@ -11,15 +11,28 @@ A FastAPI-based REST API that exposes [HOOPS AI](https://www.techsoft3d.com/deve
 - HOOPS AI (CPU or GPU version) installed in the environment
 - **HOOPS AI Tutorials** – the notebooks folder and its contents (ML datasets and pre-trained models) are required to run this server.  
   The tutorials are available at [github.com/techsoft3d/HOOPS-AI-tutorials](https://github.com/techsoft3d/HOOPS-AI-tutorials/tree/main).  
-  Data packages (datasets and trained model checkpoints) must be obtained from the Tech Soft 3D File Transfer service by following the HOOPS AI installation instructions.  
-  > **Note:** The `notebooks/` and `packages/` folders must both reside directly under the HOOPS AI install directory:  
-  > ```
-  > <HOOPS_AI_INSTALL_DIR>/
-  > ├── notebooks/
-  > └── packages/
-  >     ├── flows/
-  >     └── trained_ml_models/
-  > ```
+  Data packages (datasets and trained model checkpoints) must be obtained from the Tech Soft 3D File Transfer service by following the HOOPS AI installation instructions.
+
+  **Directory layout** – `notebooks/` and `packages/` must both reside directly under the HOOPS AI install directory:
+
+  ```
+  <HOOPS_AI_INSTALL_DIR>/
+  ├── notebooks/
+  └── packages/
+      ├── flows/
+      └── trained_ml_models/
+  ```
+
+  **Pre-run requirements** – some endpoints require notebook output to be generated in advance:
+
+  | Endpoint | Notebook to run | Generated files |
+  |---|---|---|
+  | MFR endpoints | `3b_workflow_for_MFR_cadsynth.ipynb` | `notebooks/out/flows/<flow_name>/`<br>`.dataset` / `.infoset` / `.attribset` |
+  | `/similarity/search` | `5b_cad_search_using_HOOPS_embeddings.ipynb`<br>(up to **Saving an Index**) | `fabwave_embeddings_store.faiss` |
+
+  > **Tip:** Pre-generated dataset files are also available for download from the Tech Soft 3D File Transfer service — no need to run the notebooks yourself:  
+  > URL: https://transfer.techsoft3d.com/link/fIPcX3oc3UQXl7eEaB387F  
+  > Password: `HOOPS-AI-RELEASE`
 
 ---
 
@@ -544,8 +557,6 @@ curl -X POST "http://<server-ip>:8000/MFR/viewer/colorize"
 ---
 
 ### Shape Similarity Search
-
-> **Prerequisite:** Before using this endpoint, you must build the FAISS index by running the notebook `5b_cad_search_using_HOOPS_embeddings.ipynb` up to and including the **Saving an Index** section. This generates `fabwave_embeddings_store.faiss` in the notebooks folder. Without this file the similarity search endpoint will fail.
 
 Upload a CAD file and retrieve the most similar parts from the indexed database using HOOPS Embeddings and a FAISS index.
 
