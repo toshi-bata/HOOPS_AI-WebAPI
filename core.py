@@ -769,12 +769,30 @@ def create_part_class_inference_model():
     model_name = get_required_env("HOOPS_AI_PART_CLASS_MODEL_NAME")
     ckpt_path = notebooks_dir.parent / "packages" / "trained_ml_models" / model_name
 
+    use_gnn = os.environ.get("HOOPS_AI_PART_CLASS_USE_GNN_SURFACE_ENCODER", "false").lower() != "false"
+
     output_dir = notebooks_dir / "out"
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Checkpoints saved with older PyG store NNConv's edge MLP as 'edge_func';
+    # current PyG renamed it to 'nn'.  Register a pre-hook to remap keys on load.
+    try:
+        from torch_geometric.nn import NNConv
+
+        def _remap_edge_func(module, state_dict, prefix, *_args, **_kwargs):
+            old_prefix = prefix + "edge_func"
+            new_prefix = prefix + "nn"
+            for old_k in [k for k in state_dict if k.startswith(old_prefix)]:
+                new_k = new_prefix + old_k[len(old_prefix):]
+                state_dict[new_k] = state_dict.pop(old_k)
+
+        NNConv.register_load_state_dict_pre_hook(_remap_edge_func)
+    except Exception:
+        pass
+
     solid_classification = GraphClassification(
         num_classes=45,
-        use_gnn_surface_encoder=True,
+        use_gnn_surface_encoder=use_gnn,
         result_dir=str(output_dir),
     )
     inference_model = FlowInference(
