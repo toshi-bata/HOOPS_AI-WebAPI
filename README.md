@@ -32,7 +32,7 @@ A FastAPI-based REST API that exposes [HOOPS AI](https://www.techsoft3d.com/deve
   | `/part-classification/dataset/*` | `3c_workflow_for_Part_classification_fabwave.ipynb`<br>(up to **Pipeline execution**) | flow `.dataset` / `.infoset` / `.attribset`<br>`stream_cache/*.png` |
 
   > **Tip:** Pre-generated dataset files are also available for download from the Tech Soft 3D File Transfer service — no need to run the notebooks yourself:  
-  > URL: https://transfer.techsoft3d.com/link/fIPcX3oc3UQXl7eEaB387F  
+  > URL: https://transfer.techsoft3d.com/link/mb9c3d8eTHhVHFpnI0FFaD  
   > Password: `HOOPS-AI-RELEASE`
 
 ---
