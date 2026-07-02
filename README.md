@@ -29,6 +29,7 @@ A FastAPI-based REST API that exposes [HOOPS AI](https://www.techsoft3d.com/deve
   |---|---|---|
   | MFR endpoints | `3b_workflow_for_MFR_cadsynth.ipynb` | `notebooks/out/flows/<flow_name>/`<br>`.dataset` / `.infoset` / `.attribset` |
   | `/similarity/search` | `5b_cad_search_using_HOOPS_embeddings.ipynb`<br>(up to **Saving an Index**) | `fabwave_embeddings_store.faiss` |
+  | `/part-classification/*` | `3c_workflow_for_Part_classification_fabwave.ipynb`<br>then `4c_train_a_ml_model_to_classify_parts.ipynb` | flow dataset files + trained `.ckpt` checkpoint |
 
   > **Tip:** Pre-generated dataset files are also available for download from the Tech Soft 3D File Transfer service — no need to run the notebooks yourself:  
   > URL: https://transfer.techsoft3d.com/link/fIPcX3oc3UQXl7eEaB387F  
@@ -109,6 +110,10 @@ cp .env.example .env
 | `HOOPS_AI_MFR_MODEL_NAME` | optional | MFR trained model checkpoint filename (e.g. `ts3d_162k_mfr.ckpt`) |
 | `HOOPS_AI_EMBEDDINGS_MODEL_NAME` | optional | Embeddings trained model checkpoint filename (e.g. `ts3d_1M_hoops_embeddings.ckpt`) |
 | `HOOPS_AI_FAISS_INDEX_PATH` | optional | FAISS index file for shape similarity search (e.g. `fabwave_embeddings_store.faiss`) |
+| `HOOPS_AI_PART_CLASS_CHECKPOINT_PATH` | optional | Path to the trained GraphClassification checkpoint (`.ckpt`) for Part Classification |
+| `HOOPS_AI_PART_CLASS_FLOW_NAME` | optional | Part Classification flow name (required for `/part-classification/dataset/*` endpoints) |
+| `HOOPS_AI_PART_CLASS_FLOW_ROOT` | optional | Override flow root directory (default: `<HOOPS_AI_NOTEBOOK_DIR>/../packages/flows/<flow_name>`) |
+| `HOOPS_AI_PART_CLASS_LABEL_KEY` | optional | Label array key for dataset queries (default: `part_label`; use `task_A` for custom ETL) |
 
 > **Note:** `HOOPS_AI_LICENSE` is read **only** from the `.env` file, not from system environment variables.
 
@@ -601,6 +606,135 @@ curl.exe "http://<server-ip>:8000/similarity/part-image?filename=part_042.stp" -
 **Linux:**
 ```bash
 curl "http://<server-ip>:8000/similarity/part-image?filename=part_042.stp" -o part_042.png
+```
+
+**Response:** PNG image (`image/png`)
+
+---
+
+### Part Classification
+
+Classify a CAD solid into one of 45 part categories (FabWave dataset) using a trained Graph Classification model.
+
+**Prerequisites:** Run `3c_workflow_for_Part_classification_fabwave.ipynb` to build the dataset, then `4c_train_a_ml_model_to_classify_parts.ipynb` to train the model. Set `HOOPS_AI_PART_CLASS_CHECKPOINT_PATH` (and `HOOPS_AI_PART_CLASS_FLOW_NAME` for dataset endpoints) in `.env`.
+
+#### Run inference
+
+Upload a CAD file and classify it into one of the 45 part categories. Returns the top-k predictions with class ID, part name, and confidence (%).
+
+```
+POST /part-classification/predict?top_k=5
+```
+
+**Windows (PowerShell):**
+```powershell
+curl.exe -X POST "http://<server-ip>:8000/part-classification/predict?top_k=5" `
+    -F "file=@C:\path\to\model.stp"
+```
+
+**Linux:**
+```bash
+curl -X POST "http://<server-ip>:8000/part-classification/predict?top_k=5" \
+    -F "file=@/path/to/model.stp"
+```
+
+**Reuse an uploaded file by `file_id`:**
+```powershell
+# Windows
+curl.exe -X POST "http://<server-ip>:8000/part-classification/predict?file_id=<file_id>&top_k=5"
+```
+```bash
+# Linux
+curl -X POST "http://<server-ip>:8000/part-classification/predict?file_id=<file_id>&top_k=5"
+```
+
+**Response:**
+
+```json
+{
+  "predicted_class_id": 30,
+  "predicted_part_name": "Gears",
+  "top_predictions": [
+    {"rank": 1, "class_id": 30, "part_name": "Gears",       "confidence": 87},
+    {"rank": 2, "class_id": 32, "part_name": "Idler Sprocket", "confidence": 8},
+    {"rank": 3, "class_id": 34, "part_name": "Miter Gears", "confidence": 3},
+    {"rank": 4, "class_id": 29, "part_name": "Gear Rod Stock", "confidence": 1},
+    {"rank": 5, "class_id": 33, "part_name": "Miter Gear Set Screw", "confidence": 1}
+  ]
+}
+```
+
+#### List all part labels
+
+Returns the full 45-class label dictionary.
+
+```
+GET /part-classification/labels
+```
+
+**Windows (PowerShell):** `curl.exe "http://<server-ip>:8000/part-classification/labels"`
+
+**Linux:** `curl "http://<server-ip>:8000/part-classification/labels"`
+
+#### Dataset table of contents
+
+```
+GET /part-classification/dataset/table-of-contents
+```
+
+**Windows (PowerShell):** `curl.exe "http://<server-ip>:8000/part-classification/dataset/table-of-contents"`
+
+**Linux:** `curl "http://<server-ip>:8000/part-classification/dataset/table-of-contents"`
+
+#### Per-class file count distribution
+
+```
+GET /part-classification/dataset/label-distribution
+```
+
+**Windows (PowerShell):** `curl.exe "http://<server-ip>:8000/part-classification/dataset/label-distribution"`
+
+**Linux:** `curl "http://<server-ip>:8000/part-classification/dataset/label-distribution"`
+
+**Response:**
+```json
+{
+  "label_key": "part_label",
+  "bins": [
+    {"class_id": 0, "part_name": "Bearings", "bin_start": 0.0, "bin_end": 1.0, "file_count": 42},
+    {"class_id": 1, "part_name": "Bolts",    "bin_start": 1.0, "bin_end": 2.0, "file_count": 38}
+  ]
+}
+```
+
+#### List files for a class
+
+Returns the file IDs in the dataset that belong to a specific class.
+
+```
+GET /part-classification/dataset/files?label_id=<0-44>
+```
+
+**Windows (PowerShell):** `curl.exe "http://<server-ip>:8000/part-classification/dataset/files?label_id=30"`
+
+**Linux:** `curl "http://<server-ip>:8000/part-classification/dataset/files?label_id=30"`
+
+#### Dataset thumbnail preview (PNG)
+
+Returns a PNG grid of dataset thumbnails for a given class.
+
+```
+GET /part-classification/dataset/preview?label_id=<0-44>&k=25&grid_cols=8
+```
+
+**Windows (PowerShell):**
+```powershell
+Invoke-RestMethod -Uri "http://<server-ip>:8000/part-classification/dataset/preview?label_id=30&k=25" -OutFile "preview.png"
+```
+
+**Linux:**
+```bash
+curl "http://<server-ip>:8000/part-classification/dataset/preview?label_id=30&k=25" -o preview.png
 ```
 
 **Response:** PNG image (`image/png`)
