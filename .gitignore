@@ -6,3 +6,4 @@ out/
 .venv/
 demo/
 static/hoops-web-viewer-monolith.mjs
+notebooks/

@@ -16,39 +16,6 @@ ENV_FILE_PATH = pathlib.Path(__file__).with_name(".env")
 CAD_UPLOAD_DIR = APP_ROOT.joinpath("uploads")
 CAD_VIEWER_OUTPUT_DIR = APP_ROOT.joinpath("out")
 MFR_LABELS_DESCRIPTION_ENV_NAMES = ("HOOPS_AI_MFR_LABELS_DESCRIPTION", "labels_description")
-DEFAULT_MFR_LABELS_DESCRIPTION: dict[int, dict[str, str]] = {
-    0: {"name": "no-label", "description": "No label assigned."},
-    1: {"name": "rectangular_through_slot", "description": "This is a rectangular MFR feature."},
-    2: {"name": "triangular_through_slot", "description": "Triangular through-slot feature."},
-    3: {"name": "rectangular_passage", "description": "Rectangular passage feature."},
-    4: {"name": "triangular_passage", "description": "Triangular passage feature."},
-    5: {"name": "6sides_passage", "description": "Six-sided passage feature."},
-    6: {"name": "rectangular_through_step", "description": "Rectangular through-step feature."},
-    7: {"name": "2sides_through_step", "description": "Two-sided through-step feature."},
-    8: {"name": "slanted_through_step", "description": "Slanted through-step feature."},
-    9: {"name": "rectangular_blind_step", "description": "Rectangular blind-step feature."},
-    10: {"name": "triangular_blind_step", "description": "Triangular blind-step feature."},
-    11: {"name": "rectangular_blind_slot", "description": "Rectangular blind-slot feature."},
-    12: {"name": "rectangular_pocket", "description": "Rectangular pocket feature."},
-    13: {"name": "triangular_pocket", "description": "Triangular pocket feature."},
-    14: {"name": "6sides_pocket", "description": "Six-sided pocket feature."},
-    15: {"name": "chamfer", "description": "Chamfer feature."},
-    16: {"name": "circular through slot", "description": "Circular through-slot feature."},
-    17: {"name": "through hole", "description": "Description for through hole."},
-    18: {"name": "circular blind step", "description": "Description for circular blind step."},
-    19: {
-        "name": "horizontal circular end blind slot",
-        "description": "Description for horizontal circular end blind slot.",
-    },
-    20: {
-        "name": "vertical circular end blind slot",
-        "description": "Description for vertical circular end blind slot.",
-    },
-    21: {"name": "circular end pocket", "description": "Description for circular end pocket."},
-    22: {"name": "o-ring", "description": "Description for o-ring."},
-    23: {"name": "blind hole", "description": "Description for blind hole."},
-    24: {"name": "fillet", "description": "Description for fillet."},
-}
 
 MFR_dataset_explorer = None
 MFR_inference_model = None
@@ -56,6 +23,8 @@ CAD_viewers: dict[str, dict[str, Any]] = {}  # session_id -> {file_key -> viewer
 CAD_face_colors: dict[str, list] = {}  # scs_filename -> [[r,g,b], ...] indexed by face_id
 cad_searcher = None
 shape_index = None
+PART_CLASS_inference_model = None
+PART_CLASS_dataset_explorer = None
 
 
 def get_MFR_dataset_explorer():
@@ -84,6 +53,20 @@ def get_shape_index():
     if shape_index is None:
         shape_index = load_shape_index()
     return shape_index
+
+
+def get_part_class_inference_model():
+    global PART_CLASS_inference_model
+    if PART_CLASS_inference_model is None:
+        PART_CLASS_inference_model = create_part_class_inference_model()
+    return PART_CLASS_inference_model
+
+
+def get_part_class_dataset_explorer():
+    global PART_CLASS_dataset_explorer
+    if PART_CLASS_dataset_explorer is None:
+        PART_CLASS_dataset_explorer = create_part_class_dataset_explorer()
+    return PART_CLASS_dataset_explorer
 
 
 def _json_safe(value: Any) -> Any:
@@ -164,13 +147,29 @@ def read_env_literal_assignment(names: tuple[str, ...]) -> Optional[str]:
     return None
 
 
+def _load_mfr_labels_file() -> dict[int, dict[str, str]]:
+    """Load the default MFR labels from mfr_labels.py at the repository root."""
+    import importlib.util
+
+    labels_file = APP_ROOT / "mfr_labels.py"
+    if not labels_file.exists():
+        raise RuntimeError(
+            f"MFR labels file not found: {labels_file}. "
+            "Expected mfr_labels.py at the repository root."
+        )
+    spec = importlib.util.spec_from_file_location("mfr_labels", str(labels_file))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.labels_description
+
+
 def get_MFR_labels_description() -> dict[int, dict[str, str]]:
     raw_value = next(
         (os.environ[name] for name in MFR_LABELS_DESCRIPTION_ENV_NAMES if os.environ.get(name)),
         None,
     ) or read_env_literal_assignment(MFR_LABELS_DESCRIPTION_ENV_NAMES)
     if not raw_value:
-        return DEFAULT_MFR_LABELS_DESCRIPTION
+        return _load_mfr_labels_file()
 
     try:
         labels_description = ast.literal_eval(raw_value)
@@ -702,3 +701,223 @@ def get_brep_attributes(cad_file_path: pathlib.Path) -> dict[str, Any]:
             "types_description": _json_safe(edge_types_descr),
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Part Classification
+# ---------------------------------------------------------------------------
+
+def get_part_class_labels_description() -> dict[int, dict[str, str]]:
+    """Return the 45-class part label dict from the shared labels module."""
+    import importlib.util
+
+    labels_file = APP_ROOT / "part_classification_labels.py"
+    if not labels_file.exists():
+        raise RuntimeError(
+            f"Part classification labels file not found: {labels_file}. "
+            "Expected part_classification_labels.py at the repository root."
+        )
+    spec = importlib.util.spec_from_file_location("part_classification_labels", str(labels_file))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.labels_description
+
+
+def _get_part_class_flow_root_dir() -> pathlib.Path:
+    """Resolve the flow root directory for the part classification dataset.
+
+    Priority (same convention as MFR):
+    1. <HOOPS_AI_NOTEBOOK_DIR>/out/flows/<FLOW_NAME>  — notebook-generated output (has stream_cache)
+    2. <HOOPS_AI_NOTEBOOK_DIR>/../packages/flows/<FLOW_NAME>  — pre-packaged dataset
+    """
+    notebooks_dir = pathlib.Path(get_required_env("HOOPS_AI_NOTEBOOK_DIR"))
+    flow_name = get_required_env("HOOPS_AI_PART_CLASS_FLOW_NAME")
+    notebook_out = notebooks_dir / "out" / "flows" / flow_name
+    if notebook_out.exists():
+        return notebook_out.resolve()
+    return (notebooks_dir.parent / "packages" / "flows" / flow_name).resolve()
+
+
+def create_part_class_inference_model():
+    """Load the GraphClassification checkpoint once and return the FlowInference instance."""
+    import torch.nn as nn
+    from hoops_ai.cadaccess import HOOPSLoader
+    from hoops_ai.ml.EXPERIMENTAL import FlowInference, GraphClassification
+
+    load_env_file()
+
+    notebooks_dir = pathlib.Path(get_required_env("HOOPS_AI_NOTEBOOK_DIR"))
+    model_name = get_required_env("HOOPS_AI_PART_CLASS_MODEL_NAME")
+    ckpt_path = notebooks_dir.parent / "packages" / "trained_ml_models" / model_name
+
+    use_gnn = os.environ.get("HOOPS_AI_PART_CLASS_USE_GNN_SURFACE_ENCODER", "false").lower() != "false"
+
+    output_dir = notebooks_dir / "out"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Checkpoints saved with older PyG store NNConv's edge MLP as 'edge_func';
+    # current PyG renamed it to 'nn'.  Patch Module._load_from_state_dict so
+    # every submodule's load transparently remaps the old key name.
+    _orig = nn.Module._load_from_state_dict
+
+    def _remap_edge_func(self, state_dict, prefix, local_metadata, strict,
+                         missing_keys, unexpected_keys, error_msgs):
+        old_prefix = prefix + "edge_func."
+        new_prefix = prefix + "nn."
+        for k in [k for k in list(state_dict.keys()) if k.startswith(old_prefix)]:
+            state_dict[new_prefix + k[len(old_prefix):]] = state_dict.pop(k)
+        return _orig(self, state_dict, prefix, local_metadata, strict,
+                     missing_keys, unexpected_keys, error_msgs)
+
+    nn.Module._load_from_state_dict = _remap_edge_func
+    try:
+        solid_classification = GraphClassification(
+            num_classes=45,
+            use_gnn_surface_encoder=use_gnn,
+            result_dir=str(output_dir),
+        )
+        inference_model = FlowInference(
+            cad_loader=HOOPSLoader(),
+            flowmodel=solid_classification,
+        )
+        inference_model.load_from_checkpoint(str(ckpt_path))
+    finally:
+        nn.Module._load_from_state_dict = _orig  # always restore
+
+    return inference_model
+
+
+def create_part_class_dataset_explorer():
+    """Open the part classification DatasetExplorer (dataset / infoset / attribset)."""
+    load_env_file()
+
+    DatasetExplorer = import_MFR_dataset_explorer()  # reuse the same SSL workaround
+
+    flow_root_dir = _get_part_class_flow_root_dir()
+    # Derive flow name: prefer env var, fall back to directory name
+    flow_name_val = os.environ.get("HOOPS_AI_PART_CLASS_FLOW_NAME") or flow_root_dir.name
+
+    return DatasetExplorer(
+        merged_store_path=str(flow_root_dir / f"{flow_name_val}.dataset"),
+        parquet_file_path=str(flow_root_dir / f"{flow_name_val}.infoset"),
+        parquet_file_attribs=str(flow_root_dir / f"{flow_name_val}.attribset"),
+        dask_client_params={"processes": False},
+    )
+
+
+def run_part_classification_inference(cad_file_path: pathlib.Path, top_k: int = 5) -> dict[str, Any]:
+    """Preprocess a CAD file and run part classification. Returns top-k predictions."""
+    labels = get_part_class_labels_description()
+    inference_model = get_part_class_inference_model()
+
+    ml_input = inference_model.preprocess(str(cad_file_path))
+    predictions = inference_model.predict_and_postprocess(ml_input)
+
+    # predictions shape: (batch=1, 2, num_classes)
+    #   axis-1[0]: class indices sorted by confidence (descending)
+    #   axis-1[1]: probability percentages (int)
+    n_classes = predictions.shape[2]
+    top_k_actual = min(top_k, n_classes)
+
+    top_predictions = []
+    for i in range(top_k_actual):
+        class_id = int(_json_safe(predictions[0, 0, i]))
+        confidence = int(_json_safe(predictions[0, 1, i]))
+        part_name = labels.get(class_id, {}).get("name", f"class_{class_id}")
+        top_predictions.append(
+            {"rank": i + 1, "class_id": class_id, "part_name": part_name, "confidence": confidence}
+        )
+
+    return {
+        "predicted_class_id": top_predictions[0]["class_id"] if top_predictions else None,
+        "predicted_part_name": top_predictions[0]["part_name"] if top_predictions else None,
+        "top_predictions": top_predictions,
+    }
+
+
+def get_part_class_table_of_contents() -> dict[str, Any]:
+    explorer = get_part_class_dataset_explorer()
+
+    output = io.StringIO()
+    with redirect_stdout(output):
+        result = explorer.print_table_of_contents()
+
+    response: dict[str, Any] = {
+        "table_of_contents": output.getvalue(),
+        "available_groups": _json_safe(explorer.available_groups()),
+    }
+    if result is not None:
+        response["result"] = _json_safe(result)
+    return response
+
+
+def get_part_class_label_distribution() -> dict[str, Any]:
+    explorer = get_part_class_dataset_explorer()
+    label_key = os.environ.get("HOOPS_AI_PART_CLASS_LABEL_KEY", "part_label")
+
+    dist = explorer.create_distribution(key=label_key, bins=None, group="Labels")
+    labels = get_part_class_labels_description()
+
+    bins = []
+    for i, file_ids_in_bin in enumerate(dist["file_id_codes_in_bins"]):
+        bin_start = float(dist["bin_edges"][i])
+        bin_end = float(dist["bin_edges"][i + 1])
+        class_id = int(bin_start + 0.5)  # bin is centered on the integer label
+        part_name = labels.get(class_id, {}).get("name", f"class_{class_id}")
+        safe_ids = _json_safe(file_ids_in_bin)
+        file_count = len(safe_ids) if isinstance(safe_ids, list) else int(file_ids_in_bin.size)
+        bins.append(
+            {
+                "class_id": class_id,
+                "part_name": part_name,
+                "file_count": file_count,
+            }
+        )
+
+    return {"label_key": label_key, "bins": bins}
+
+
+def get_part_class_file_list(label_id: int) -> dict[str, Any]:
+    explorer = get_part_class_dataset_explorer()
+    label_key = os.environ.get("HOOPS_AI_PART_CLASS_LABEL_KEY", "part_label")
+
+    label_matches = lambda ds: ds[label_key] == label_id  # noqa: E731
+    file_ids = explorer.get_file_list(group="Labels", where=label_matches)
+
+    labels = get_part_class_labels_description()
+    part_name = labels.get(label_id, {}).get("name", f"class_{label_id}")
+
+    safe_ids = _json_safe(file_ids)
+    return {
+        "label_id": label_id,
+        "part_name": part_name,
+        "file_ids": safe_ids,
+        "count": len(safe_ids) if isinstance(safe_ids, list) else int(file_ids.shape[0]),
+    }
+
+
+def get_part_class_preview_image(file_ids: list, k: int = 25, grid_cols: int = 8) -> str:
+    """Render a thumbnail grid for the given file IDs. Saves to /out/ and returns the filename."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from hoops_ai.insights import DatasetViewer
+
+    explorer = get_part_class_dataset_explorer()
+    dataset_viewer = DatasetViewer.from_explorer(explorer)
+
+    fig = dataset_viewer.show_preview_as_image(
+        file_ids,
+        k=k,
+        grid_cols=grid_cols,
+        label_format="id",
+        figsize=(15, 5),
+    )
+
+    image_filename = f"{uuid.uuid4()}.png"
+    image_path = CAD_VIEWER_OUTPUT_DIR / image_filename
+    CAD_VIEWER_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    fig.savefig(str(image_path), format="png", bbox_inches="tight")
+    plt.close(fig)
+    return image_filename
+

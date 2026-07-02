@@ -8,7 +8,7 @@ mimetypes.add_type("application/javascript", ".mjs")
 import core
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
-from routers import brep, cad, files, mfr, similarity
+from routers import brep, cad, files, mfr, part_classification, similarity
 
 
 @asynccontextmanager
@@ -22,6 +22,8 @@ async def lifespan(app: FastAPI):
     yield
     if core.MFR_dataset_explorer is not None and hasattr(core.MFR_dataset_explorer, "close"):
         core.MFR_dataset_explorer.close()
+    if core.PART_CLASS_dataset_explorer is not None and hasattr(core.PART_CLASS_dataset_explorer, "close"):
+        core.PART_CLASS_dataset_explorer.close()
     core.CAD_viewers.clear()
 
 
@@ -35,6 +37,7 @@ app.include_router(mfr.router)
 app.include_router(cad.router)
 app.include_router(brep.router)
 app.include_router(similarity.router)
+app.include_router(part_classification.router)
 
 core.CAD_VIEWER_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/out", StaticFiles(directory=str(core.CAD_VIEWER_OUTPUT_DIR)), name="out")
