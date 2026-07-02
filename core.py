@@ -883,7 +883,7 @@ def get_part_class_label_distribution() -> dict[str, Any]:
     for i, file_ids_in_bin in enumerate(dist["file_id_codes_in_bins"]):
         bin_start = float(dist["bin_edges"][i])
         bin_end = float(dist["bin_edges"][i + 1])
-        class_id = int(round(bin_start))
+        class_id = int(bin_start + 0.5)  # bin is centered on the integer label
         part_name = labels.get(class_id, {}).get("name", f"class_{class_id}")
         safe_ids = _json_safe(file_ids_in_bin)
         file_count = len(safe_ids) if isinstance(safe_ids, list) else int(file_ids_in_bin.size)
@@ -891,8 +891,6 @@ def get_part_class_label_distribution() -> dict[str, Any]:
             {
                 "class_id": class_id,
                 "part_name": part_name,
-                "bin_start": bin_start,
-                "bin_end": bin_end,
                 "file_count": file_count,
             }
         )
