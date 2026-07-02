@@ -29,7 +29,7 @@ A FastAPI-based REST API that exposes [HOOPS AI](https://www.techsoft3d.com/deve
   |---|---|---|
   | MFR endpoints | `3b_workflow_for_MFR_cadsynth.ipynb` | `notebooks/out/flows/<flow_name>/`<br>`.dataset` / `.infoset` / `.attribset` |
   | `/similarity/search` | `5b_cad_search_using_HOOPS_embeddings.ipynb`<br>(up to **Saving an Index**) | `fabwave_embeddings_store.faiss` |
-  | `/part-classification/dataset/*` | `3c_workflow_for_Part_classification_fabwave.ipynb` | flow `.dataset` / `.infoset` / `.attribset`<br>`stream_cache/*.png` |
+  | `/part-classification/dataset/*` | `3c_workflow_for_Part_classification_fabwave.ipynb`<br>(up to **Pipeline execution**) | flow `.dataset` / `.infoset` / `.attribset`<br>`stream_cache/*.png` |
 
   > **Tip:** Pre-generated dataset files are also available for download from the Tech Soft 3D File Transfer service — no need to run the notebooks yourself:  
   > URL: https://transfer.techsoft3d.com/link/fIPcX3oc3UQXl7eEaB387F  
