@@ -6,7 +6,8 @@ mimetypes.init()
 mimetypes.add_type("application/javascript", ".mjs")
 
 import core
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from routers import brep, cad, files, mfr, part_classification, similarity
 
@@ -31,6 +32,22 @@ app = FastAPI(
     title="HOOPS AI File Search API",
     lifespan=lifespan,
 )
+
+
+@app.exception_handler(core.EnvConfigError)
+async def env_config_error_handler(request: Request, exc: core.EnvConfigError):
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "Service unavailable: server configuration error. Check the server logs for details."},
+    )
+
+
+@app.exception_handler(core.PathConfigError)
+async def path_config_error_handler(request: Request, exc: core.PathConfigError):
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "Service unavailable: required server resource not found. Check the server logs for details."},
+    )
 
 app.include_router(files.router)
 app.include_router(mfr.router)

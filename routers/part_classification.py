@@ -31,6 +31,8 @@ def part_classification_predict(
         raise
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except (core.EnvConfigError, core.PathConfigError):
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Part classification failed: {exc}") from exc
 
@@ -49,6 +51,8 @@ def part_class_table_of_contents():
     """Return dataset table of contents and available groups."""
     try:
         return core.get_part_class_table_of_contents()
+    except (core.EnvConfigError, core.PathConfigError):
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
 
@@ -58,6 +62,8 @@ def part_class_label_distribution():
     """Return per-class file count distribution across the training dataset."""
     try:
         return core.get_part_class_label_distribution()
+    except (core.EnvConfigError, core.PathConfigError):
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
 
@@ -69,6 +75,8 @@ def part_class_file_list(
     """Return the list of file IDs in the dataset that belong to a given class."""
     try:
         return core.get_part_class_file_list(label_id)
+    except (core.EnvConfigError, core.PathConfigError):
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
 
@@ -98,6 +106,8 @@ def part_class_preview_image(
             "image_url": image_url,
         }
     except HTTPException:
+        raise
+    except (core.EnvConfigError, core.PathConfigError):
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc

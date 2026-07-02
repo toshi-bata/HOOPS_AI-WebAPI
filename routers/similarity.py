@@ -58,6 +58,8 @@ def similarity_search(
         raise
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except (core.EnvConfigError, core.PathConfigError):
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Similarity search failed: {exc}") from exc
 
@@ -104,6 +106,8 @@ def similarity_index_info():
     """
     try:
         return core.get_similar_search_index_info()
+    except (core.EnvConfigError, core.PathConfigError):
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
 

@@ -173,6 +173,8 @@ def CAD_viewer(
         raise
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except (core.EnvConfigError, core.PathConfigError):
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"CADViewer failed: {exc}") from exc
 
@@ -183,6 +185,8 @@ def CAD_viewer_terminate(request: Request, all: bool = False):
         return core.terminate_CAD_viewer(session_id=_get_session_id(request), terminate_all=all)
     except RuntimeError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (core.EnvConfigError, core.PathConfigError):
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Terminate failed: {exc}") from exc
 
@@ -193,6 +197,8 @@ def CAD_viewer_from_path(request: Request, cad_file_path: str = Form(...)):
         return _resolve_urls(core.create_CAD_viewer(core.get_shared_CAD_file(cad_file_path), _get_session_id(request)), str(request.base_url))
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except (core.EnvConfigError, core.PathConfigError):
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"CADViewer failed: {exc}") from exc
 

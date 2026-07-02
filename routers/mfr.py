@@ -73,6 +73,8 @@ def MFR_inference(
         raise
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except (core.EnvConfigError, core.PathConfigError):
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Inference failed: {exc}") from exc
 

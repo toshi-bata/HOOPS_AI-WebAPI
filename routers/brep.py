@@ -31,6 +31,8 @@ def brep_adjacency_graph(
         raise
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except (core.EnvConfigError, core.PathConfigError):
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"BRep encoding failed: {exc}") from exc
 
@@ -56,6 +58,8 @@ def brep_attributes(
         raise
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except (core.EnvConfigError, core.PathConfigError):
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"BRep attribute extraction failed: {exc}") from exc
 

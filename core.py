@@ -1,6 +1,7 @@
 import ast
 import hashlib
 import io
+import logging
 import os
 import pathlib
 import shutil
@@ -8,6 +9,8 @@ import ssl
 import uuid
 from contextlib import redirect_stdout
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 from fastapi import UploadFile
 
@@ -104,20 +107,47 @@ def load_env_file(path: pathlib.Path = ENV_FILE_PATH) -> None:
         os.environ.setdefault(key, value)
 
 
+class EnvConfigError(Exception):
+    """Raised when a required environment variable is missing or empty."""
+
+
+class PathConfigError(Exception):
+    """Raised when a path derived from an environment variable does not exist."""
+
+
 def get_required_env(name: str) -> str:
     value = os.environ.get(name)
     if not value:
-        raise RuntimeError(
-            f"{name} environment variable is required. Set it in {ENV_FILE_PATH.name} or the environment."
-        )
+        msg = f"[CONFIG] Required environment variable '{name}' is not set. Set it in {ENV_FILE_PATH.name} or the environment."
+        logger.error(msg)
+        print(msg, flush=True)
+        raise EnvConfigError(msg)
     return value
 
 
 def get_required_file_env(name: str) -> str:
     value = read_env_file().get(name)
     if not value:
-        raise RuntimeError(f"{name} is required in {ENV_FILE_PATH.name}.")
+        msg = f"[CONFIG] Required environment variable '{name}' is not set in {ENV_FILE_PATH.name}."
+        logger.error(msg)
+        print(msg, flush=True)
+        raise EnvConfigError(msg)
     return value
+
+
+def require_path(path: pathlib.Path, *, env_name: str = "", label: str = "") -> pathlib.Path:
+    """Return *path* unchanged, or raise PathConfigError if it does not exist.
+
+    Logs the missing path to the console before raising so that operators can
+    immediately see which file or directory is absent.
+    """
+    if not path.exists():
+        origin = f" (from {env_name})" if env_name else (f" ({label})" if label else "")
+        msg = f"[CONFIG] Path not found{origin}: {path}"
+        logger.error(msg)
+        print(msg, flush=True)
+        raise PathConfigError(msg)
+    return path
 
 
 def read_env_literal_assignment(names: tuple[str, ...]) -> Optional[str]:
@@ -256,13 +286,20 @@ def create_MFR_dataset_explorer():
 
     DatasetExplorer = import_MFR_dataset_explorer()
 
-    notebooks_dir = pathlib.Path(get_required_env("HOOPS_AI_NOTEBOOK_DIR"))
+    notebooks_dir = require_path(
+        pathlib.Path(get_required_env("HOOPS_AI_NOTEBOOK_DIR")),
+        env_name="HOOPS_AI_NOTEBOOK_DIR",
+    )
     MFR_flow_name = get_required_env("HOOPS_AI_MFR_FLOW_NAME")
 
     # Dataset files are produced by running the ETL tutorial notebook:
     #   notebooks/3b_workflow_for_MFR_cadsynth.ipynb
     # Output is written to: <HOOPS_AI_NOTEBOOK_DIR>/out/flows/<HOOPS_AI_MFR_FLOW_NAME>/
-    flow_root_dir = notebooks_dir / "out" / "flows" / MFR_flow_name
+    flow_root_dir = require_path(
+        notebooks_dir / "out" / "flows" / MFR_flow_name,
+        env_name="HOOPS_AI_MFR_FLOW_NAME",
+        label=f"MFR flow directory for '{MFR_flow_name}'",
+    )
 
     return DatasetExplorer(
         merged_store_path=str(flow_root_dir.joinpath(f"{MFR_flow_name}.dataset")),
@@ -278,9 +315,15 @@ def create_MFR_inference_model():
 
     load_env_file()
 
-    notebooks_dir = pathlib.Path(get_required_env("HOOPS_AI_NOTEBOOK_DIR"))
+    notebooks_dir = require_path(
+        pathlib.Path(get_required_env("HOOPS_AI_NOTEBOOK_DIR")),
+        env_name="HOOPS_AI_NOTEBOOK_DIR",
+    )
     model_name = get_required_env("HOOPS_AI_MFR_MODEL_NAME")
-    trained_model = notebooks_dir.parent.joinpath("packages", "trained_ml_models", model_name)
+    trained_model = require_path(
+        notebooks_dir.parent.joinpath("packages", "trained_ml_models", model_name),
+        env_name="HOOPS_AI_MFR_MODEL_NAME",
+    )
     output_dir = notebooks_dir.joinpath("out")
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -299,9 +342,15 @@ def create_cad_searcher():
 
     load_env_file()
 
-    notebooks_dir = pathlib.Path(get_required_env("HOOPS_AI_NOTEBOOK_DIR"))
+    notebooks_dir = require_path(
+        pathlib.Path(get_required_env("HOOPS_AI_NOTEBOOK_DIR")),
+        env_name="HOOPS_AI_NOTEBOOK_DIR",
+    )
     ckpt_name = get_required_env("HOOPS_AI_EMBEDDINGS_MODEL_NAME")
-    trained_model = notebooks_dir.parent.joinpath("packages", "trained_ml_models", ckpt_name)
+    trained_model = require_path(
+        notebooks_dir.parent.joinpath("packages", "trained_ml_models", ckpt_name),
+        env_name="HOOPS_AI_EMBEDDINGS_MODEL_NAME",
+    )
 
     HOOPSEmbeddings.register_model(
         model_name="hoops_embeddings_model",
@@ -314,9 +363,15 @@ def create_cad_searcher():
 def load_shape_index():
     load_env_file()
 
-    notebooks_dir = pathlib.Path(get_required_env("HOOPS_AI_NOTEBOOK_DIR"))
+    notebooks_dir = require_path(
+        pathlib.Path(get_required_env("HOOPS_AI_NOTEBOOK_DIR")),
+        env_name="HOOPS_AI_NOTEBOOK_DIR",
+    )
     faiss_file_name = get_required_env("HOOPS_AI_FAISS_INDEX_PATH")
-    faiss_index_path = notebooks_dir.joinpath(faiss_file_name)
+    faiss_index_path = require_path(
+        notebooks_dir.joinpath(faiss_file_name),
+        env_name="HOOPS_AI_FAISS_INDEX_PATH",
+    )
     searcher = get_cad_searcher()
     # The FAISS index may have been pickled on Windows and contain WindowsPath objects.
     if not hasattr(pathlib, "WindowsPath") or not issubclass(pathlib.WindowsPath, pathlib.Path):
@@ -829,12 +884,20 @@ def _get_part_class_flow_root_dir() -> pathlib.Path:
     1. <HOOPS_AI_NOTEBOOK_DIR>/out/flows/<FLOW_NAME>  — notebook-generated output (has stream_cache)
     2. <HOOPS_AI_NOTEBOOK_DIR>/../packages/flows/<FLOW_NAME>  — pre-packaged dataset
     """
-    notebooks_dir = pathlib.Path(get_required_env("HOOPS_AI_NOTEBOOK_DIR"))
+    notebooks_dir = require_path(
+        pathlib.Path(get_required_env("HOOPS_AI_NOTEBOOK_DIR")),
+        env_name="HOOPS_AI_NOTEBOOK_DIR",
+    )
     flow_name = get_required_env("HOOPS_AI_PART_CLASS_FLOW_NAME")
     notebook_out = notebooks_dir / "out" / "flows" / flow_name
     if notebook_out.exists():
         return notebook_out.resolve()
-    return (notebooks_dir.parent / "packages" / "flows" / flow_name).resolve()
+    packages_flow = (notebooks_dir.parent / "packages" / "flows" / flow_name).resolve()
+    return require_path(
+        packages_flow,
+        env_name="HOOPS_AI_PART_CLASS_FLOW_NAME",
+        label=f"Part classification flow directory for '{flow_name}'",
+    )
 
 
 def create_part_class_inference_model():
@@ -845,9 +908,15 @@ def create_part_class_inference_model():
 
     load_env_file()
 
-    notebooks_dir = pathlib.Path(get_required_env("HOOPS_AI_NOTEBOOK_DIR"))
+    notebooks_dir = require_path(
+        pathlib.Path(get_required_env("HOOPS_AI_NOTEBOOK_DIR")),
+        env_name="HOOPS_AI_NOTEBOOK_DIR",
+    )
     model_name = get_required_env("HOOPS_AI_PART_CLASS_MODEL_NAME")
-    ckpt_path = notebooks_dir.parent / "packages" / "trained_ml_models" / model_name
+    ckpt_path = require_path(
+        notebooks_dir.parent / "packages" / "trained_ml_models" / model_name,
+        env_name="HOOPS_AI_PART_CLASS_MODEL_NAME",
+    )
 
     use_gnn = os.environ.get("HOOPS_AI_PART_CLASS_USE_GNN_SURFACE_ENCODER", "false").lower() != "false"
 
