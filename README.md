@@ -613,6 +613,67 @@ curl "http://<server-ip>:8000/similarity/part-image?filename=part_042.stp" -o pa
 
 ---
 
+#### Similarity search index info
+
+Return metadata about the FAISS similarity-search index currently loaded on
+the server.  This endpoint is read-only and never triggers index construction
+or model training.  When the index has not been loaded yet, a
+``"not_loaded"`` status is returned instead of an error.
+
+```
+GET /similarity/index-info
+```
+
+**Windows (PowerShell):**
+```powershell
+curl.exe "http://<server-ip>:8000/similarity/index-info"
+```
+
+**Linux:**
+```bash
+curl "http://<server-ip>:8000/similarity/index-info"
+```
+
+**Response (index loaded):**
+
+```json
+{
+  "status": "loaded",
+  "index_path": "/path/to/notebooks/fabwave_embeddings_store.faiss",
+  "index_last_modified": "2025-06-01T12:00:00Z",
+  "index_count": 5000,
+  "model_name": "hoops_embeddings_model",
+  "embedding_dim": 512,
+  "metadata": {"failed_count": 0}
+}
+```
+
+**Response (index not yet loaded):**
+
+```json
+{
+  "status": "not_loaded",
+  "index_path": "/path/to/notebooks/fabwave_embeddings_store.faiss",
+  "index_last_modified": "2025-06-01T12:00:00Z",
+  "index_count": null,
+  "model_name": null,
+  "embedding_dim": null,
+  "metadata": null
+}
+```
+
+| Field | Description |
+|---|---|
+| `status` | `"loaded"` or `"not_loaded"` |
+| `index_path` | Absolute path to the FAISS index file (from env) |
+| `index_last_modified` | UTC last-modified timestamp of the index file (`null` if file not found) |
+| `index_count` | Number of embeddings stored in the index |
+| `model_name` | Name of the embedding model used to build the index |
+| `embedding_dim` | Dimension of each embedding vector |
+| `metadata` | Auxiliary metadata stored in the index (e.g. `failed_count`) |
+
+---
+
 ### Part Classification
 
 Classify a CAD solid into one of 45 part categories (FabWave dataset) using a trained Graph Classification model.

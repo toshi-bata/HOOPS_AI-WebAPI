@@ -363,6 +363,105 @@ def search_by_shape(cad_file_path: pathlib.Path, top_k: int = 10) -> dict[str, A
     return {"hits": results, "count": len(results), "image_url": f"/out/{image_filename}"}
 
 
+def get_similar_search_index_info() -> dict[str, Any]:
+    """Return metadata about the currently loaded FAISS similarity search index.
+
+    Always succeeds — returns ``status: "not_loaded"`` when neither the searcher
+    nor the index has been initialised yet, so callers never need to treat an
+    unloaded state as an error.
+    """
+    import datetime
+
+    load_env_file()
+
+    # Resolve the index file path from env (best-effort, no error if missing).
+    index_path: Optional[str] = None
+    index_last_modified: Optional[str] = None
+    faiss_file_name = os.environ.get("HOOPS_AI_FAISS_INDEX_PATH")
+    if faiss_file_name:
+        notebooks_dir_str = os.environ.get("HOOPS_AI_NOTEBOOK_DIR")
+        if notebooks_dir_str:
+            faiss_index_path = pathlib.Path(notebooks_dir_str) / faiss_file_name
+            index_path = str(faiss_index_path)
+            if faiss_index_path.exists():
+                mtime = faiss_index_path.stat().st_mtime
+                index_last_modified = (
+                    datetime.datetime.fromtimestamp(mtime, tz=datetime.timezone.utc)
+                    .strftime("%Y-%m-%dT%H:%M:%SZ")
+                )
+        else:
+            index_path = faiss_file_name
+
+    # Trigger lazy loading of the searcher + FAISS index if not yet initialised.
+    # This mirrors what search_by_shape() does on first use.  If loading fails
+    # (missing env var, file not found, etc.) we fall through to not_loaded.
+    if cad_searcher is None or shape_index is None:
+        try:
+            get_shape_index()  # populates both cad_searcher and shape_index globals
+        except Exception:
+            pass  # genuine not_loaded situation — reported below
+
+    if cad_searcher is None and shape_index is None:
+        return {
+            "status": "not_loaded",
+            "index_path": index_path,
+            "index_last_modified": index_last_modified,
+            "index_count": None,
+            "model_name": None,
+            "embedding_dim": None,
+            "metadata": None,
+        }
+
+    info: dict[str, Any] = {
+        "status": "loaded",
+        "index_path": index_path,
+        "index_last_modified": index_last_modified,
+        "index_count": None,
+        "model_name": None,
+        "embedding_dim": None,
+        "metadata": None,
+    }
+
+    # Extract embedder attributes from the CADSearch object.
+    # HOOPSEmbeddings does not expose public attributes via dir(), so we try
+    # both the public and private attribute names used by CADSearch internals.
+    if cad_searcher is not None:
+        embedder = (
+            getattr(cad_searcher, "_shape_model", None)
+            or getattr(cad_searcher, "shape_model", None)
+        )
+        if embedder is not None:
+            info["model_name"] = (
+                getattr(embedder, "model_name", None)
+                or getattr(embedder, "model", None)
+            )
+
+    # Extract counts, dim, and metadata from the loaded EmbeddingBatch object.
+    # EmbeddingBatch exposes: ids, dim, model, metadata, values, get.
+    if shape_index is not None:
+        ids = getattr(shape_index, "ids", None)
+        if ids is not None:
+            try:
+                info["index_count"] = int(len(ids))
+            except (TypeError, ValueError):
+                pass
+        # embedding_dim lives on the batch as .dim
+        dim = getattr(shape_index, "dim", None)
+        if dim is not None:
+            try:
+                info["embedding_dim"] = int(dim)
+            except (TypeError, ValueError):
+                info["embedding_dim"] = _json_safe(dim)
+        # Fall back to model name from the batch if not obtained from the embedder.
+        if info["model_name"] is None:
+            info["model_name"] = getattr(shape_index, "model", None)
+        metadata = getattr(shape_index, "metadata", None)
+        if metadata is not None:
+            info["metadata"] = _json_safe(dict(metadata) if hasattr(metadata, "items") else metadata)
+
+    return info
+
+
 def search_MFR_files(feature_name: str) -> dict[str, Any]:
     explorer = get_MFR_dataset_explorer()
 

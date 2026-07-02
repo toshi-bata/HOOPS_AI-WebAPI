@@ -1,12 +1,35 @@
 import os
 import pathlib
-from typing import Optional
+from typing import Any, Optional
 
 import core
 from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse
+from pydantic import BaseModel
 
 router = APIRouter(prefix="/similarity", tags=["CAD Similarity Search"])
+
+
+# ---------------------------------------------------------------------------
+# Response schemas
+# ---------------------------------------------------------------------------
+
+
+class SimilarSearchIndexInfo(BaseModel):
+    """Metadata about the loaded FAISS similarity-search index.
+
+    ``status`` is ``"loaded"`` when the index has been initialised, or
+    ``"not_loaded"`` when no index has been loaded yet.
+    All other fields are ``null`` / ``None`` when the index is not loaded.
+    """
+
+    status: str
+    index_path: Optional[str] = None
+    index_last_modified: Optional[str] = None
+    index_count: Optional[int] = None
+    model_name: Optional[str] = None
+    embedding_dim: Optional[int] = None
+    metadata: Optional[dict[str, Any]] = None
 
 
 @router.post("/search")
@@ -68,4 +91,20 @@ def get_part_image(
         status_code=404,
         detail=f"PNG image not found for '{filename}'. Searched: {[str(c) for c in candidates]}",
     )
+
+
+@router.get("/index-info", response_model=SimilarSearchIndexInfo)
+def similarity_index_info():
+    """Return metadata about the currently loaded FAISS similarity-search index.
+
+    This is a read-only, inference-side endpoint — it never triggers index
+    construction or model training.  When the index has not been loaded yet
+    the response contains ``status: "not_loaded"`` and ``null`` values for all
+    other fields; no error is raised.
+    """
+    try:
+        return core.get_similar_search_index_info()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
+
 
