@@ -760,6 +760,7 @@ def _get_part_class_flow_root_dir() -> pathlib.Path:
 
 def create_part_class_inference_model():
     """Load the GraphClassification checkpoint once and return the FlowInference instance."""
+    import torch.nn as nn
     from hoops_ai.cadaccess import HOOPSLoader
     from hoops_ai.ml.EXPERIMENTAL import FlowInference, GraphClassification
 
@@ -775,31 +776,34 @@ def create_part_class_inference_model():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Checkpoints saved with older PyG store NNConv's edge MLP as 'edge_func';
-    # current PyG renamed it to 'nn'.  Register a pre-hook to remap keys on load.
+    # current PyG renamed it to 'nn'.  Patch Module._load_from_state_dict so
+    # every submodule's load transparently remaps the old key name.
+    _orig = nn.Module._load_from_state_dict
+
+    def _remap_edge_func(self, state_dict, prefix, local_metadata, strict,
+                         missing_keys, unexpected_keys, error_msgs):
+        old_prefix = prefix + "edge_func."
+        new_prefix = prefix + "nn."
+        for k in [k for k in list(state_dict.keys()) if k.startswith(old_prefix)]:
+            state_dict[new_prefix + k[len(old_prefix):]] = state_dict.pop(k)
+        return _orig(self, state_dict, prefix, local_metadata, strict,
+                     missing_keys, unexpected_keys, error_msgs)
+
+    nn.Module._load_from_state_dict = _remap_edge_func
     try:
-        from torch_geometric.nn import NNConv
+        solid_classification = GraphClassification(
+            num_classes=45,
+            use_gnn_surface_encoder=use_gnn,
+            result_dir=str(output_dir),
+        )
+        inference_model = FlowInference(
+            cad_loader=HOOPSLoader(),
+            flowmodel=solid_classification,
+        )
+        inference_model.load_from_checkpoint(str(ckpt_path))
+    finally:
+        nn.Module._load_from_state_dict = _orig  # always restore
 
-        def _remap_edge_func(module, state_dict, prefix, *_args, **_kwargs):
-            old_prefix = prefix + "edge_func"
-            new_prefix = prefix + "nn"
-            for old_k in [k for k in state_dict if k.startswith(old_prefix)]:
-                new_k = new_prefix + old_k[len(old_prefix):]
-                state_dict[new_k] = state_dict.pop(old_k)
-
-        NNConv.register_load_state_dict_pre_hook(_remap_edge_func)
-    except Exception:
-        pass
-
-    solid_classification = GraphClassification(
-        num_classes=45,
-        use_gnn_surface_encoder=use_gnn,
-        result_dir=str(output_dir),
-    )
-    inference_model = FlowInference(
-        cad_loader=HOOPSLoader(),
-        flowmodel=solid_classification,
-    )
-    inference_model.load_from_checkpoint(str(ckpt_path))
     return inference_model
 
 
