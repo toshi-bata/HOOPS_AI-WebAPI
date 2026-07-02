@@ -50,8 +50,8 @@ def part_class_table_of_contents():
     """Return dataset table of contents and available groups."""
     try:
         return core.get_part_class_table_of_contents()
-    except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
 
 
 @router.get("/dataset/label-distribution")
@@ -59,8 +59,8 @@ def part_class_label_distribution():
     """Return per-class file count distribution across the training dataset."""
     try:
         return core.get_part_class_label_distribution()
-    except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
 
 
 @router.get("/dataset/files")
@@ -70,8 +70,8 @@ def part_class_file_list(
     """Return the list of file IDs in the dataset that belong to a given class."""
     try:
         return core.get_part_class_file_list(label_id)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
 
 
 @router.get("/dataset/preview")
@@ -94,7 +94,5 @@ def part_class_preview_image(
         return StreamingResponse(io.BytesIO(png_bytes), media_type="image/png")
     except HTTPException:
         raise
-    except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Preview image generation failed: {exc}") from exc
+        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
