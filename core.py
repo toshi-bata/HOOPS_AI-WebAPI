@@ -1,11 +1,14 @@
 import ast
+import datetime
 import hashlib
 import io
 import logging
 import os
 import pathlib
+import re
 import shutil
 import ssl
+import threading
 import uuid
 from contextlib import redirect_stdout
 from typing import Any, Optional
@@ -19,6 +22,7 @@ ENV_FILE_PATH = pathlib.Path(__file__).with_name(".env")
 CAD_UPLOAD_DIR = APP_ROOT.joinpath("uploads")
 CAD_VIEWER_OUTPUT_DIR = APP_ROOT.joinpath("out")
 EMBEDDINGS_CACHE_DIR = APP_ROOT.joinpath("embeddings_cache")
+INDEXES_DIR = APP_ROOT.joinpath("indexes")
 
 # Allowed CAD file extensions for upload/ZIP extraction
 CAD_ALLOWED_EXTENSIONS = frozenset({
@@ -37,6 +41,315 @@ PART_CLASS_inference_model = None
 PART_CLASS_dataset_explorer = None
 _embedder = None
 _embedding_memory_cache: dict[str, dict] = {}  # cache_key -> embedding entry
+
+# ---------------------------------------------------------------------------
+# Named index registry (incremental index management)
+# ---------------------------------------------------------------------------
+
+# SDK verification notes (verified against hoops_ai.ml.embeddings):
+#   - FaissVectorStore.load(path) is a CLASSMETHOD returning a new store instance.
+#     Calling vs_instance.load(path) does NOT load data into the existing instance.
+#   - upsert() accepts VectorRecord(id, embedding, metadata) where `embedding` must
+#     be an Embedding(values=np.ndarray, model=str, dim=int) object, not a raw array.
+#   - upsert() with a duplicate ID inserts a second entry in the FAISS index;
+#     get_ids() deduplicates IDs but count() reflects raw FAISS entries.
+#     Solution: always delete(id) before upserting an existing ID to avoid duplicates.
+#   - Empty-index query() returns [] without error.
+#   - HOOPSEmbeddings exposes an `embedding_dim` attribute for dimension discovery.
+
+_INDEX_NAME_RE = re.compile(r"^[a-z0-9_-]{1,64}$")
+_RESERVED_INDEX_NAMES = frozenset({"default"})
+
+# name -> FaissVectorStore (in-memory cache, updated on every write)
+_named_indexes: dict[str, Any] = {}
+
+# per-index write lock; also held during searches to prevent torn reads
+_index_locks: dict[str, threading.Lock] = {}
+_index_locks_mutex = threading.Lock()
+
+
+def _get_index_lock(name: str) -> threading.Lock:
+    with _index_locks_mutex:
+        if name not in _index_locks:
+            _index_locks[name] = threading.Lock()
+        return _index_locks[name]
+
+
+def _validate_index_name(name: str) -> None:
+    """Raise ValueError for invalid names, PermissionError for reserved names."""
+    if not _INDEX_NAME_RE.match(name):
+        raise ValueError(
+            f"Invalid index name '{name}'. "
+            r"Must match ^[a-z0-9_-]{1,64}$ (lowercase alphanumerics, hyphens, underscores)."
+        )
+    if name in _RESERVED_INDEX_NAMES:
+        raise PermissionError(
+            f"Index name '{name}' is reserved and cannot be created, modified, or deleted."
+        )
+
+
+def _index_base_path(name: str) -> pathlib.Path:
+    """Base path (no extension) for a named index; save() appends .faiss / .meta."""
+    return INDEXES_DIR / name
+
+
+def _index_faiss_path(name: str) -> pathlib.Path:
+    return INDEXES_DIR / f"{name}.faiss"
+
+
+def _get_embedder_dim() -> int:
+    """Return the embedding dimension from the lazy-loaded HOOPSEmbeddings model."""
+    embedder = get_embedder()
+    dim = getattr(embedder, "embedding_dim", None)
+    if dim is not None:
+        return int(dim)
+    raise RuntimeError(
+        "Cannot determine embedding dimension from HOOPSEmbeddings. "
+        "Ensure the embeddings model is correctly configured."
+    )
+
+
+def _load_named_index(name: str) -> Any:
+    """Return the in-memory FaissVectorStore for `name`, loading from disk if needed.
+
+    Must be called while holding the per-index lock.
+    Raises KeyError if the index does not exist on disk.
+    """
+    if name in _named_indexes:
+        return _named_indexes[name]
+
+    faiss_file = _index_faiss_path(name)
+    if not faiss_file.exists():
+        raise KeyError(f"Index '{name}' does not exist.")
+
+    from hoops_ai.ml.embeddings import FaissVectorStore
+
+    vs = FaissVectorStore.load(str(_index_base_path(name)))
+    _named_indexes[name] = vs
+    return vs
+
+
+def _save_named_index_atomic(name: str, vs: Any) -> None:
+    """Persist *vs* to disk atomically using temp-file + replace pattern.
+
+    Writes to ``_tmp_{uuid}.faiss`` / ``.meta`` in INDEXES_DIR and then calls
+    ``Path.replace()`` to swap them in place.  replace() is atomic on POSIX and
+    as close to atomic as Windows allows (non-atomic but crash-safe for our use case).
+    """
+    INDEXES_DIR.mkdir(parents=True, exist_ok=True)
+    tmp_base = INDEXES_DIR / f"_tmp_{uuid.uuid4().hex}"
+    try:
+        vs.save(str(tmp_base))
+        pathlib.Path(str(tmp_base) + ".faiss").replace(_index_faiss_path(name))
+        pathlib.Path(str(tmp_base) + ".meta").replace(INDEXES_DIR / f"{name}.meta")
+    except Exception:
+        for suffix in (".faiss", ".meta"):
+            tmp = pathlib.Path(str(tmp_base) + suffix)
+            if tmp.exists():
+                tmp.unlink(missing_ok=True)
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Named index public API
+# ---------------------------------------------------------------------------
+
+
+def create_index(name: str) -> dict[str, Any]:
+    """Create a new empty named index.
+
+    Raises ValueError for invalid names, PermissionError for reserved names,
+    and FileExistsError if an index with that name already exists.
+    """
+    _validate_index_name(name)
+    lock = _get_index_lock(name)
+    with lock:
+        if _index_faiss_path(name).exists():
+            raise FileExistsError(f"Index '{name}' already exists.")
+
+        from hoops_ai.ml.embeddings import FaissVectorStore
+
+        dim = _get_embedder_dim()
+        vs = FaissVectorStore(dim)
+        _save_named_index_atomic(name, vs)
+        _named_indexes[name] = vs
+        return {"name": name, "count": 0, "dim": dim}
+
+
+def list_indexes() -> list[dict[str, Any]]:
+    """Return metadata for all known indexes, including the read-only ``default`` index."""
+    result: list[dict[str, Any]] = []
+
+    # "default" index – read-only, backed by the env-configured FAISS file
+    load_env_file()
+    faiss_name = os.environ.get("HOOPS_AI_FAISS_INDEX_PATH")
+    if faiss_name:
+        notebooks_dir_str = os.environ.get("HOOPS_AI_NOTEBOOK_DIR")
+        if notebooks_dir_str:
+            default_path = pathlib.Path(notebooks_dir_str) / faiss_name
+            last_modified: Optional[str] = None
+            if default_path.exists():
+                mtime = default_path.stat().st_mtime
+                last_modified = (
+                    datetime.datetime.fromtimestamp(mtime, tz=datetime.timezone.utc)
+                    .strftime("%Y-%m-%dT%H:%M:%SZ")
+                )
+            default_count: Optional[int] = None
+            if shape_index is not None:
+                ids = getattr(shape_index, "ids", None)
+                if ids is not None:
+                    try:
+                        default_count = int(len(ids))
+                    except (TypeError, ValueError):
+                        pass
+            result.append(
+                {
+                    "name": "default",
+                    "count": default_count,
+                    "last_modified": last_modified,
+                    "is_readonly": True,
+                }
+            )
+
+    # Named indexes from INDEXES_DIR
+    if INDEXES_DIR.exists():
+        for faiss_file in sorted(INDEXES_DIR.glob("*.faiss")):
+            if faiss_file.name.startswith("_tmp_"):
+                continue
+            idx_name = faiss_file.stem
+            last_modified_idx: Optional[str] = None
+            mtime = faiss_file.stat().st_mtime
+            last_modified_idx = (
+                datetime.datetime.fromtimestamp(mtime, tz=datetime.timezone.utc)
+                .strftime("%Y-%m-%dT%H:%M:%SZ")
+            )
+            idx_count: Optional[int] = None
+            lock = _get_index_lock(idx_name)
+            with lock:
+                try:
+                    vs = _load_named_index(idx_name)
+                    idx_count = len(vs.get_ids())
+                except Exception:
+                    pass
+            result.append(
+                {
+                    "name": idx_name,
+                    "count": idx_count,
+                    "last_modified": last_modified_idx,
+                    "is_readonly": False,
+                }
+            )
+
+    return result
+
+
+def add_to_index(name: str, file_ids: list[str]) -> dict[str, Any]:
+    """Compute embeddings for *file_ids* and upsert them into the named index.
+
+    Re-uses the ``compute_embedding()`` disk cache.  Re-inserting the same
+    file_id overwrites the existing entry (delete-then-upsert to avoid FAISS
+    duplicate entries).
+
+    Returns ``added``, ``updated``, ``index_count``, and per-file ``errors``.
+    """
+    _validate_index_name(name)
+    lock = _get_index_lock(name)
+    with lock:
+        vs = _load_named_index(name)
+
+        from hoops_ai.ml.embeddings import Embedding, FaissVectorStore, VectorRecord
+
+        existing_ids: set[str] = set(vs.get_ids())
+        added = 0
+        updated = 0
+        errors: list[dict[str, Any]] = []
+
+        for fid in file_ids:
+            try:
+                emb_result = compute_embedding(fid)
+                v = emb_result["vector"]
+                emb_obj = Embedding(values=v, model=emb_result["model_name"], dim=emb_result["dim"])
+                meta = {
+                    "file_id": fid,
+                    "filename": emb_result["filename"],
+                    "registered_at": datetime.datetime.now(datetime.timezone.utc).strftime(
+                        "%Y-%m-%dT%H:%M:%SZ"
+                    ),
+                }
+                rec = VectorRecord(id=fid, embedding=emb_obj, metadata=meta)
+
+                if fid in existing_ids:
+                    # delete first to prevent FAISS duplicate entries on re-insert
+                    vs.delete([fid])
+                    updated += 1
+                else:
+                    added += 1
+                    existing_ids.add(fid)
+
+                vs.upsert([rec])
+            except Exception as exc:
+                errors.append({"file_id": fid, "detail": str(exc)})
+
+        _save_named_index_atomic(name, vs)
+        return {
+            "name": name,
+            "added": added,
+            "updated": updated,
+            "index_count": len(vs.get_ids()),
+            "errors": errors,
+        }
+
+
+def remove_from_index(name: str, part_ids: list[str]) -> dict[str, Any]:
+    """Delete *part_ids* from the named index and persist the change."""
+    _validate_index_name(name)
+    lock = _get_index_lock(name)
+    with lock:
+        vs = _load_named_index(name)
+        vs.delete(part_ids)
+        _save_named_index_atomic(name, vs)
+        return {"name": name, "removed": len(part_ids), "index_count": len(vs.get_ids())}
+
+
+def search_index(name: str, file_id: str, top_k: int) -> dict[str, Any]:
+    """Search the named index for the top-k most similar parts to *file_id*.
+
+    Returns an empty hits list when the index contains no entries (no error).
+    """
+    _validate_index_name(name)
+    lock = _get_index_lock(name)
+    with lock:
+        vs = _load_named_index(name)
+        if len(vs.get_ids()) == 0:
+            return {"hits": [], "count": 0}
+        emb_result = compute_embedding(file_id)
+        v = emb_result["vector"]
+        hits = vs.query(v, top_k=top_k)
+        return {
+            "hits": [
+                {"id": h.id, "score": round(float(h.score), 6), "metadata": h.metadata}
+                for h in hits
+            ],
+            "count": len(hits),
+        }
+
+
+def delete_index(name: str) -> dict[str, Any]:
+    """Delete the named index and its on-disk files.
+
+    Raises PermissionError for reserved names, KeyError if the index does not exist.
+    """
+    _validate_index_name(name)
+    lock = _get_index_lock(name)
+    with lock:
+        faiss_file = _index_faiss_path(name)
+        if not faiss_file.exists():
+            raise KeyError(f"Index '{name}' does not exist.")
+        faiss_file.unlink(missing_ok=True)
+        meta_file = INDEXES_DIR / f"{name}.meta"
+        meta_file.unlink(missing_ok=True)
+        _named_indexes.pop(name, None)
+        return {"name": name, "deleted": True}
 
 
 def get_MFR_dataset_explorer():
