@@ -674,7 +674,141 @@ curl "http://<server-ip>:8000/similarity/index-info"
 
 ---
 
-### Part Classification
+#### Compute shape embedding (index-free)
+
+Compute (or retrieve from cache) the shape embedding vector for a single CAD part.
+This endpoint does **not** require a FAISS index — the embedding model alone is sufficient.
+
+```
+POST /similarity/embed
+```
+
+Supply **either** a file upload or a `file_id` from a previous `POST /files/upload`.
+
+**Windows (PowerShell):**
+```powershell
+# Upload a file and get its embedding
+curl.exe -X POST "http://<server-ip>:8000/similarity/embed" `
+    -F "file=@C:\path\to\bracket.step"
+
+# Or use an already-uploaded file_id
+curl.exe -X POST "http://<server-ip>:8000/similarity/embed?file_id=a3f8c2..."
+```
+
+**Linux:**
+```bash
+curl -X POST "http://<server-ip>:8000/similarity/embed" \
+    -F "file=@/path/to/bracket.step"
+```
+
+**Response:**
+
+```json
+{
+  "file_id": "a3f8c2...",
+  "filename": "bracket.step",
+  "dim": 512,
+  "model_name": "hoops_embeddings_model",
+  "num_bodies": 1,
+  "cached": false
+}
+```
+
+Add `?include_vector=true` to include the raw float array in the response (omitted by default to save bandwidth).
+
+| Field | Description |
+|---|---|
+| `file_id` | SHA-256 content hash of the uploaded file |
+| `filename` | Original filename |
+| `dim` | Embedding vector dimension |
+| `model_name` | Name of the embedding model used |
+| `num_bodies` | Number of solid bodies detected in the CAD file |
+| `cached` | `true` if the vector was returned from cache |
+| `vector` | Raw float array (only present when `include_vector=true`) |
+
+---
+
+#### Compare parts by shape similarity (index-free)
+
+Compare multiple CAD parts and return a pairwise cosine similarity matrix.
+Input sources can be combined freely.
+This endpoint does **not** require a FAISS index.
+
+```
+POST /similarity/compare
+```
+
+| Input | How to supply |
+|---|---|
+| Existing file IDs | `?file_ids=<id1>,<id2>,...` query parameter |
+| CAD file uploads | `files` multipart field (one or more) |
+| ZIP archive | `zip_file` multipart field (auto-extracted, Zip Slip protected) |
+
+At least **two** valid parts are required.  Per-file failures are collected in `errors`
+and do not abort the request (unless fewer than two parts succeed).
+
+**Windows (PowerShell) – upload two files directly:**
+```powershell
+curl.exe -X POST "http://<server-ip>:8000/similarity/compare" `
+    -F "files=@C:\path\to\bracket_a.step" `
+    -F "files=@C:\path\to\bracket_b.step"
+```
+
+**Linux – upload two files directly:**
+```bash
+curl -X POST "http://<server-ip>:8000/similarity/compare" \
+    -F "files=@/path/to/bracket_a.step" \
+    -F "files=@/path/to/bracket_b.step"
+```
+
+**Linux – compare using already-uploaded file_ids:**
+```bash
+curl -X POST "http://<server-ip>:8000/similarity/compare?file_ids=a3f8c2...,cd34ef..."
+```
+
+**Linux – compare files inside a ZIP archive:**
+```bash
+curl -X POST "http://<server-ip>:8000/similarity/compare" \
+    -F "zip_file=@/path/to/parts.zip"
+```
+
+**Response:**
+
+```json
+{
+  "count": 3,
+  "model_name": "hoops_embeddings_model",
+  "files": [
+    {"index": 0, "file_id": "ab12...", "filename": "bracket_a.step", "num_bodies": 1},
+    {"index": 1, "file_id": "cd34...", "filename": "bracket_b.step", "num_bodies": 1},
+    {"index": 2, "file_id": "ef56...", "filename": "gear.step",      "num_bodies": 2}
+  ],
+  "matrix": [
+    [1.0,    0.9532, 0.6821],
+    [0.9532, 1.0,    0.7015],
+    [0.6821, 0.7015, 1.0   ]
+  ],
+  "pairs": [
+    {"a": 0, "b": 1, "score": 0.9532},
+    {"a": 1, "b": 2, "score": 0.7015},
+    {"a": 0, "b": 2, "score": 0.6821}
+  ],
+  "errors": []
+}
+```
+
+| Field | Description |
+|---|---|
+| `count` | Number of parts compared |
+| `model_name` | Embedding model used |
+| `files` | Metadata for each part in index order |
+| `matrix` | N×N cosine similarity matrix (diagonal = 1.0) |
+| `pairs` | All i < j pairs sorted by similarity score descending |
+| `errors` | Per-file failures that were skipped (empty on full success) |
+
+ZIP archives are filtered to recognised CAD extensions (`.step .stp .iges .igs .x_t .x_b .sat .ipt .prt .sldprt .catpart`).
+Paths that escape the extraction directory (Zip Slip) are rejected with HTTP 400.
+Uncompressed size is capped at 500 MB and file count at 50 (HTTP 413 if exceeded).
 
 Classify a CAD solid into one of 45 part categories (FabWave dataset) using a trained Graph Classification model.
 
