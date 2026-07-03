@@ -810,6 +810,214 @@ ZIP archives are filtered to recognised CAD extensions (`.step .stp .iges .igs .
 Paths that escape the extraction directory (Zip Slip) are rejected with HTTP 400.
 Uncompressed size is capped at 500 MB and file count at 50 (HTTP 413 if exceeded).
 
+---
+
+### Named Index Management (Incremental Workflow)
+
+Manage user-created similarity indexes that grow over time.  Unlike the built-in
+read-only ``default`` index (backed by ``HOOPS_AI_FAISS_INDEX_PATH``), named indexes
+are fully writable: create an empty index, register new parts whenever they arrive,
+and query immediately — all via Web API with no notebook re-runs.
+
+Indexes are stored under ``APP_ROOT/indexes/<name>.faiss`` (+ ``.meta``).
+Index names must match ``^[a-z0-9_-]{1,64}$``; ``default`` is reserved.
+
+#### Incremental workflow example
+
+```
+# 1. Create an empty index
+POST /similarity/index/create?name=my-parts
+
+# 2. Register parts (repeat as new parts arrive)
+POST /similarity/index/add?name=my-parts
+     + files=@bracket_v1.step
+
+# 3. Search the growing index
+POST /similarity/index/my-parts/search
+     + files=@new_bracket.step
+
+# 4. Update a part (re-registering overwrites the old entry)
+POST /similarity/index/add?name=my-parts
+     + file_ids=<existing_file_id>
+
+# 5. Remove a part
+DELETE /similarity/index/my-parts/parts?part_ids=<file_id>
+
+# 6. Delete the whole index (destructive — requires confirm=true)
+DELETE /similarity/index/my-parts?confirm=true
+```
+
+#### Create a named index
+
+```
+POST /similarity/index/create?name=<name>
+```
+
+Returns **201** on success, **409** if the name already exists, **422** for invalid/reserved names.
+
+**Windows (PowerShell):**
+```powershell
+curl.exe -X POST "http://<server-ip>:8000/similarity/index/create?name=my-parts"
+```
+
+**Linux:**
+```bash
+curl -X POST "http://<server-ip>:8000/similarity/index/create?name=my-parts"
+```
+
+**Response:**
+```json
+{ "name": "my-parts", "count": 0, "dim": 512 }
+```
+
+---
+
+#### List all indexes
+
+```
+GET /similarity/index/list
+```
+
+Returns all named indexes plus the built-in ``default`` index (``is_readonly: true``).
+
+**Windows (PowerShell):** `curl.exe "http://<server-ip>:8000/similarity/index/list"`
+
+**Linux:** `curl "http://<server-ip>:8000/similarity/index/list"`
+
+**Response:**
+```json
+[
+  { "name": "default",  "count": 5000, "last_modified": "2025-06-01T12:00:00Z", "is_readonly": true  },
+  { "name": "my-parts", "count": 3,    "last_modified": "2026-07-01T08:30:00Z", "is_readonly": false }
+]
+```
+
+---
+
+#### Register parts in a named index
+
+```
+POST /similarity/index/add?name=<name>
+```
+
+Accepts the same three input sources as ``POST /similarity/compare``:
+
+| Input | How to supply |
+|---|---|
+| Existing file IDs | `?file_ids=<id1>,<id2>,...` |
+| CAD file uploads | `files` multipart field |
+| ZIP archive | `zip_file` multipart field |
+
+Re-registering a part ID overwrites the existing entry (``updated`` counter).
+Embedding results are cached on disk — re-adding the same file is fast.
+
+**Windows (PowerShell):**
+```powershell
+# Upload a new part directly
+curl.exe -X POST "http://<server-ip>:8000/similarity/index/add?name=my-parts" `
+    -F "files=@C:\path\to\new_bracket.step"
+
+# Add an already-uploaded part by file_id
+curl.exe -X POST "http://<server-ip>:8000/similarity/index/add?name=my-parts" `
+    -F "" --data-urlencode "file_ids=a3f8c2..."
+```
+
+**Linux:**
+```bash
+curl -X POST "http://<server-ip>:8000/similarity/index/add?name=my-parts" \
+    -F "files=@/path/to/new_bracket.step"
+```
+
+**Response:**
+```json
+{ "name": "my-parts", "added": 1, "updated": 0, "index_count": 4, "errors": [] }
+```
+
+---
+
+#### Search a named index
+
+```
+POST /similarity/index/{name}/search?top_k=<n>
+```
+
+Supply **either** a file upload or a `file_id`.  Returns an empty ``hits`` list
+when the index contains zero entries (no error).
+
+**Windows (PowerShell):**
+```powershell
+curl.exe -X POST "http://<server-ip>:8000/similarity/index/my-parts/search?top_k=5" `
+    -F "file=@C:\path\to\query.step"
+```
+
+**Linux:**
+```bash
+curl -X POST "http://<server-ip>:8000/similarity/index/my-parts/search?top_k=5" \
+    -F "file=@/path/to/query.step"
+```
+
+**Response:**
+```json
+{
+  "hits": [
+    { "id": "<file_id>", "score": 0.987, "metadata": { "filename": "bracket_v1.step", "registered_at": "2026-07-01T08:30:00Z" } }
+  ],
+  "count": 1
+}
+```
+
+---
+
+#### Remove parts from a named index
+
+```
+DELETE /similarity/index/{name}/parts?part_ids=<id1>,<id2>,...
+```
+
+**Windows (PowerShell):**
+```powershell
+Invoke-RestMethod -Method Delete `
+    -Uri "http://<server-ip>:8000/similarity/index/my-parts/parts?part_ids=a3f8c2...,cd34ef..."
+```
+
+**Linux:**
+```bash
+curl -X DELETE "http://<server-ip>:8000/similarity/index/my-parts/parts?part_ids=a3f8c2...,cd34ef..."
+```
+
+**Response:**
+```json
+{ "name": "my-parts", "removed": 2, "index_count": 2 }
+```
+
+---
+
+#### Delete a named index
+
+```
+DELETE /similarity/index/{name}?confirm=true
+```
+
+Destructive and irreversible.  Requires ``?confirm=true``; without it returns **409** with
+an instruction.  Returns **403** for the read-only ``default`` index.
+
+**Windows (PowerShell):**
+```powershell
+Invoke-RestMethod -Method Delete -Uri "http://<server-ip>:8000/similarity/index/my-parts?confirm=true"
+```
+
+**Linux:**
+```bash
+curl -X DELETE "http://<server-ip>:8000/similarity/index/my-parts?confirm=true"
+```
+
+**Response:**
+```json
+{ "name": "my-parts", "deleted": true }
+```
+
+---
+
 Classify a CAD solid into one of 45 part categories (FabWave dataset) using a trained Graph Classification model.
 
 #### Run inference
