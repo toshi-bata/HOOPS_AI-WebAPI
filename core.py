@@ -18,6 +18,13 @@ APP_ROOT = pathlib.Path(__file__).resolve().parent
 ENV_FILE_PATH = pathlib.Path(__file__).with_name(".env")
 CAD_UPLOAD_DIR = APP_ROOT.joinpath("uploads")
 CAD_VIEWER_OUTPUT_DIR = APP_ROOT.joinpath("out")
+EMBEDDINGS_CACHE_DIR = APP_ROOT.joinpath("embeddings_cache")
+
+# Allowed CAD file extensions for upload/ZIP extraction
+CAD_ALLOWED_EXTENSIONS = frozenset({
+    ".step", ".stp", ".iges", ".igs", ".x_t", ".x_b",
+    ".sat", ".ipt", ".prt", ".sldprt", ".catpart",
+})
 MFR_LABELS_DESCRIPTION_ENV_NAMES = ("HOOPS_AI_MFR_LABELS_DESCRIPTION", "labels_description")
 
 MFR_dataset_explorer = None
@@ -28,6 +35,8 @@ cad_searcher = None
 shape_index = None
 PART_CLASS_inference_model = None
 PART_CLASS_dataset_explorer = None
+_embedder = None
+_embedding_memory_cache: dict[str, dict] = {}  # cache_key -> embedding entry
 
 
 def get_MFR_dataset_explorer():
@@ -515,6 +524,204 @@ def get_similar_search_index_info() -> dict[str, Any]:
             info["metadata"] = _json_safe(dict(metadata) if hasattr(metadata, "items") else metadata)
 
     return info
+
+
+# ---------------------------------------------------------------------------
+# Embedding-only helpers (no FAISS index required)
+# ---------------------------------------------------------------------------
+
+
+def get_embedder():
+    """Lazy-initialise HOOPSEmbeddings without loading a FAISS index.
+
+    Safe to call alongside (or after) ``create_cad_searcher()`` — the model
+    registration is guarded so it is never performed twice.
+    """
+    global _embedder
+    if _embedder is not None:
+        return _embedder
+
+    from hoops_ai.ml.embeddings import HOOPSEmbeddings
+
+    load_env_file()
+
+    notebooks_dir = require_path(
+        pathlib.Path(get_required_env("HOOPS_AI_NOTEBOOK_DIR")),
+        env_name="HOOPS_AI_NOTEBOOK_DIR",
+    )
+    ckpt_name = get_required_env("HOOPS_AI_EMBEDDINGS_MODEL_NAME")
+    trained_model = require_path(
+        notebooks_dir.parent.joinpath("packages", "trained_ml_models", ckpt_name),
+        env_name="HOOPS_AI_EMBEDDINGS_MODEL_NAME",
+    )
+
+    try:
+        HOOPSEmbeddings.register_model(
+            model_name="hoops_embeddings_model",
+            checkpoint_path=str(trained_model),
+        )
+    except Exception:
+        pass  # already registered (e.g. by create_cad_searcher)
+
+    _embedder = HOOPSEmbeddings(model="hoops_embeddings_model")
+    return _embedder
+
+
+def _l2_normalize(v):
+    """L2-normalise a 1-D numpy float32 array. Returns a zero vector unchanged."""
+    import numpy as np
+
+    norm = float(np.linalg.norm(v))
+    if norm == 0.0:
+        return v.astype(np.float32)
+    return (v / norm).astype(np.float32)
+
+
+def compute_embedding(file_id: str) -> dict[str, Any]:
+    """Compute (or retrieve from cache) the shape embedding for a CAD file.
+
+    The result vector is a single L2-normalised float32 array representing the
+    whole part.  For multi-body models the per-body vectors are individually
+    L2-normalised, averaged, then re-normalised.
+
+    Returns a dict with keys:
+      ``file_id``, ``vector`` (np.ndarray), ``dim``, ``model_name``,
+      ``num_bodies``, ``filename``, ``cached`` (bool).
+    """
+    import numpy as np
+
+    embedder = get_embedder()
+    model_name = (
+        getattr(embedder, "model_name", None)
+        or getattr(embedder, "model", None)
+        or "hoops_embeddings_model"
+    )
+
+    # Build a filesystem-safe cache key that includes the model name.
+    safe_model = "".join(c if c.isalnum() or c in "-_." else "_" for c in model_name)
+    cache_key = f"{safe_model}__{file_id}"
+
+    # 1. Memory cache (fastest)
+    if cache_key in _embedding_memory_cache:
+        entry = _embedding_memory_cache[cache_key]
+        return {**entry, "cached": True}
+
+    # 2. Disk cache (survives server restart)
+    EMBEDDINGS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    disk_vec_path = EMBEDDINGS_CACHE_DIR / f"{cache_key}.npy"
+    disk_meta_path = EMBEDDINGS_CACHE_DIR / f"{cache_key}.meta.npy"
+
+    if disk_vec_path.exists() and disk_meta_path.exists():
+        try:
+            vector = np.load(str(disk_vec_path))
+            meta = np.load(str(disk_meta_path), allow_pickle=True).item()
+            entry: dict[str, Any] = {
+                "file_id": file_id,
+                "vector": vector,
+                "dim": int(vector.shape[0]),
+                "model_name": model_name,
+                "num_bodies": int(meta.get("num_bodies", 1)),
+                "filename": str(meta.get("filename", "")),
+            }
+            _embedding_memory_cache[cache_key] = entry
+            return {**entry, "cached": True}
+        except Exception:
+            pass  # corrupted cache — fall through to recompute
+
+    # 3. Compute via HOOPS embedder
+    cad_path = find_persistent_CAD_file(file_id)
+    # The stored file name pattern is "{file_id}_{original_filename}".
+    parts = cad_path.name.split("_", 1)
+    filename = parts[1] if len(parts) == 2 and len(parts[0]) == 64 else cad_path.name
+
+    raw_embeddings = embedder.embed_shape(str(cad_path))
+
+    body_vectors: list = []
+    for emb in raw_embeddings:
+        v = getattr(emb, "values", None)
+        if v is None:
+            v = np.array(emb)
+        v = np.array(v, dtype=np.float32).flatten()
+        body_vectors.append(_l2_normalize(v))
+
+    if not body_vectors:
+        raise RuntimeError(f"embed_shape() returned no embeddings for file_id '{file_id}'.")
+
+    if len(body_vectors) == 1:
+        vector = body_vectors[0]
+    else:
+        stacked = np.stack(body_vectors, axis=0)  # (N, D)
+        vector = _l2_normalize(stacked.mean(axis=0))
+
+    num_bodies = len(body_vectors)
+
+    entry = {
+        "file_id": file_id,
+        "vector": vector,
+        "dim": int(vector.shape[0]),
+        "model_name": model_name,
+        "num_bodies": num_bodies,
+        "filename": filename,
+    }
+
+    # Persist to disk (non-fatal on failure)
+    try:
+        np.save(str(disk_vec_path), vector)
+        np.save(str(disk_meta_path), {"num_bodies": num_bodies, "filename": filename})
+    except Exception:
+        pass
+
+    _embedding_memory_cache[cache_key] = entry
+    return {**entry, "cached": False}
+
+
+def compare_embeddings(file_ids: list[str]) -> dict[str, Any]:
+    """Compute an N×N cosine similarity matrix for the given file_ids.
+
+    All embedding vectors are L2-normalised, so cosine similarity equals their
+    dot product.  Diagonal entries are forced to exactly ``1.0``.
+
+    Returns a dict with keys:
+      ``count``, ``model_name``, ``files``, ``matrix`` (N×N list of lists),
+      ``pairs`` (all i<j combos sorted by score descending).
+    """
+    import numpy as np
+
+    embeddings = [compute_embedding(fid) for fid in file_ids]
+    vectors = np.stack([e["vector"] for e in embeddings], axis=0)  # (N, D)
+
+    # Cosine similarity via dot product (vectors are already L2-normalised)
+    raw_matrix = (vectors @ vectors.T).tolist()
+    n = len(embeddings)
+    matrix = [[round(float(raw_matrix[i][j]), 6) for j in range(n)] for i in range(n)]
+    for i in range(n):
+        matrix[i][i] = 1.0  # enforce exact diagonal
+
+    files = [
+        {
+            "index": i,
+            "file_id": e["file_id"],
+            "filename": e["filename"],
+            "num_bodies": e["num_bodies"],
+        }
+        for i, e in enumerate(embeddings)
+    ]
+
+    pairs = [
+        {"a": i, "b": j, "score": matrix[i][j]}
+        for i in range(n)
+        for j in range(i + 1, n)
+    ]
+    pairs.sort(key=lambda p: p["score"], reverse=True)
+
+    model_name = embeddings[0]["model_name"] if embeddings else "hoops_embeddings_model"
+    return {
+        "count": n,
+        "model_name": model_name,
+        "files": files,
+        "matrix": matrix,
+        "pairs": pairs,
+    }
 
 
 def search_MFR_files(feature_name: str) -> dict[str, Any]:
