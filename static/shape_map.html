@@ -56,6 +56,11 @@
       <input id="scale" type="range" min="0" max="100" value="0" step="1">
       <span id="scaleValue">1.0×</span>
     </div>
+    <div class="row">
+      <label for="maxMult" style="white-space:nowrap">Max ×</label>
+      <input id="maxMult" type="number" min="2" max="10000" value="100" step="1"
+             style="width:70px;padding:2px 4px;font-size:13px;border:1px solid #ccc;border-radius:4px;">
+    </div>
     <div id="stress">Layout accuracy: -</div>
   </div>
 
@@ -81,6 +86,7 @@
     const scaleSlider = document.getElementById('scale');
     const scaleValueEl = document.getElementById('scaleValue');
     const stressEl = document.getElementById('stress');
+    const maxMultInput = document.getElementById('maxMult');
 
     function showError(msg) {
       spinner.style.display = 'none';
@@ -168,17 +174,21 @@
     function setupSlider() {
       baseScale = computeInitialScale();
       currentScale = baseScale;
-      // slider maps 0..100 → baseScale .. baseScale*100 (linear)
       scaleSlider.min = 0;
       scaleSlider.max = 100;
       scaleSlider.value = 0;
       updateScaleLabel();
-      scaleSlider.addEventListener('input', () => {
-        const t = parseFloat(scaleSlider.value) / 100;   // 0..1
-        currentScale = baseScale * (1 + t * 99);          // 1×..100× of baseScale
+
+      function applySlider() {
+        const mult = Math.max(2, parseInt(maxMultInput.value) || 100);
+        const t = parseFloat(scaleSlider.value) / 100;  // 0..1
+        currentScale = baseScale * (1 + t * (mult - 1));
         updateScaleLabel();
         applyPositions();
-      });
+      }
+
+      scaleSlider.addEventListener('input', applySlider);
+      maxMultInput.addEventListener('change', applySlider);
     }
 
     function updateScaleLabel() {
