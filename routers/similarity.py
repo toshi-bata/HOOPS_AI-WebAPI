@@ -6,7 +6,7 @@ from typing import Any, List, Optional
 
 import core
 from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 
 router = APIRouter(prefix="/similarity", tags=["CAD Similarity Search"])
@@ -340,6 +340,180 @@ def similarity_compare(
         pairs=[ComparePair(**p) for p in result["pairs"]],
         errors=[CompareError(**e) for e in errors],
     )
+
+
+# ---------------------------------------------------------------------------
+# Response schemas – shape space map
+# ---------------------------------------------------------------------------
+
+
+class MapPartInfo(BaseModel):
+    index: int
+    file_id: str
+    filename: str
+    scs_url: str
+    position: list[float]  # [x, y, z]
+
+
+class ShapeMapResponse(BaseModel):
+    """A 3D layout of CAD parts where similar parts are placed closer together."""
+
+    map_id: str
+    viewer_url: str
+    count: int
+    parts: list[MapPartInfo]
+    matrix: list[list[float]]
+    stress: float
+    errors: list[CompareError]
+
+
+# ---------------------------------------------------------------------------
+# POST /similarity/map
+# ---------------------------------------------------------------------------
+
+
+@router.post("/map", response_model=ShapeMapResponse)
+def similarity_map(
+    request: Request,
+    file_ids: Optional[str] = Query(
+        None,
+        description="Comma-separated file_ids of already-uploaded CAD files.",
+    ),
+    files: Optional[List[UploadFile]] = File(None),
+    zip_file: Optional[UploadFile] = File(None),
+):
+    """Compute a Shape Space Map: arrange CAD parts in 3D so similar parts are closer together.
+
+    Input sources can be combined freely:
+
+    * ``file_ids`` – comma-separated ``file_id`` values from previous uploads
+    * ``files`` – one or more multipart CAD file uploads
+    * ``zip_file`` – a single ZIP archive containing CAD files (auto-extracted)
+
+    At least **two** valid parts are required.  Parts are embedded, compared by
+    cosine similarity and laid out in 3D with classical MDS (multidimensional
+    scaling).  Each part is also converted to an SCS stream cache so the returned
+    ``viewer_url`` can render them together in the HOOPS Web Viewer.
+    """
+    errors: list[dict] = []
+    # (file_id, display_filename) tuples collected from all input sources
+    resolved: list[tuple[str, str]] = []
+
+    # ── 1. file_ids from query parameter ─────────────────────────────────────
+    if file_ids:
+        for fid in [f.strip() for f in file_ids.split(",") if f.strip()]:
+            try:
+                path = core.find_persistent_CAD_file(fid)
+                parts = path.name.split("_", 1)
+                display = parts[1] if len(parts) == 2 and len(parts[0]) == 64 else path.name
+                resolved.append((fid, display))
+            except RuntimeError as exc:
+                errors.append({"filename": fid, "detail": str(exc)})
+
+    # ── 2. Direct file uploads ────────────────────────────────────────────────
+    if files:
+        for upload in files:
+            if not (upload and upload.filename):
+                continue
+            try:
+                fid, _, _ = core.upload_CAD_file_persistent(upload)
+                resolved.append((fid, upload.filename))
+            except Exception as exc:
+                errors.append({"filename": upload.filename or "unknown", "detail": str(exc)})
+
+    # ── 3. ZIP archive ────────────────────────────────────────────────────────
+    if zip_file and zip_file.filename:
+        try:
+            zip_data = zip_file.file.read()
+            _process_zip(zip_data, resolved, errors)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400, detail=f"Failed to process ZIP archive: {exc}"
+            ) from exc
+
+    # ── Require at least 2 inputs ─────────────────────────────────────────────
+    if len(resolved) < 2:
+        msg = (
+            f"At least 2 CAD files are required for a shape map. "
+            f"Received {len(resolved)} valid input(s)"
+            + (f" and {len(errors)} failure(s)." if errors else ".")
+        )
+        raise HTTPException(status_code=422, detail=msg)
+
+    # ── 4. Compute embeddings (collect per-file errors) ───────────────────────
+    valid_ids: list[str] = []
+    for fid, display in resolved:
+        try:
+            core.compute_embedding(fid)
+            valid_ids.append(fid)
+        except Exception as exc:
+            errors.append({"filename": display, "detail": str(exc)})
+
+    if len(valid_ids) < 2:
+        raise HTTPException(
+            status_code=422,
+            detail=f"At least 2 successful embeddings are required. "
+            f"{len(errors)} file(s) failed to embed.",
+        )
+
+    # ── 5. Compute shape map ──────────────────────────────────────────────────
+    try:
+        result = core.compute_shape_map_data(valid_ids)
+    except HTTPException:
+        raise
+    except (core.EnvConfigError, core.PathConfigError):
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Shape map failed: {exc}") from exc
+
+    # Merge any embed/upload errors with SCS-conversion errors from the pipeline.
+    all_errors = errors + list(result.get("errors", []))
+
+    base = str(request.base_url).rstrip("/")
+
+    parts_out: list[MapPartInfo] = []
+    for p in result["parts"]:
+        scs_url = p.get("scs_url")
+        abs_scs = f"{base}{scs_url}" if scs_url else ""
+        parts_out.append(
+            MapPartInfo(
+                index=p["index"],
+                file_id=p["file_id"],
+                filename=p["filename"],
+                scs_url=abs_scs,
+                position=p["position"],
+            )
+        )
+
+    return ShapeMapResponse(
+        map_id=result["map_id"],
+        viewer_url=f"{base}{result['viewer_url']}",
+        count=result["count"],
+        parts=parts_out,
+        matrix=result["matrix"],
+        stress=result["stress"],
+        errors=[CompareError(**e) for e in all_errors],
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /similarity/map/show
+# ---------------------------------------------------------------------------
+
+
+@router.get("/map/show", response_class=HTMLResponse)
+def similarity_map_show(
+    map: str = Query(..., description="map_id returned by POST /similarity/map")
+):
+    """Serve the Shape Space Map viewer page.
+
+    The page reads the ``map`` query parameter and fetches the layout JSON from
+    ``/out/shape_map_{map}.json`` itself.
+    """
+    html_path = pathlib.Path(__file__).parent.parent / "static" / "shape_map.html"
+    return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
 
 
 
