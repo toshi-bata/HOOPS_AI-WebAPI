@@ -89,12 +89,14 @@ def _validate_index_name(name: str) -> None:
 
 
 def _index_base_path(name: str) -> pathlib.Path:
-    """Base path (no extension) for a named index; save() appends .faiss / .meta."""
-    return INDEXES_DIR / name
+    """Base path (no extension) passed to FaissVectorStore.save/load.
+    Generates indexes/{name}/index.faiss and indexes/{name}/index.meta.
+    """
+    return INDEXES_DIR / name / "index"
 
 
 def _index_faiss_path(name: str) -> pathlib.Path:
-    return INDEXES_DIR / f"{name}.faiss"
+    return INDEXES_DIR / name / "index.faiss"
 
 
 def _get_embedder_dim() -> int:
@@ -137,11 +139,13 @@ def _save_named_index_atomic(name: str, vs: Any) -> None:
     as close to atomic as Windows allows (non-atomic but crash-safe for our use case).
     """
     INDEXES_DIR.mkdir(parents=True, exist_ok=True)
-    tmp_base = INDEXES_DIR / f"_tmp_{uuid.uuid4().hex}"
+    index_dir = INDEXES_DIR / name
+    index_dir.mkdir(parents=True, exist_ok=True)
+    tmp_base = index_dir / f"_tmp_{uuid.uuid4().hex}"
     try:
         vs.save(str(tmp_base))
         pathlib.Path(str(tmp_base) + ".faiss").replace(_index_faiss_path(name))
-        pathlib.Path(str(tmp_base) + ".meta").replace(INDEXES_DIR / f"{name}.meta")
+        pathlib.Path(str(tmp_base) + ".meta").replace(INDEXES_DIR / name / "index.meta")
     except Exception:
         for suffix in (".faiss", ".meta"):
             tmp = pathlib.Path(str(tmp_base) + suffix)
@@ -211,12 +215,10 @@ def list_indexes() -> list[dict[str, Any]]:
                 }
             )
 
-    # Named indexes from INDEXES_DIR
+    # Named indexes from INDEXES_DIR — each lives in its own subdirectory
     if INDEXES_DIR.exists():
-        for faiss_file in sorted(INDEXES_DIR.glob("*.faiss")):
-            if faiss_file.name.startswith("_tmp_"):
-                continue
-            idx_name = faiss_file.stem
+        for faiss_file in sorted(INDEXES_DIR.glob("*/index.faiss")):
+            idx_name = faiss_file.parent.name
             last_modified_idx: Optional[str] = None
             mtime = faiss_file.stat().st_mtime
             last_modified_idx = (
@@ -364,22 +366,19 @@ def delete_index(name: str) -> dict[str, Any]:
         faiss_file = _index_faiss_path(name)
         if not faiss_file.exists():
             raise KeyError(f"Index '{name}' does not exist.")
-        faiss_file.unlink(missing_ok=True)
-        meta_file = INDEXES_DIR / f"{name}.meta"
-        meta_file.unlink(missing_ok=True)
         _named_indexes.pop(name, None)
 
-    # Remove thumbnails directory (outside lock, non-fatal)
-    thumb_dir = _index_thumbnails_dir(name)
-    if thumb_dir.exists():
-        shutil.rmtree(thumb_dir, ignore_errors=True)
+    # Remove the entire index directory (faiss + meta + thumbnails)
+    index_dir = INDEXES_DIR / name
+    if index_dir.exists():
+        shutil.rmtree(index_dir, ignore_errors=True)
 
     return {"name": name, "deleted": True}
 
 
 def _index_thumbnails_dir(name: str) -> pathlib.Path:
     """Return the per-index thumbnail image directory path."""
-    return INDEXES_DIR / "thumbnails" / name
+    return INDEXES_DIR / name / "thumbnails"
 
 
 def _generate_part_thumbnail(file_id: str, index_name: str) -> Optional[pathlib.Path]:

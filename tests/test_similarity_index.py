@@ -214,10 +214,10 @@ class TestIndexLifecycle(unittest.TestCase):
         FaissVS = MagicMock()
         FaissVS.load.return_value = vs_inst
 
-        # Pre-create the .faiss file so _load_named_index finds it
-        (core.INDEXES_DIR).mkdir(parents=True, exist_ok=True)
-        (core.INDEXES_DIR / "demo.faiss").write_bytes(b"fake")
-        (core.INDEXES_DIR / "demo.meta").write_bytes(b"fake")
+        # Pre-create the index.faiss file under the new per-index subdirectory
+        (core.INDEXES_DIR / "demo").mkdir(parents=True, exist_ok=True)
+        (core.INDEXES_DIR / "demo" / "index.faiss").write_bytes(b"fake")
+        (core.INDEXES_DIR / "demo" / "index.meta").write_bytes(b"fake")
         core._named_indexes["demo"] = vs_inst
 
         EmbeddingMock = MagicMock()
@@ -248,9 +248,9 @@ class TestIndexLifecycle(unittest.TestCase):
         fid = "b" * 64
         vs_inst = _fake_vs([fid])  # already contains fid
 
-        (core.INDEXES_DIR).mkdir(parents=True, exist_ok=True)
-        (core.INDEXES_DIR / "myidx.faiss").write_bytes(b"fake")
-        (core.INDEXES_DIR / "myidx.meta").write_bytes(b"fake")
+        (core.INDEXES_DIR / "myidx").mkdir(parents=True, exist_ok=True)
+        (core.INDEXES_DIR / "myidx" / "index.faiss").write_bytes(b"fake")
+        (core.INDEXES_DIR / "myidx" / "index.meta").write_bytes(b"fake")
         core._named_indexes["myidx"] = vs_inst
 
         FaissVS = MagicMock()
@@ -281,9 +281,9 @@ class TestIndexLifecycle(unittest.TestCase):
         import core
 
         vs_inst = _fake_vs([])
-        core.INDEXES_DIR.mkdir(parents=True, exist_ok=True)
-        (core.INDEXES_DIR / "empty.faiss").write_bytes(b"fake")
-        (core.INDEXES_DIR / "empty.meta").write_bytes(b"fake")
+        (core.INDEXES_DIR / "empty").mkdir(parents=True, exist_ok=True)
+        (core.INDEXES_DIR / "empty" / "index.faiss").write_bytes(b"fake")
+        (core.INDEXES_DIR / "empty" / "index.meta").write_bytes(b"fake")
         core._named_indexes["empty"] = vs_inst
 
         with patch.object(core, "compute_embedding", side_effect=_fake_embedding):
@@ -309,9 +309,9 @@ class TestIndexLifecycle(unittest.TestCase):
 
         vs_inst.delete.side_effect = fake_delete
 
-        core.INDEXES_DIR.mkdir(parents=True, exist_ok=True)
-        (core.INDEXES_DIR / "idx.faiss").write_bytes(b"fake")
-        (core.INDEXES_DIR / "idx.meta").write_bytes(b"fake")
+        (core.INDEXES_DIR / "idx").mkdir(parents=True, exist_ok=True)
+        (core.INDEXES_DIR / "idx" / "index.faiss").write_bytes(b"fake")
+        (core.INDEXES_DIR / "idx" / "index.meta").write_bytes(b"fake")
         core._named_indexes["idx"] = vs_inst
 
         FaissVS = MagicMock()
@@ -328,17 +328,16 @@ class TestIndexLifecycle(unittest.TestCase):
         self.assertIn(fid, deleted)
 
     def test_delete_index_removes_files(self):
-        """delete_index removes .faiss and .meta files from disk."""
+        """delete_index removes the entire index directory from disk."""
         import core
 
-        core.INDEXES_DIR.mkdir(parents=True, exist_ok=True)
-        (core.INDEXES_DIR / "todel.faiss").write_bytes(b"data")
-        (core.INDEXES_DIR / "todel.meta").write_bytes(b"data")
+        (core.INDEXES_DIR / "todel").mkdir(parents=True, exist_ok=True)
+        (core.INDEXES_DIR / "todel" / "index.faiss").write_bytes(b"data")
+        (core.INDEXES_DIR / "todel" / "index.meta").write_bytes(b"data")
 
         result = core.delete_index("todel")
         self.assertTrue(result["deleted"])
-        self.assertFalse((core.INDEXES_DIR / "todel.faiss").exists())
-        self.assertFalse((core.INDEXES_DIR / "todel.meta").exists())
+        self.assertFalse((core.INDEXES_DIR / "todel").exists())
         self.assertNotIn("todel", core._named_indexes)
 
 
@@ -449,10 +448,10 @@ class TestDuplicateCreate(unittest.TestCase):
         """Creating an index that already exists must return 409."""
         import core
 
-        # Pre-create the file
-        core.INDEXES_DIR.mkdir(parents=True, exist_ok=True)
-        (core.INDEXES_DIR / "exists.faiss").write_bytes(b"data")
-        (core.INDEXES_DIR / "exists.meta").write_bytes(b"data")
+        # Pre-create the index directory with the new structure
+        (core.INDEXES_DIR / "exists").mkdir(parents=True, exist_ok=True)
+        (core.INDEXES_DIR / "exists" / "index.faiss").write_bytes(b"data")
+        (core.INDEXES_DIR / "exists" / "index.meta").write_bytes(b"data")
 
         with patch.object(core, "get_embedder", return_value=MagicMock(embedding_dim=4)):
             try:
@@ -509,7 +508,6 @@ class TestAtomicSave(unittest.TestCase):
         written_paths: list[str] = []
 
         def fake_save(path: str):
-            # simulate FaissVectorStore.save() creating .faiss and .meta
             pathlib.Path(path + ".faiss").write_bytes(b"faiss_data")
             pathlib.Path(path + ".meta").write_bytes(b"meta_data")
             written_paths.append(path)
@@ -519,14 +517,13 @@ class TestAtomicSave(unittest.TestCase):
 
         core._save_named_index_atomic("mytest", vs)
 
-        dest_faiss = core.INDEXES_DIR / "mytest.faiss"
-        dest_meta = core.INDEXES_DIR / "mytest.meta"
-        self.assertTrue(dest_faiss.exists(), "Final .faiss must exist after atomic save")
-        self.assertTrue(dest_meta.exists(), "Final .meta must exist after atomic save")
+        dest_faiss = core.INDEXES_DIR / "mytest" / "index.faiss"
+        dest_meta = core.INDEXES_DIR / "mytest" / "index.meta"
+        self.assertTrue(dest_faiss.exists(), "Final index.faiss must exist after atomic save")
+        self.assertTrue(dest_meta.exists(), "Final index.meta must exist after atomic save")
         self.assertEqual(dest_faiss.read_bytes(), b"faiss_data")
         self.assertEqual(dest_meta.read_bytes(), b"meta_data")
 
-        # Temp file must have been removed (replaced)
         self.assertEqual(len(written_paths), 1)
         tmp_base = written_paths[0]
         self.assertFalse(
