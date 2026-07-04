@@ -191,6 +191,8 @@
 
     // 笏笏 Labels 笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏
     function updateLabels(screenPts) {
+      if (!hwv) return;
+      if (!screenPts) screenPts = projectAll();
       partState.forEach((st, i) => {
         if (!st.label) return;
         const s = screenPts[i];
@@ -202,7 +204,8 @@
     // 笏笏 SVG edges 笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏
     function updateEdges(screenPts) {
       edgeSvg.innerHTML = '';
-      if (!showEdges || !mapData) return;
+      if (!showEdges || !mapData || !hwv) return;
+      if (!screenPts) screenPts = projectAll();
       const thresh = parseFloat(edgeThresh.value) || 0;
       const n = partState.length;
       for (let i = 0; i < n; i++) {
