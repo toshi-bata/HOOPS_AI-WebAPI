@@ -291,7 +291,7 @@ def add_to_index(name: str, file_ids: list[str]) -> dict[str, Any]:
                 errors.append({"file_id": fid, "detail": str(exc)})
 
         _save_named_index_atomic(name, vs)
-        return {
+        result = {
             "name": name,
             "added": added,
             "updated": updated,
@@ -299,43 +299,62 @@ def add_to_index(name: str, file_ids: list[str]) -> dict[str, Any]:
             "errors": errors,
         }
 
+    # Generate thumbnails outside the lock (non-fatal, can be slow)
+    for fid in [f for f in file_ids if f not in [e["file_id"] for e in errors]]:
+        _generate_part_thumbnail(fid, name)
+
+    return result
+
 
 def remove_from_index(name: str, part_ids: list[str]) -> dict[str, Any]:
-    """Delete *part_ids* from the named index and persist the change."""
+    """Delete *part_ids* from the named index, persist, and remove their thumbnails."""
     _validate_index_name(name)
     lock = _get_index_lock(name)
     with lock:
         vs = _load_named_index(name)
         vs.delete(part_ids)
         _save_named_index_atomic(name, vs)
-        return {"name": name, "removed": len(part_ids), "index_count": len(vs.get_ids())}
+
+    # Remove thumbnails outside the lock (non-fatal)
+    thumb_dir = _index_thumbnails_dir(name)
+    for pid in part_ids:
+        png = thumb_dir / f"{pid}.png"
+        png.unlink(missing_ok=True)
+
+    return {"name": name, "removed": len(part_ids), "index_count": len(vs.get_ids())}
 
 
 def search_index(name: str, file_id: str, top_k: int) -> dict[str, Any]:
     """Search the named index for the top-k most similar parts to *file_id*.
 
-    Returns an empty hits list when the index contains no entries (no error).
+    Returns an empty hits list (and no image_url) when the index has no entries.
+    Generates a result-grid PNG in out/ and returns its relative URL as ``image_url``.
     """
     _validate_index_name(name)
     lock = _get_index_lock(name)
+
+    # Phase 1: vector store operations (locked)
     with lock:
         vs = _load_named_index(name)
         if len(vs.get_ids()) == 0:
-            return {"hits": [], "count": 0}
+            return {"hits": [], "count": 0, "image_url": None}
         emb_result = compute_embedding(file_id)
-        v = emb_result["vector"]
-        hits = vs.query(v, top_k=top_k)
-        return {
-            "hits": [
-                {"id": h.id, "score": round(float(h.score), 6), "metadata": h.metadata}
-                for h in hits
-            ],
-            "count": len(hits),
-        }
+        raw_hits = vs.query(emb_result["vector"], top_k=top_k)
+
+    hit_dicts = [
+        {"id": h.id, "score": round(float(h.score), 6), "metadata": h.metadata}
+        for h in raw_hits
+    ]
+
+    # Phase 2: thumbnail + grid generation (outside lock, non-fatal)
+    _generate_part_thumbnail(file_id, name)
+    image_url = _build_search_grid_image(file_id, hit_dicts, name) if hit_dicts else None
+
+    return {"hits": hit_dicts, "count": len(hit_dicts), "image_url": image_url}
 
 
 def delete_index(name: str) -> dict[str, Any]:
-    """Delete the named index and its on-disk files.
+    """Delete the named index, its on-disk FAISS files, and all stored thumbnails.
 
     Raises PermissionError for reserved names, KeyError if the index does not exist.
     """
@@ -349,11 +368,150 @@ def delete_index(name: str) -> dict[str, Any]:
         meta_file = INDEXES_DIR / f"{name}.meta"
         meta_file.unlink(missing_ok=True)
         _named_indexes.pop(name, None)
-        return {"name": name, "deleted": True}
+
+    # Remove thumbnails directory (outside lock, non-fatal)
+    thumb_dir = _index_thumbnails_dir(name)
+    if thumb_dir.exists():
+        shutil.rmtree(thumb_dir, ignore_errors=True)
+
+    return {"name": name, "deleted": True}
 
 
-def get_MFR_dataset_explorer():
-    global MFR_dataset_explorer
+def _index_thumbnails_dir(name: str) -> pathlib.Path:
+    """Return the per-index thumbnail image directory path."""
+    return INDEXES_DIR / "thumbnails" / name
+
+
+def _generate_part_thumbnail(file_id: str, index_name: str) -> Optional[pathlib.Path]:
+    """Render a CAD part as a white-background PNG and store it in the index thumbnails dir.
+
+    Idempotent: skips generation when the PNG already exists.
+    Non-fatal: returns None on any failure so callers are never interrupted.
+    The SCS intermediate file is deleted after the PNG is extracted.
+    """
+    thumb_dir = _index_thumbnails_dir(index_name)
+    dest_png = thumb_dir / f"{file_id}.png"
+
+    if dest_png.exists():
+        return dest_png
+
+    try:
+        from hoops_ai.cadaccess import HOOPSLoader, HOOPSTools
+
+        cad_path = find_persistent_CAD_file(file_id)
+        thumb_dir.mkdir(parents=True, exist_ok=True)
+
+        # exportStreamCache writes {stem}.scs and {stem}.png next to the given filename.
+        tmp_scs = thumb_dir / f"_tmp_{uuid.uuid4().hex}.scs"
+        cad_loader = HOOPSLoader()
+        model = cad_loader.create_from_file(str(cad_path))
+        tools = HOOPSTools()
+        png_result, scs_result = tools.exportStreamCache(
+            model,
+            filename=str(tmp_scs),
+            is_white_background=True,
+            overwrite=True,
+        )
+
+        # Move the generated PNG to the final destination
+        png_file = pathlib.Path(png_result) if png_result else None
+        if png_file and png_file.exists():
+            png_file.replace(dest_png)
+
+        # Remove the SCS file — we only need the PNG for thumbnails
+        for p_str in (scs_result, str(tmp_scs)):
+            if p_str:
+                p = pathlib.Path(p_str)
+                if p.exists():
+                    p.unlink(missing_ok=True)
+
+        return dest_png if dest_png.exists() else None
+    except Exception:
+        return None
+
+
+def _build_search_grid_image(
+    query_file_id: str,
+    hits: list[dict[str, Any]],
+    index_name: str,
+) -> Optional[str]:
+    """Generate a matplotlib result-grid PNG (query + top-k hits) and save to out/.
+
+    Returns a ``/out/{uuid}.png`` relative URL, or None on failure.
+    Thumbnails are looked up from the index thumbnails directory.
+    """
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.image as mpimg
+        import matplotlib.pyplot as plt
+
+        thumb_dir = _index_thumbnails_dir(index_name)
+        n_total = len(hits) + 1  # query cell + one cell per hit
+        cols = min(4, n_total)
+        rows = (n_total + cols - 1) // cols
+
+        fig, raw_axes = plt.subplots(rows, cols, figsize=(cols * 3, rows * 3 + 0.4))
+        # Normalise axes to a flat list regardless of shape
+        import numpy as np
+
+        axes: list = list(np.array(raw_axes).flatten())
+
+        def _show_cell(ax, png_path: Optional[pathlib.Path], title: str, subtitle: str = "") -> None:
+            if png_path and png_path.exists():
+                try:
+                    img = mpimg.imread(str(png_path))
+                    ax.imshow(img)
+                except Exception:
+                    ax.set_facecolor("#e8e8e8")
+            else:
+                ax.set_facecolor("#e8e8e8")
+                ax.text(
+                    0.5, 0.5, title, ha="center", va="center",
+                    transform=ax.transAxes, fontsize=7, wrap=True,
+                )
+            ax.set_title(title[:30], fontsize=7, pad=2)
+            if subtitle:
+                ax.set_xlabel(subtitle, fontsize=6, labelpad=2)
+            ax.set_xticks([])
+            ax.set_yticks([])
+
+        # Query cell — look up embedding cache for filename
+        query_name = "query"
+        cached = _embedding_memory_cache.get(f"hoops_embeddings_model__{query_file_id}")
+        if cached:
+            query_name = cached.get("filename", query_file_id[:12])
+        query_thumb = thumb_dir / f"{query_file_id}.png"
+        _show_cell(axes[0], query_thumb, f"Query\n{pathlib.Path(query_name).name}")
+
+        # Hit cells
+        for i, hit in enumerate(hits):
+            if i + 1 >= len(axes):
+                break
+            hit_thumb = thumb_dir / f"{hit['id']}.png"
+            meta = hit.get("metadata") or {}
+            hit_name = pathlib.Path(meta.get("filename", hit["id"][:12])).name
+            _show_cell(axes[i + 1], hit_thumb, hit_name, f"score: {hit['score']:.4f}")
+
+        # Hide surplus axes
+        for i in range(n_total, len(axes)):
+            axes[i].axis("off")
+
+        plt.tight_layout(pad=0.5)
+
+        image_filename = f"{uuid.uuid4()}.png"
+        image_path = CAD_VIEWER_OUTPUT_DIR / image_filename
+        CAD_VIEWER_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        fig.savefig(str(image_path), format="png", bbox_inches="tight", dpi=100)
+        plt.close(fig)
+
+        return f"/out/{image_filename}"
+    except Exception:
+        return None
+
+
+
     if MFR_dataset_explorer is None:
         MFR_dataset_explorer = create_MFR_dataset_explorer()
     return MFR_dataset_explorer

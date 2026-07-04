@@ -385,6 +385,7 @@ class IndexSearchHit(BaseModel):
 class IndexSearchResponse(BaseModel):
     hits: list[IndexSearchHit]
     count: int
+    image_url: Optional[str] = None
 
 
 class IndexDeleteResponse(BaseModel):
@@ -537,6 +538,7 @@ def add_to_index(
 @router.post("/index/{name}/search", response_model=IndexSearchResponse)
 def search_named_index(
     name: str,
+    request: Request,
     file: Optional[UploadFile] = File(None),
     file_id: Optional[str] = Query(None, description="file_id from a previous upload."),
     top_k: int = Query(10, ge=1, description="Number of similar shapes to return."),
@@ -544,7 +546,8 @@ def search_named_index(
     """Search a named index for the most similar parts to a query shape.
 
     Supply **either** a file upload *or* a ``file_id``.  Returns an empty ``hits``
-    list when the index contains zero entries (no error).
+    list when the index contains zero entries (no error).  When hits are found a
+    ``image_url`` pointing to a result-grid PNG is included in the response.
     """
     try:
         _validate_name_or_raise(name)
@@ -560,9 +563,17 @@ def search_named_index(
             raise HTTPException(status_code=422, detail="Either 'file' or 'file_id' is required.")
 
         result = core.search_index(name, resolved_id, top_k)
+
+        # Convert relative /out/{file} URL to an absolute URL (same pattern as /similarity/search)
+        image_url = result.get("image_url")
+        if image_url:
+            image_filename = image_url.lstrip("/out/")
+            image_url = str(request.url_for("out", path=image_filename))
+
         return IndexSearchResponse(
             hits=[IndexSearchHit(**h) for h in result["hits"]],
             count=result["count"],
+            image_url=image_url,
         )
     except HTTPException:
         raise
