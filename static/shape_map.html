@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>Shape Space Map</title>
+  <style>
+    html, body { margin: 0; padding: 0; overflow: hidden; font-family: "Segoe UI", sans-serif; }
+    #viewer { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: #f4f4f7; }
+
+    #labels { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; pointer-events: none; z-index: 5; }
+    .part-label {
+      position: absolute; transform: translate(-50%, -120%);
+      background: rgba(30, 30, 46, 0.82); color: #f8f8f2;
+      padding: 2px 8px; border-radius: 5px; font-size: 12px; white-space: nowrap;
+      pointer-events: none;
+    }
+
+    #panel {
+      position: fixed; top: 14px; left: 14px; z-index: 10;
+      background: rgba(255, 255, 255, 0.92); border: 1px solid #ddd; border-radius: 8px;
+      padding: 12px 16px; box-shadow: 0 2px 8px rgba(0,0,0,0.12); min-width: 260px;
+    }
+    #panel h1 { font-size: 15px; margin: 0 0 8px; }
+    #panel .row { display: flex; align-items: center; gap: 8px; margin: 6px 0; font-size: 13px; }
+    #panel input[type="range"] { flex: 1; }
+    #stress { font-size: 12px; color: #555; margin-top: 6px; }
+    #scaleValue { min-width: 42px; text-align: right; font-variant-numeric: tabular-nums; }
+
+    #spinner {
+      position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 20;
+      background: #1e1e2e; color: #f8f8f2; padding: 1.4em 2em; border-radius: 10px;
+      font-size: 14px; text-align: center;
+    }
+    #spinner .dot {
+      display: inline-block; width: 10px; height: 10px; margin-left: 8px; border-radius: 50%;
+      border: 3px solid #888; border-top-color: #fff; animation: spin 0.9s linear infinite;
+      vertical-align: middle;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    #errorMsg {
+      display: none; position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+      background: #1e1e2e; color: #f8f8f2; padding: 1.6em 2em; border-radius: 10px;
+      border: 1px solid #ff5555; max-width: 480px; text-align: center; z-index: 30;
+    }
+    #errorMsg h2 { color: #ff5555; margin: 0 0 .5em; }
+  </style>
+</head>
+<body>
+  <div id="viewer"></div>
+  <div id="labels"></div>
+
+  <div id="panel">
+    <h1>Shape Space Map</h1>
+    <div class="row">
+      <label for="scale">スケール</label>
+      <input id="scale" type="range" min="0" max="100" value="0" step="1">
+      <span id="scaleValue">1.0×</span>
+    </div>
+    <div id="stress">配置精度: -</div>
+  </div>
+
+  <div id="spinner">読み込み中<span class="dot"></span></div>
+
+  <div id="errorMsg">
+    <h2>エラー</h2>
+    <p id="errorDetail"></p>
+  </div>
+
+  <script type="module">
+    import { WebViewer } from '/static/hoops-web-viewer-monolith.mjs';
+
+    const params = new URLSearchParams(window.location.search);
+    const mapId = params.get('map');
+    // TODO: min_gap query param support — currently ignored (positions come from MDS).
+    const minGap = parseFloat(params.get('min_gap') || '0');
+
+    const spinner = document.getElementById('spinner');
+    const errorBox = document.getElementById('errorMsg');
+    const errorDetail = document.getElementById('errorDetail');
+    const labelsRoot = document.getElementById('labels');
+    const scaleSlider = document.getElementById('scale');
+    const scaleValueEl = document.getElementById('scaleValue');
+    const stressEl = document.getElementById('stress');
+
+    function showError(msg) {
+      spinner.style.display = 'none';
+      errorDetail.textContent = msg;
+      errorBox.style.display = 'block';
+    }
+
+    if (!mapId) {
+      showError("URL に map パラメータがありません (例: ?map=abcd1234)。");
+      throw new Error("missing map param");
+    }
+
+    // Runtime state
+    let hwv = null;
+    let mapData = null;
+    // Per-part state: { nodeId, position:[x,y,z], center:[x,y,z], label element }
+    const partState = [];
+    let baseScale = 1;   // auto-computed initial scale
+    let currentScale = 1;
+
+    function vecLen(v) { return Math.sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]); }
+
+    function applyPositions() {
+      if (!hwv) return;
+      for (const st of partState) {
+        if (st.nodeId == null) continue;
+        const p = st.position;
+        const c = st.center;
+        const dx = p[0] * currentScale - c[0];
+        const dy = p[1] * currentScale - c[1];
+        const dz = p[2] * currentScale - c[2];
+        const m = new Communicator.Matrix();
+        m.setTranslationComponent(dx, dy, dz);
+        hwv.model.setNodeMatrix(st.nodeId, m, true);
+      }
+      updateLabels();
+    }
+
+    function updateLabels() {
+      if (!hwv) return;
+      for (const st of partState) {
+        if (st.nodeId == null || !st.label) continue;
+        const p = st.position;
+        const world = new Communicator.Point3(
+          p[0] * currentScale, p[1] * currentScale, p[2] * currentScale
+        );
+        try {
+          const screen = hwv.view.projectPoint(world);
+          if (screen && screen.z > 0) {
+            st.label.style.display = 'block';
+            st.label.style.left = screen.x + 'px';
+            st.label.style.top = screen.y + 'px';
+          } else {
+            st.label.style.display = 'none';
+          }
+        } catch (e) {
+          st.label.style.display = 'none';
+        }
+      }
+    }
+
+    function computeInitialScale() {
+      // max part bbox diagonal
+      let maxDiag = 0;
+      for (const st of partState) {
+        if (st.diag > maxDiag) maxDiag = st.diag;
+      }
+      // min nonzero pairwise MDS distance
+      let minDist = Infinity;
+      const n = partState.length;
+      for (let i = 0; i < n; i++) {
+        for (let j = i + 1; j < n; j++) {
+          const a = partState[i].position, b = partState[j].position;
+          const d = Math.sqrt(
+            (a[0]-b[0])**2 + (a[1]-b[1])**2 + (a[2]-b[2])**2
+          );
+          if (d > 1e-9 && d < minDist) minDist = d;
+        }
+      }
+      let s = (minDist !== Infinity && minDist > 0 && maxDiag > 0) ? maxDiag / minDist : 1;
+      s = Math.min(100, Math.max(1, s));
+      return s;
+    }
+
+    function setupSlider() {
+      baseScale = computeInitialScale();
+      currentScale = baseScale;
+      // slider maps 0..100 → baseScale .. baseScale*20 (linear)
+      scaleSlider.min = 0;
+      scaleSlider.max = 100;
+      scaleSlider.value = 0;
+      updateScaleLabel();
+      scaleSlider.addEventListener('input', () => {
+        const t = parseFloat(scaleSlider.value) / 100;   // 0..1
+        currentScale = baseScale * (1 + t * 19);          // 1×..20× of baseScale
+        updateScaleLabel();
+        applyPositions();
+      });
+    }
+
+    function updateScaleLabel() {
+      const rel = currentScale / baseScale;
+      scaleValueEl.textContent = rel.toFixed(1) + '×';
+    }
+
+    function setStress(stress) {
+      const s = Number(stress) || 0;
+      const label = s < 0.01
+        ? `配置精度: 正確 (stress=${s.toFixed(3)})`
+        : `配置精度: 近似 (stress=${s.toFixed(3)})`;
+      stressEl.textContent = label;
+    }
+
+    async function main() {
+      let resp;
+      try {
+        resp = await fetch(`/out/shape_map_${mapId}.json`);
+      } catch (e) {
+        showError("マップデータの取得に失敗しました: " + e.message);
+        return;
+      }
+      if (!resp.ok) {
+        showError(`マップデータが見つかりません (HTTP ${resp.status})。`);
+        return;
+      }
+      mapData = await resp.json();
+      setStress(mapData.stress);
+
+      const validParts = mapData.parts.filter(p => p.scs_url);
+      if (validParts.length === 0) {
+        showError("表示可能なパーツ (SCS) がありません。");
+        return;
+      }
+
+      const container = document.getElementById('viewer');
+      hwv = new WebViewer({ container, empty: true });
+
+      hwv.setCallbacks({
+        sceneReady: function () {
+          hwv.focusInput(true);
+          container.addEventListener('mouseenter', () => hwv.focusInput(true));
+          window.addEventListener('resize', () => { hwv.resizeCanvas(); updateLabels(); });
+          if (hwv.view.getAxisTriad) hwv.view.getAxisTriad().enable();
+          if (hwv.view.getNavCube) hwv.view.getNavCube().enable();
+        },
+        camera: function () { updateLabels(); },
+        cameraChanged: function () { updateLabels(); },
+        modelStructureReady: async function () {
+          try {
+            const rootNode = hwv.model.getAbsoluteRootNode();
+
+            // Load every part's SCS under its own child node.
+            const loaded = await Promise.all(validParts.map(async (part) => {
+              const nodeId = hwv.model.createNode(rootNode, part.filename);
+              await hwv.model.loadSubtreeFromScsFile(nodeId, part.scs_url);
+              return { nodeId, part };
+            }));
+
+            for (const { nodeId, part } of loaded) {
+              // bounding box → center + diagonal
+              let center = [0, 0, 0];
+              let diag = 0;
+              try {
+                const box = await hwv.model.getNodeRealBoundingBox(nodeId);
+                center = [
+                  (box.min.x + box.max.x) / 2,
+                  (box.min.y + box.max.y) / 2,
+                  (box.min.z + box.max.z) / 2,
+                ];
+                diag = Math.sqrt(
+                  (box.max.x - box.min.x) ** 2 +
+                  (box.max.y - box.min.y) ** 2 +
+                  (box.max.z - box.min.z) ** 2
+                );
+              } catch (e) { /* keep defaults */ }
+
+              // label overlay
+              const label = document.createElement('div');
+              label.className = 'part-label';
+              label.textContent = part.filename;
+              labelsRoot.appendChild(label);
+
+              partState.push({
+                nodeId,
+                position: part.position,
+                center,
+                diag,
+                label,
+              });
+            }
+
+            setupSlider();
+            applyPositions();
+
+            // frame the whole scene
+            if (hwv.view.fitWorld) hwv.view.fitWorld();
+            spinner.style.display = 'none';
+          } catch (e) {
+            showError("モデルの読み込みに失敗しました: " + (e.message || e));
+          }
+        },
+      });
+
+      hwv.start().catch(err => {
+        showError(err.message || String(err));
+      });
+    }
+
+    main();
+  </script>
+</body>
+</html>
