@@ -818,7 +818,6 @@ Arrange a set of CAD parts in an interactive 3D scene so that shape-similar part
 placed closer together.  Embeddings are compared by cosine similarity and laid out with
 classical MDS (multidimensional scaling), then rendered together in the HOOPS Web Viewer.
 
-![Shape Space Map](docs/shape_space_map.png)
 
 ```
 POST /similarity/map
