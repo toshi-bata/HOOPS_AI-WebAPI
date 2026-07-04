@@ -68,7 +68,7 @@
   </div>
 
   <script type="module">
-    import { WebViewer } from '/static/hoops-web-viewer-monolith.mjs';
+    import { WebViewer, Matrix, Point3 } from '/static/hoops-web-viewer-monolith.mjs';
 
     const params = new URLSearchParams(window.location.search);
     const mapId = params.get('map');
@@ -105,7 +105,7 @@
     function vecLen(v) { return Math.sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]); }
 
     function applyPositions() {
-      if (!hwv || !MatrixClass) return;
+      if (!hwv) return;
       for (const st of partState) {
         if (st.nodeId == null) continue;
         const p = st.position;
@@ -114,7 +114,7 @@
         const dy = p[1] * currentScale - c[1];
         const dz = p[2] * currentScale - c[2];
         try {
-          const m = new MatrixClass();
+          const m = new Matrix();
           m.setTranslationComponent(dx, dy, dz);
           hwv.model.setNodeMatrix(st.nodeId, m, true);
         } catch (e) {}
@@ -128,9 +128,7 @@
         if (st.nodeId == null || !st.label) continue;
         const p = st.position;
         try {
-          const worldPos = Point3Class
-            ? new Point3Class(p[0] * currentScale, p[1] * currentScale, p[2] * currentScale)
-            : { x: p[0] * currentScale, y: p[1] * currentScale, z: p[2] * currentScale };
+          const worldPos = new Point3(p[0] * currentScale, p[1] * currentScale, p[2] * currentScale);
           const screen = hwv.view.projectPoint(worldPos);
           if (screen && screen.z > 0) {
             st.label.style.display = 'block';
@@ -235,18 +233,6 @@
           window.addEventListener('resize', () => { hwv.resizeCanvas(); updateLabels(); });
           if (hwv.view.getAxisTriad) hwv.view.getAxisTriad().enable();
           if (hwv.view.getNavCube) hwv.view.getNavCube().enable();
-
-          // Capture HOOPS class constructors from live instances.
-          // Communicator.* is not exported from the ES module, so we extract
-          // the constructors from objects the API hands us.
-          try {
-            const m = hwv.model.getNodeNetMatrix(hwv.model.getAbsoluteRootNode());
-            if (m && m.constructor !== Object) MatrixClass = m.constructor;
-          } catch (e) {}
-          try {
-            const pos = hwv.view.getCamera().getPosition();
-            if (pos && pos.constructor !== Object) Point3Class = pos.constructor;
-          } catch (e) {}
         },
         camera: function () { updateLabels(); },
         modelStructureReady: async function () {
@@ -305,9 +291,15 @@
         },
       });
 
-      hwv.start().catch(err => {
+      // start() may return void in some HOOPS versions, so guard before calling .catch()
+      try {
+        const started = hwv.start();
+        if (started && typeof started.catch === 'function') {
+          started.catch(err => showError(err.message || String(err)));
+        }
+      } catch (err) {
         showError(err.message || String(err));
-      });
+      }
     }
 
     main();
