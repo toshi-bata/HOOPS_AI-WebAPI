@@ -168,14 +168,14 @@
     function setupSlider() {
       baseScale = computeInitialScale();
       currentScale = baseScale;
-      // slider maps 0..100 → baseScale .. baseScale*50 (linear)
+      // slider maps 0..100 → baseScale .. baseScale*100 (linear)
       scaleSlider.min = 0;
       scaleSlider.max = 100;
       scaleSlider.value = 0;
       updateScaleLabel();
       scaleSlider.addEventListener('input', () => {
         const t = parseFloat(scaleSlider.value) / 100;   // 0..1
-        currentScale = baseScale * (1 + t * 49);          // 1×..50× of baseScale
+        currentScale = baseScale * (1 + t * 99);          // 1×..100× of baseScale
         updateScaleLabel();
         applyPositions();
       });
