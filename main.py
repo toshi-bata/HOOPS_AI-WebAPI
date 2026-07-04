@@ -15,7 +15,8 @@ from routers import brep, cad, files, mfr, part_classification, similarity
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     import shutil
-    for folder in (core.CAD_UPLOAD_DIR, core.CAD_VIEWER_OUTPUT_DIR):
+    core._embedding_memory_cache.clear()
+    for folder in (core.CAD_UPLOAD_DIR, core.CAD_VIEWER_OUTPUT_DIR, core.EMBEDDINGS_CACHE_DIR):
         if folder.exists():
             shutil.rmtree(folder, ignore_errors=True)
         folder.mkdir(parents=True, exist_ok=True)
