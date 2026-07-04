@@ -889,7 +889,74 @@ accuracy indicator, and per-part filename labels that track the camera.
 
 ---
 
-### Named Index Management (Incremental Workflow)
+### Shape Space Map – Query Overlay
+
+Highlight a single query CAD part inside an **existing** shape-space map.  The query
+part is embedded with the same pipeline used to build the map and projected into the
+existing 3D coordinate space using the out-of-sample MDS extension formula, so it appears
+near its most similar parts.  It is rendered in **magenta** so it is clearly distinguishable.
+
+```
+POST /similarity/map/{map_id}/query
+```
+
+| Parameter | Where | Description |
+|---|---|---|
+| `map_id` | path | `map_id` returned by `POST /similarity/map` |
+| `file_id` | query | `file_id` of an already-uploaded part |
+| `file` | multipart | CAD file upload (alternative to `file_id`) |
+| `persist` | query | `false` (default) — overlay only; `true` — add to original map permanently |
+
+Supply **either** `file_id` **or** a `file` upload.
+
+**Windows (PowerShell) – direct upload:**
+```powershell
+curl.exe -X POST "http://localhost:8000/similarity/map/d2a7f205/query" `
+    -F "file=@C:\temp\Sprocket.step"
+
+# Or with PowerShell native:
+$form = @{ file = Get-Item "C:\temp\Sprocket.step" }
+Invoke-RestMethod -Uri "http://localhost:8000/similarity/map/d2a7f205/query" -Method POST -Form $form
+```
+
+**Linux – use an already-uploaded file:**
+```bash
+curl -s -X POST "http://localhost:8000/similarity/map/d2a7f205/query?file_id=<id>" | python -m json.tool
+```
+
+**Response (abridged):**
+```json
+{
+  "overlay_map_id": "e5f6a7b8",
+  "viewer_url": "http://localhost:8000/similarity/map/show?map=e5f6a7b8",
+  "query_part": {
+    "index": 4, "file_id": "ab12...", "filename": "Sprocket.step",
+    "scs_url": "http://localhost:8000/out/xxxx_Sprocket.scs",
+    "position": [0.12, -0.05, 0.0], "is_query": true
+  },
+  "nearest_parts": [
+    {"index": 2, "file_id": "cd34...", "filename": "gear.step", "score": 0.9741},
+    {"index": 0, "file_id": "ef56...", "filename": "sprocket_v2.step", "score": 0.9312}
+  ],
+  "persisted": false,
+  "errors": []
+}
+```
+
+| Field | Description |
+|---|---|
+| `overlay_map_id` | New temporary map that includes the query part |
+| `viewer_url` | Absolute URL — open in browser to see the query highlighted in magenta |
+| `query_part` | Query part metadata, position, and `is_query: true` flag |
+| `nearest_parts` | Top-5 most similar existing parts sorted by cosine similarity |
+| `persisted` | `true` when `persist=true` was used and the query was added to the original map |
+
+The overlay map is independent of the original — by default it exists only until the
+server restarts.  Use `persist=true` to permanently add the query part to the source map.
+
+---
+
+
 
 Manage user-created similarity indexes that grow over time.  Unlike the built-in
 read-only ``default`` index (backed by ``HOOPS_AI_FAISS_INDEX_PATH``), named indexes
