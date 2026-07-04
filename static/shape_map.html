@@ -6,23 +6,16 @@
   <style>
     html, body { margin: 0; padding: 0; overflow: hidden; font-family: "Segoe UI", sans-serif; }
     #viewer { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: #f4f4f7; }
-
-    /* SVG edge overlay */
     #edgeSvg { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; pointer-events: none; z-index: 4; }
-
-    /* Label overlay */
-    #labels { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; pointer-events: none; z-index: 5; }
+    #labels  { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; pointer-events: none; z-index: 5; }
     .part-label {
       position: absolute; transform: translate(-50%, -120%);
-      background: rgba(30, 30, 46, 0.82); color: #f8f8f2;
-      padding: 2px 8px; border-radius: 5px; font-size: 12px; white-space: nowrap;
-      pointer-events: none;
+      color: #fff; padding: 2px 8px; border-radius: 5px; font-size: 12px; white-space: nowrap;
+      pointer-events: none; border: 1px solid rgba(255,255,255,0.4);
     }
-
-    /* Control panel */
     #panel {
       position: fixed; top: 14px; left: 14px; z-index: 10;
-      background: rgba(255, 255, 255, 0.92); border: 1px solid #ddd; border-radius: 8px;
+      background: rgba(255,255,255,0.93); border: 1px solid #ddd; border-radius: 8px;
       padding: 12px 16px; box-shadow: 0 2px 8px rgba(0,0,0,0.12); min-width: 270px;
     }
     #panel h1 { font-size: 15px; margin: 0 0 8px; }
@@ -32,8 +25,6 @@
     #panel hr { border: none; border-top: 1px solid #eee; margin: 8px 0; }
     #stress { font-size: 12px; color: #555; margin-top: 6px; }
     #scaleValue { min-width: 42px; text-align: right; font-variant-numeric: tabular-nums; }
-
-    /* Toggle switch */
     .toggle-wrap { display: flex; align-items: center; gap: 8px; font-size: 13px; }
     .toggle { position: relative; display: inline-block; width: 34px; height: 18px; flex-shrink: 0; }
     .toggle input { opacity: 0; width: 0; height: 0; }
@@ -42,28 +33,23 @@
       background: #ccc; border-radius: 18px; transition: .2s;
     }
     .toggle-slider:before {
-      content: ""; position: absolute;
-      width: 12px; height: 12px; left: 3px; bottom: 3px;
+      content: ""; position: absolute; width: 12px; height: 12px; left: 3px; bottom: 3px;
       background: white; border-radius: 50%; transition: .2s;
     }
     .toggle input:checked + .toggle-slider { background: #4a90d9; }
     .toggle input:checked + .toggle-slider:before { transform: translateX(16px); }
-
-    /* Spinner */
     #spinner {
-      position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 20;
+      position: fixed; top: 50%; left: 50%; transform: translate(-50%,-50%); z-index: 20;
       background: #1e1e2e; color: #f8f8f2; padding: 1.4em 2em; border-radius: 10px;
       font-size: 14px; text-align: center;
     }
     #spinner .dot {
       display: inline-block; width: 10px; height: 10px; margin-left: 8px; border-radius: 50%;
-      border: 3px solid #888; border-top-color: #fff; animation: spin 0.9s linear infinite;
-      vertical-align: middle;
+      border: 3px solid #888; border-top-color: #fff; animation: spin 0.9s linear infinite; vertical-align: middle;
     }
     @keyframes spin { to { transform: rotate(360deg); } }
-
     #errorMsg {
-      display: none; position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+      display: none; position: fixed; top: 50%; left: 50%; transform: translate(-50%,-50%);
       background: #1e1e2e; color: #f8f8f2; padding: 1.6em 2em; border-radius: 10px;
       border: 1px solid #ff5555; max-width: 480px; text-align: center; z-index: 30;
     }
@@ -80,7 +66,7 @@
     <div class="row">
       <label for="scale">Scale</label>
       <input id="scale" type="range" min="0" max="100" value="0" step="1">
-      <span id="scaleValue">1.0ﾃ・/span>
+      <span id="scaleValue">1.0x</span>
     </div>
     <div class="row">
       <label for="maxMult">Max x</label>
@@ -96,6 +82,10 @@
       <label class="toggle"><input id="toggleEdges" type="checkbox" checked><span class="toggle-slider"></span></label>
       <span>Similarity edges</span>
     </div>
+    <div class="row toggle-wrap">
+      <label class="toggle"><input id="toggleCluster" type="checkbox" checked><span class="toggle-slider"></span></label>
+      <span>Cluster colors</span>
+    </div>
     <div class="row" id="threshRow" style="padding-left:42px;">
       <label for="edgeThresh" style="font-size:12px;color:#555;">Min sim</label>
       <input id="edgeThresh" type="range" min="0" max="1" value="0.5" step="0.01" style="flex:1;">
@@ -108,23 +98,23 @@
   <div id="errorMsg"><h2>Error</h2><p id="errorDetail"></p></div>
 
   <script type="module">
-    import { WebViewer, Matrix, Point3 } from '/static/hoops-web-viewer-monolith.mjs';
+    import { WebViewer, Matrix, Point3, Color } from '/static/hoops-web-viewer-monolith.mjs';
 
-    const params = new URLSearchParams(window.location.search);
-    const mapId = params.get('map');
-    const minGap = parseFloat(params.get('min_gap') || '0');
+    const params       = new URLSearchParams(window.location.search);
+    const mapId        = params.get('map');
 
-    const spinner      = document.getElementById('spinner');
-    const errorBox     = document.getElementById('errorMsg');
-    const errorDetail  = document.getElementById('errorDetail');
-    const labelsRoot   = document.getElementById('labels');
-    const edgeSvg      = document.getElementById('edgeSvg');
-    const scaleSlider  = document.getElementById('scale');
-    const scaleValueEl = document.getElementById('scaleValue');
-    const stressEl     = document.getElementById('stress');
-    const maxMultInput = document.getElementById('maxMult');
-    const toggleLabels = document.getElementById('toggleLabels');
-    const toggleEdges  = document.getElementById('toggleEdges');
+    const spinner         = document.getElementById('spinner');
+    const errorBox        = document.getElementById('errorMsg');
+    const errorDetail     = document.getElementById('errorDetail');
+    const labelsRoot      = document.getElementById('labels');
+    const edgeSvg         = document.getElementById('edgeSvg');
+    const scaleSlider     = document.getElementById('scale');
+    const scaleValueEl    = document.getElementById('scaleValue');
+    const stressEl        = document.getElementById('stress');
+    const maxMultInput    = document.getElementById('maxMult');
+    const toggleLabels    = document.getElementById('toggleLabels');
+    const toggleEdges     = document.getElementById('toggleEdges');
+    const toggleCluster   = document.getElementById('toggleCluster');
     const edgeThresh      = document.getElementById('edgeThresh');
     const edgeThreshValue = document.getElementById('edgeThreshValue');
 
@@ -134,36 +124,85 @@
       errorBox.style.display = 'block';
     }
 
-    if (!mapId) {
-      showError("Missing 'map' query parameter (e.g. ?map=abcd1234).");
-      throw new Error("missing map param");
-    }
+    if (!mapId) { showError("Missing 'map' query parameter."); throw new Error("missing map"); }
+
+    // Cluster color palette — CSS hex + matching HOOPS Color (0-255 RGB)
+    const CLUSTER_CSS  = ['#c0392b','#2980b9','#27ae60','#d35400','#8e44ad','#c0006a','#0097a7','#b8860b'];
+    const CLUSTER_HOOPS = CLUSTER_CSS.map(h => new Color(
+      parseInt(h.slice(1,3),16), parseInt(h.slice(3,5),16), parseInt(h.slice(5,7),16)
+    ));
 
     // Runtime state
     let hwv = null;
     let mapData = null;
-    const partState = [];   // { nodeId, position, center, diag, label }
+    const partState = [];
     let baseScale = 1;
     let currentScale = 1;
-    let showLabels = false;
-    let showEdges  = true;
+    let showLabels  = false;
+    let showEdges   = true;
+    let showCluster = true;
 
-    // 笏笏 Toggle handlers 笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏
-    toggleLabels.addEventListener('change', () => {
-      showLabels = toggleLabels.checked;
-      updateOverlays();
-    });
+    // ── Union-Find cluster detection ────────────────────────────────────────
+    function computeClusters(matrix, threshold) {
+      const n = matrix.length;
+      const parent = Array.from({length: n}, (_, i) => i);
+      function find(x) { return parent[x] === x ? x : (parent[x] = find(parent[x])); }
+      function union(a, b) { parent[find(a)] = find(b); }
+      for (let i = 0; i < n; i++)
+        for (let j = i+1; j < n; j++)
+          if (matrix[i][j] >= threshold) union(i, j);
+      const roots = {};
+      let next = 0;
+      return Array.from({length: n}, (_, i) => {
+        const r = find(i);
+        if (!(r in roots)) roots[r] = next++;
+        return roots[r];
+      });
+    }
+
+    // ── Apply cluster colors to geometry + labels ───────────────────────────
+    function applyClusterColors() {
+      if (!hwv || !mapData || partState.length === 0) return;
+      const thresh = parseFloat(edgeThresh.value) || 0;
+      const clusters = computeClusters(mapData.matrix, thresh);
+      partState.forEach((st, i) => {
+        const cid = clusters[i];
+        const css  = CLUSTER_CSS[cid % CLUSTER_CSS.length];
+        const hc   = CLUSTER_HOOPS[cid % CLUSTER_HOOPS.length];
+        // Label background
+        if (st.label) {
+          st.label.style.background = showCluster ? css + 'dd' : 'rgba(30,30,46,0.82)';
+        }
+        // 3D node color
+        if (st.nodeId != null) {
+          try {
+            if (showCluster) { hwv.model.setNodeColor(st.nodeId, hc); }
+            else             { hwv.model.unsetNodeColor(st.nodeId); }
+          } catch(e) {
+            try {
+              if (showCluster) { hwv.model.setNodesFaceColor([st.nodeId], hc); }
+              else             { hwv.model.unsetNodesFaceColor([st.nodeId]); }
+            } catch(e2) {}
+          }
+        }
+      });
+    }
+
+    // ── Toggle handlers ─────────────────────────────────────────────────────
+    toggleLabels.addEventListener('change', () => { showLabels = toggleLabels.checked; updateOverlays(); });
     toggleEdges.addEventListener('change', () => {
       showEdges = toggleEdges.checked;
       document.getElementById('threshRow').style.display = showEdges ? '' : 'none';
       updateEdges();
     });
+    toggleCluster.addEventListener('change', () => { showCluster = toggleCluster.checked; applyClusterColors(); });
     edgeThresh.addEventListener('input', () => {
       edgeThreshValue.textContent = parseFloat(edgeThresh.value).toFixed(2);
       updateEdges();
+      applyClusterColors();  // re-cluster on threshold change
     });
 
-    // 笏笏 Positioning 笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏
+    // ── Positioning ─────────────────────────────────────────────────────────
     function applyPositions() {
       if (!hwv) return;
       for (const st of partState) {
@@ -171,80 +210,67 @@
         const p = st.position, c = st.center;
         try {
           const m = new Matrix();
-          m.setTranslationComponent(
-            p[0] * currentScale - c[0],
-            p[1] * currentScale - c[1],
-            p[2] * currentScale - c[2]
-          );
+          m.setTranslationComponent(p[0]*currentScale - c[0], p[1]*currentScale - c[1], p[2]*currentScale - c[2]);
           hwv.model.setNodeMatrix(st.nodeId, m, true);
-        } catch (e) {}
+        } catch(e) {}
       }
       updateOverlays();
     }
 
-    // 笏笏 Project all parts to screen, return array of {x,y,visible} 笏笏笏笏笏笏笏笏笏笏
+    // ── Overlay helpers ──────────────────────────────────────────────────────
     function projectAll() {
       return partState.map(st => {
         try {
           const p = st.position;
           const s = hwv.view.projectPoint(new Point3(p[0]*currentScale, p[1]*currentScale, p[2]*currentScale));
           return (s && s.z > 0) ? { x: s.x, y: s.y, visible: true } : { visible: false };
-        } catch (e) { return { visible: false }; }
+        } catch(e) { return { visible: false }; }
       });
     }
 
-    // 笏笏 Labels 笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏
-    function updateLabels(screenPts) {
+    function updateLabels(pts) {
       if (!hwv) return;
-      if (!screenPts) screenPts = projectAll();
+      if (!pts) pts = projectAll();
       partState.forEach((st, i) => {
         if (!st.label) return;
-        const s = screenPts[i];
+        const s = pts[i];
         st.label.style.display = (showLabels && s.visible) ? 'block' : 'none';
         if (s.visible) { st.label.style.left = s.x + 'px'; st.label.style.top = s.y + 'px'; }
       });
     }
 
-    // 笏笏 SVG edges 笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏
-    function updateEdges(screenPts) {
+    function updateEdges(pts) {
       edgeSvg.innerHTML = '';
       if (!showEdges || !mapData || !hwv) return;
-      if (!screenPts) screenPts = projectAll();
+      if (!pts) pts = projectAll();
       const thresh = parseFloat(edgeThresh.value) || 0;
       const n = partState.length;
       for (let i = 0; i < n; i++) {
-        for (let j = i + 1; j < n; j++) {
+        for (let j = i+1; j < n; j++) {
           const sim = mapData.matrix[i][j];
           if (sim < thresh) continue;
-          const a = screenPts[i], b = screenPts[j];
+          const a = pts[i], b = pts[j];
           if (!a.visible || !b.visible) continue;
-          // color: green(high sim) 竊・red(low sim) via hue
-          const hue = Math.round(sim * 120);   // 0=red, 120=green
-          const opacity = 0.2 + sim * 0.7;     // 0.2 窶・0.9
-          const width = 0.5 + sim * 3;         // 0.5 窶・3.5 px
-          const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-          line.setAttribute('x1', a.x); line.setAttribute('y1', a.y);
-          line.setAttribute('x2', b.x); line.setAttribute('y2', b.y);
-          line.setAttribute('stroke', `hsl(${hue},80%,45%)`);
+          const hue = Math.round(sim * 120);
+          const opacity = 0.2 + sim * 0.7;
+          const width = 0.5 + sim * 3;
+          const line = document.createElementNS('http://www.w3.org/2000/svg','line');
+          line.setAttribute('x1',a.x); line.setAttribute('y1',a.y);
+          line.setAttribute('x2',b.x); line.setAttribute('y2',b.y);
+          line.setAttribute('stroke',`hsl(${hue},80%,45%)`);
           line.setAttribute('stroke-width', width);
           line.setAttribute('stroke-opacity', opacity);
           edgeSvg.appendChild(line);
-
-          // similarity score midpoint label
-          const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-          text.setAttribute('x', (a.x + b.x) / 2);
-          text.setAttribute('y', (a.y + b.y) / 2 - 4);
-          text.setAttribute('text-anchor', 'middle');
-          text.setAttribute('font-size', '11');
-          text.setAttribute('fill', `hsl(${hue},70%,30%)`);
-          text.setAttribute('fill-opacity', opacity);
+          const text = document.createElementNS('http://www.w3.org/2000/svg','text');
+          text.setAttribute('x',(a.x+b.x)/2); text.setAttribute('y',(a.y+b.y)/2-4);
+          text.setAttribute('text-anchor','middle'); text.setAttribute('font-size','11');
+          text.setAttribute('fill',`hsl(${hue},70%,30%)`); text.setAttribute('fill-opacity',opacity);
           text.textContent = sim.toFixed(3);
           edgeSvg.appendChild(text);
         }
       }
     }
 
-    // 笏笏 Combined overlay update 笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏
     function updateOverlays() {
       if (!hwv) return;
       const pts = projectAll();
@@ -252,22 +278,19 @@
       updateEdges(pts);
     }
 
-    // 笏笏 Scale 笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏
-    function vecLen(v) { return Math.sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]); }
-
+    // ── Scale ────────────────────────────────────────────────────────────────
     function computeInitialScale() {
       let maxDiag = 0;
       for (const st of partState) if (st.diag > maxDiag) maxDiag = st.diag;
       let minDist = Infinity;
       const n = partState.length;
       for (let i = 0; i < n; i++)
-        for (let j = i + 1; j < n; j++) {
+        for (let j = i+1; j < n; j++) {
           const a = partState[i].position, b = partState[j].position;
-          const d = Math.sqrt((a[0]-b[0])**2 + (a[1]-b[1])**2 + (a[2]-b[2])**2);
+          const d = Math.sqrt((a[0]-b[0])**2+(a[1]-b[1])**2+(a[2]-b[2])**2);
           if (d > 1e-9 && d < minDist) minDist = d;
         }
-      let s = (minDist !== Infinity && minDist > 0 && maxDiag > 0) ? maxDiag / minDist : 1;
-      return Math.min(500, Math.max(1, s)) * 5;
+      return Math.min(500, Math.max(1, (minDist !== Infinity && minDist > 0 && maxDiag > 0) ? maxDiag/minDist : 1)) * 5;
     }
 
     function setupSlider() {
@@ -277,8 +300,7 @@
       updateScaleLabel();
       function applySlider() {
         const mult = Math.max(2, parseInt(maxMultInput.value) || 100);
-        const t = parseFloat(scaleSlider.value) / 100;
-        currentScale = baseScale * (1 + t * (mult - 1));
+        currentScale = baseScale * (1 + parseFloat(scaleSlider.value)/100 * (mult-1));
         updateScaleLabel();
         applyPositions();
       }
@@ -287,7 +309,7 @@
     }
 
     function updateScaleLabel() {
-      scaleValueEl.textContent = (currentScale / baseScale).toFixed(1) + 'x';
+      scaleValueEl.textContent = (currentScale/baseScale).toFixed(1) + 'x';
     }
 
     function setStress(stress) {
@@ -297,31 +319,31 @@
         : `Layout accuracy: approximate (stress=${s.toFixed(3)})`;
     }
 
-    // 笏笏 Main 笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏笏
+    // ── Main ─────────────────────────────────────────────────────────────────
     async function main() {
       let resp;
       try { resp = await fetch(`/out/shape_map_${mapId}.json`); }
-      catch (e) { showError("Failed to fetch map data: " + e.message); return; }
+      catch(e) { showError("Failed to fetch map data: " + e.message); return; }
       if (!resp.ok) { showError(`Map data not found (HTTP ${resp.status}).`); return; }
       mapData = await resp.json();
       setStress(mapData.stress);
 
       const validParts = mapData.parts.filter(p => p.scs_url);
-      if (validParts.length === 0) { showError("No displayable parts (SCS files) found."); return; }
+      if (!validParts.length) { showError("No displayable parts (SCS files) found."); return; }
 
       const container = document.getElementById('viewer');
       hwv = new WebViewer({ container, endpointUri: validParts[0].scs_url });
 
       hwv.setCallbacks({
-        sceneReady: function () {
+        sceneReady: function() {
           hwv.focusInput(true);
           container.addEventListener('mouseenter', () => hwv.focusInput(true));
           window.addEventListener('resize', () => { hwv.resizeCanvas(); updateOverlays(); });
           if (hwv.view.getAxisTriad) hwv.view.getAxisTriad().enable();
-          if (hwv.view.getNavCube) hwv.view.getNavCube().enable();
+          if (hwv.view.getNavCube)   hwv.view.getNavCube().enable();
         },
-        camera: function () { updateOverlays(); },
-        modelStructureReady: async function () {
+        camera: function() { updateOverlays(); },
+        modelStructureReady: async function() {
           try {
             const rootNode = hwv.model.getAbsoluteRootNode();
             const rootChildren = hwv.model.getNodeChildren(rootNode);
@@ -329,7 +351,7 @@
             const loadedParts = [{ nodeId: firstNodeId, part: validParts[0] }];
 
             if (validParts.length > 1) {
-              const rest = await Promise.all(validParts.slice(1).map(async (part) => {
+              const rest = await Promise.all(validParts.slice(1).map(async part => {
                 const nodeId = hwv.model.createNode(rootNode, part.filename);
                 await hwv.model.loadSubtreeFromScsFile(nodeId, part.scs_url);
                 return { nodeId, part };
@@ -341,9 +363,9 @@
               let center = [0,0,0], diag = 0;
               try {
                 const box = await hwv.model.getNodeRealBoundingBox(nodeId);
-                center = [(box.min.x+box.max.x)/2, (box.min.y+box.max.y)/2, (box.min.z+box.max.z)/2];
+                center = [(box.min.x+box.max.x)/2,(box.min.y+box.max.y)/2,(box.min.z+box.max.z)/2];
                 diag = Math.sqrt((box.max.x-box.min.x)**2+(box.max.y-box.min.y)**2+(box.max.z-box.min.z)**2);
-              } catch (e) {}
+              } catch(e) {}
               const label = document.createElement('div');
               label.className = 'part-label';
               label.textContent = part.filename;
@@ -353,9 +375,10 @@
 
             setupSlider();
             applyPositions();
+            applyClusterColors();
             if (hwv.view.fitWorld) hwv.view.fitWorld();
             spinner.style.display = 'none';
-          } catch (e) {
+          } catch(e) {
             showError("Failed to load models: " + (e.message || e));
           }
         },
@@ -365,7 +388,7 @@
         const started = hwv.start();
         if (started && typeof started.catch === 'function')
           started.catch(err => showError(err.message || String(err)));
-      } catch (err) { showError(err.message || String(err)); }
+      } catch(err) { showError(err.message || String(err)); }
     }
 
     main();
