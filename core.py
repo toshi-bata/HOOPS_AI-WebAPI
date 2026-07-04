@@ -1194,6 +1194,163 @@ def compare_embeddings(file_ids: list[str]) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Shape Space Map (classical MDS layout of CAD parts)
+# ---------------------------------------------------------------------------
+
+
+def _classical_mds(dist_matrix: "Any") -> tuple:
+    """Classical (Torgerson) multidimensional scaling into 3 dimensions.
+
+    Given an ``N×N`` symmetric distance matrix, returns ``(coords, stress)``
+    where ``coords`` has shape ``(N, 3)`` (mean-centred) and ``stress`` is the
+    Kruskal stress-1 goodness-of-fit value in ``[0, 1]``.
+
+    Implemented with numpy only (no sklearn/scipy).
+    """
+    import numpy as np
+
+    D = np.asarray(dist_matrix, dtype=float)
+    n = D.shape[0]
+
+    # Double-centering: B = -0.5 * H @ D^2 @ H,  H = I - (1/n) * ones
+    H = np.eye(n) - np.ones((n, n)) / n
+    D_squared = D ** 2
+    B = -0.5 * H @ D_squared @ H
+
+    # eigh returns eigenvalues in ascending order → take the largest 3
+    eigenvalues, eigenvectors = np.linalg.eigh(B)
+    eigenvalues = np.maximum(eigenvalues, 0.0)  # clamp negatives to 0
+
+    top_vals = eigenvalues[-3:]
+    top_vecs = eigenvectors[:, -3:]
+    coords = top_vecs @ np.diag(np.sqrt(top_vals))  # (N, up-to-3)
+
+    # Pad to 3 columns when N < 3
+    if coords.shape[1] < 3:
+        pad = np.zeros((n, 3 - coords.shape[1]))
+        coords = np.hstack([coords, pad])
+
+    # Reverse so columns are in descending eigenvalue order
+    coords = coords[:, ::-1]
+
+    # Mean-centre
+    coords = coords - coords.mean(axis=0)
+
+    # Kruskal stress-1 over all i<j pairs
+    iu = np.triu_indices(n, k=1)
+    d_target = D[iu]
+    diff = coords[iu[0]] - coords[iu[1]]
+    d_hat = np.sqrt((diff ** 2).sum(axis=1))
+    denom = float((d_target ** 2).sum())
+    if denom == 0.0:
+        stress = 0.0
+    else:
+        stress = float(np.sqrt(((d_hat - d_target) ** 2).sum() / denom))
+
+    return coords, stress
+
+
+def export_scs_for_part(file_id: str) -> str:
+    """Convert a persistent CAD file to an SCS stream cache and return its filename.
+
+    A thin wrapper around the conversion logic in ``create_CAD_viewer`` — it does
+    NOT touch the per-session viewer cache.  Returns just the SCS filename (served
+    under ``/out/``), not a full path or URL.
+    """
+    from hoops_ai.cadaccess import HOOPSLoader, HOOPSTools
+
+    cad_file_path = find_persistent_CAD_file(file_id)
+    CAD_VIEWER_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    unique_id = uuid.uuid4().hex[:12]
+    scs_name = f"{unique_id}_{cad_file_path.stem}.scs"
+    scs_path = CAD_VIEWER_OUTPUT_DIR / scs_name
+
+    cad_loader = HOOPSLoader()
+    model = cad_loader.create_from_file(str(cad_file_path))
+
+    tools = HOOPSTools()
+    _png_path, scs_path = tools.exportStreamCache(
+        model,
+        filename=str(scs_path),
+        is_white_background=True,
+        overwrite=True,
+    )
+    return pathlib.Path(scs_path).name
+
+
+def compute_shape_map_data(file_ids: list[str]) -> dict[str, Any]:
+    """Compute a 3D "Shape Space Map" layout for a set of CAD parts.
+
+    Steps:
+      1. Compute the N×N cosine-similarity matrix via ``compare_embeddings``.
+      2. Convert each part to an SCS stream cache (failures are non-fatal and
+         collected in ``errors``).
+      3. Lay the parts out in 3D with classical MDS so that similar parts sit
+         closer together (distance ``d_ij = 1 - similarity_ij``).
+      4. Persist the result to ``out/shape_map_{map_id}.json`` and return it.
+    """
+    import json
+
+    import numpy as np
+
+    compare = compare_embeddings(file_ids)
+    matrix = compare["matrix"]
+    files = compare["files"]
+    n = compare["count"]
+
+    sim = np.asarray(matrix, dtype=float)
+    dist = 1.0 - sim
+    np.fill_diagonal(dist, 0.0)
+
+    coords, stress = _classical_mds(dist)
+
+    errors: list[dict] = []
+    parts: list[dict] = []
+    for i, finfo in enumerate(files):
+        fid = finfo["file_id"]
+        filename = finfo["filename"]
+        scs_url = None
+        try:
+            scs_filename = export_scs_for_part(fid)
+            scs_url = f"/out/{scs_filename}"
+        except Exception as exc:  # SCS conversion failure is non-fatal
+            errors.append({"filename": filename, "detail": str(exc)})
+
+        parts.append(
+            {
+                "index": i,
+                "file_id": fid,
+                "filename": filename,
+                "scs_url": scs_url,
+                "position": [
+                    float(coords[i, 0]),
+                    float(coords[i, 1]),
+                    float(coords[i, 2]),
+                ],
+            }
+        )
+
+    map_id = uuid.uuid4().hex[:8]
+    result = {
+        "map_id": map_id,
+        "viewer_url": f"/similarity/map/show?map={map_id}",
+        "count": n,
+        "parts": parts,
+        "matrix": matrix,
+        "stress": float(stress),
+        "errors": errors,
+    }
+
+    CAD_VIEWER_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = CAD_VIEWER_OUTPUT_DIR / f"shape_map_{map_id}.json"
+    with open(out_path, "w", encoding="utf-8") as fh:
+        json.dump(result, fh)
+
+    return result
+
+
 def search_MFR_files(feature_name: str) -> dict[str, Any]:
     explorer = get_MFR_dataset_explorer()
 
