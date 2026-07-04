@@ -2,8 +2,7 @@
 <html lang="ja">
 <head>
   <meta charset="UTF-8">
-  <title>Shape Space Map</title>
-  <style>
+  <title>Shape Space Map</title>  <style>
     html, body { margin: 0; padding: 0; overflow: hidden; font-family: "Segoe UI", sans-serif; }
     #viewer { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: #f4f4f7; }
 
@@ -53,17 +52,17 @@
   <div id="panel">
     <h1>Shape Space Map</h1>
     <div class="row">
-      <label for="scale">スケール</label>
+      <label for="scale">Scale</label>
       <input id="scale" type="range" min="0" max="100" value="0" step="1">
       <span id="scaleValue">1.0×</span>
     </div>
-    <div id="stress">配置精度: -</div>
+    <div id="stress">Layout accuracy: -</div>
   </div>
 
-  <div id="spinner">読み込み中<span class="dot"></span></div>
+  <div id="spinner">Loading<span class="dot"></span></div>
 
   <div id="errorMsg">
-    <h2>エラー</h2>
+    <h2>Error</h2>
     <p id="errorDetail"></p>
   </div>
 
@@ -90,7 +89,7 @@
     }
 
     if (!mapId) {
-      showError("URL に map パラメータがありません (例: ?map=abcd1234)。");
+      showError("Missing 'map' query parameter (e.g. ?map=abcd1234).");
       throw new Error("missing map param");
     }
 
@@ -162,21 +161,21 @@
         }
       }
       let s = (minDist !== Infinity && minDist > 0 && maxDiag > 0) ? maxDiag / minDist : 1;
-      s = Math.min(100, Math.max(1, s));
+      s = Math.min(500, Math.max(1, s)) * 5;  // start at 5× auto-scale so parts are well separated
       return s;
     }
 
     function setupSlider() {
       baseScale = computeInitialScale();
       currentScale = baseScale;
-      // slider maps 0..100 → baseScale .. baseScale*20 (linear)
+      // slider maps 0..100 → baseScale .. baseScale*50 (linear)
       scaleSlider.min = 0;
       scaleSlider.max = 100;
       scaleSlider.value = 0;
       updateScaleLabel();
       scaleSlider.addEventListener('input', () => {
         const t = parseFloat(scaleSlider.value) / 100;   // 0..1
-        currentScale = baseScale * (1 + t * 19);          // 1×..20× of baseScale
+        currentScale = baseScale * (1 + t * 49);          // 1×..50× of baseScale
         updateScaleLabel();
         applyPositions();
       });
@@ -190,8 +189,8 @@
     function setStress(stress) {
       const s = Number(stress) || 0;
       const label = s < 0.01
-        ? `配置精度: 正確 (stress=${s.toFixed(3)})`
-        : `配置精度: 近似 (stress=${s.toFixed(3)})`;
+        ? `Layout accuracy: exact (stress=${s.toFixed(3)})`
+        : `Layout accuracy: approximate (stress=${s.toFixed(3)})`;
       stressEl.textContent = label;
     }
 
@@ -204,11 +203,11 @@
       try {
         resp = await fetch(`/out/shape_map_${mapId}.json`);
       } catch (e) {
-        showError("マップデータの取得に失敗しました: " + e.message);
+        showError("Failed to fetch map data: " + e.message);
         return;
       }
       if (!resp.ok) {
-        showError(`マップデータが見つかりません (HTTP ${resp.status})。`);
+        showError(`Map data not found (HTTP ${resp.status}).`);
         return;
       }
       mapData = await resp.json();
@@ -216,7 +215,7 @@
 
       const validParts = mapData.parts.filter(p => p.scs_url);
       if (validParts.length === 0) {
-        showError("表示可能なパーツ (SCS) がありません。");
+        showError("No displayable parts (SCS files) found.");
         return;
       }
 
@@ -286,7 +285,7 @@
             if (hwv.view.fitWorld) hwv.view.fitWorld();
             spinner.style.display = 'none';
           } catch (e) {
-            showError("モデルの読み込みに失敗しました: " + (e.message || e));
+            showError("Failed to load models: " + (e.message || e));
           }
         },
       });
