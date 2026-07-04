@@ -812,6 +812,84 @@ Uncompressed size is capped at 500 MB and file count at 50 (HTTP 413 if exceeded
 
 ---
 
+## Shape Space Map
+
+Arrange a set of CAD parts in an interactive 3D scene so that shape-similar parts are
+placed closer together.  Embeddings are compared by cosine similarity and laid out with
+classical MDS (multidimensional scaling), then rendered together in the HOOPS Web Viewer.
+
+![Shape Space Map](docs/shape_space_map.png)
+
+```
+POST /similarity/map
+GET  /similarity/map/show?map=<map_id>
+```
+
+| Input | How to supply |
+|---|---|
+| Existing file IDs | `?file_ids=<id1>,<id2>,...` query parameter |
+| CAD file uploads | `files` multipart field (one or more) |
+| ZIP archive | `zip_file` multipart field (auto-extracted, Zip Slip protected) |
+
+At least **two** valid parts are required.  Accepts the same three input sources as
+`POST /similarity/compare`.  The response includes a 3D `position` for each part, the
+similarity `matrix`, a Kruskal `stress` value (layout accuracy: `0.0` is exact), and an
+absolute `viewer_url` that opens the interactive map.  The viewer page fetches its layout
+data from `/out/shape_map_<map_id>.json`.
+
+**Linux – generate a shape map from uploaded files:**
+```bash
+# Upload parts
+curl -s -X POST http://localhost:8000/files/upload -F "file=@part_a.step"
+curl -s -X POST http://localhost:8000/files/upload -F "file=@part_b.step"
+
+# Generate shape map
+curl -s -X POST "http://localhost:8000/similarity/map?file_ids=<id_a>,<id_b>" | python -m json.tool
+
+# Open the viewer_url from the response in a browser
+```
+
+**Windows (PowerShell) – upload parts directly:**
+```powershell
+curl.exe -X POST "http://<server-ip>:8000/similarity/map" `
+    -F "files=@C:\path\to\bracket_a.step" `
+    -F "files=@C:\path\to\bracket_b.step"
+```
+
+**Response (abridged):**
+
+```json
+{
+  "map_id": "a1b2c3d4",
+  "viewer_url": "http://localhost:8000/similarity/map/show?map=a1b2c3d4",
+  "count": 2,
+  "parts": [
+    {"index": 0, "file_id": "ab12...", "filename": "bracket_a.step",
+     "scs_url": "http://localhost:8000/out/xxxx_bracket_a.scs", "position": [0.5, 0.0, 0.0]},
+    {"index": 1, "file_id": "cd34...", "filename": "bracket_b.step",
+     "scs_url": "http://localhost:8000/out/yyyy_bracket_b.scs", "position": [-0.5, 0.0, 0.0]}
+  ],
+  "matrix": [[1.0, 0.9532], [0.9532, 1.0]],
+  "stress": 0.0,
+  "errors": []
+}
+```
+
+| Field | Description |
+|---|---|
+| `map_id` | Identifier for the generated layout |
+| `viewer_url` | Absolute URL of the interactive 3D viewer page |
+| `count` | Number of parts placed |
+| `parts` | Per-part metadata, absolute `scs_url`, and centred 3D `position` |
+| `matrix` | N×N cosine similarity matrix (diagonal = 1.0) |
+| `stress` | Kruskal stress-1 layout accuracy (`< 0.01` = exact, higher = approximate) |
+| `errors` | Per-file upload/embed/SCS failures that were skipped (non-fatal) |
+
+The viewer overlays a scale slider (to spread parts apart or pack them together), a layout
+accuracy indicator, and per-part filename labels that track the camera.
+
+---
+
 ### Named Index Management (Incremental Workflow)
 
 Manage user-created similarity indexes that grow over time.  Unlike the built-in
