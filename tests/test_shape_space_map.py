@@ -240,5 +240,364 @@ class ShapeMapEndpointValidationTests(unittest.TestCase):
         self.assertTrue(body["parts"][0]["scs_url"].startswith("http"))
 
 
+class ProjectOosMdsTests(unittest.TestCase):
+    """Exercise core._project_oos_mds directly."""
+
+    def test_known_collinear_projection(self):
+        """Query equidistant from two endpoints → projected to their midpoint (origin)."""
+        import core
+
+        # Mean-centred MDS coords for 2 points 2 units apart: [-1, 0, 0] and [1, 0, 0]
+        coords = np.array([[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+        dist_matrix = np.array([[0.0, 2.0], [2.0, 0.0]])
+        # Query equidistant from both endpoints
+        query_dist = np.array([math.sqrt(3), math.sqrt(3)])
+        pos = core._project_oos_mds(coords, dist_matrix, query_dist)
+        self.assertEqual(len(pos), 3)
+        # Equidistant from both → projects to midpoint at origin (x ≈ 0)
+        self.assertAlmostEqual(pos[0], 0.0, delta=0.1)
+
+    def test_output_length_is_always_3(self):
+        """Return value always has exactly 3 components."""
+        import core
+
+        coords = np.array([[0.0, 0.0, 0.0]])
+        dist_matrix = np.array([[0.0]])
+        query_dist = np.array([1.0])
+        pos = core._project_oos_mds(coords, dist_matrix, query_dist)
+        self.assertEqual(len(pos), 3)
+
+    def test_empty_coords_returns_zeros(self):
+        """Empty existing map → returns zero vector."""
+        import core
+
+        import numpy as _np
+
+        pos = core._project_oos_mds(
+            _np.zeros((0, 3)), _np.zeros((0, 0)), _np.zeros(0)
+        )
+        self.assertEqual(list(pos), [0.0, 0.0, 0.0])
+
+    def test_identical_query_projects_near_existing(self):
+        """Query identical to one existing part (distance 0) should land near it."""
+        import core
+
+        # Mean-centred MDS coords for 3 collinear parts with distances [[0,1,2],[1,0,1],[2,1,0]]
+        coords = np.array([[-1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+        dist_matrix = np.array([
+            [0.0, 1.0, 2.0],
+            [1.0, 0.0, 1.0],
+            [2.0, 1.0, 0.0],
+        ])
+        # Query is identical to the middle part (distance 0 from it, 1 from neighbours)
+        query_dist = np.array([1.0, 0.0, 1.0])
+        pos = core._project_oos_mds(coords, dist_matrix, query_dist)
+        # Middle part is at origin (0, 0, 0) in mean-centred coords
+        self.assertAlmostEqual(pos[0], 0.0, delta=0.2)
+        self.assertAlmostEqual(pos[1], 0.0, delta=0.2)
+
+
+class QueryShapeMapCoreTests(unittest.TestCase):
+    """Exercise core.query_shape_map with mocked dependencies."""
+
+    def _make_map_file(self, tmp_dir, map_id, n=3):
+        """Write a minimal shape_map_{map_id}.json to tmp_dir and return its path."""
+        import json, pathlib
+
+        rng = np.random.default_rng(42)
+        sim = np.eye(n)
+        for i in range(n):
+            for j in range(i + 1, n):
+                v = round(float(rng.random() * 0.4 + 0.3), 6)
+                sim[i, j] = v
+                sim[j, i] = v
+        matrix = sim.tolist()
+        parts = [
+            {
+                "index": i,
+                "file_id": f"id_{i}",
+                "filename": f"part_{i}.step",
+                "scs_url": f"/out/id_{i}.scs",
+                "position": [float(i), 0.0, 0.0],
+            }
+            for i in range(n)
+        ]
+        data = {
+            "map_id": map_id,
+            "viewer_url": f"/similarity/map/show?map={map_id}",
+            "count": n,
+            "parts": parts,
+            "matrix": matrix,
+            "stress": 0.0,
+            "errors": [],
+        }
+        p = pathlib.Path(tmp_dir) / f"shape_map_{map_id}.json"
+        p.write_text(__import__("json").dumps(data), encoding="utf-8")
+        return p
+
+    def test_overlay_saved_and_returned(self):
+        """query_shape_map saves a new overlay JSON and returns expected keys."""
+        import core, json, pathlib, tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            orig_out = core.CAD_VIEWER_OUTPUT_DIR
+            core.CAD_VIEWER_OUTPUT_DIR = pathlib.Path(tmp)
+            try:
+                self._make_map_file(tmp, "aabb1122")
+
+                fake_emb = {
+                    "file_id": "q0",
+                    "vector": np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+                    "dim": 4,
+                    "model_name": "m",
+                    "num_bodies": 1,
+                    "filename": "query.step",
+                    "cached": False,
+                }
+
+                def fake_compute(fid):
+                    return {**fake_emb, "file_id": fid}
+
+                with (
+                    patch.object(core, "compute_embedding", side_effect=fake_compute),
+                    patch.object(core, "export_scs_for_part", side_effect=lambda fid: f"{fid}.scs"),
+                ):
+                    result = core.query_shape_map("aabb1122", "q0")
+
+                self.assertIn("overlay_map_id", result)
+                self.assertIn("viewer_url", result)
+                self.assertEqual(result["query_part"]["file_id"], "q0")
+                self.assertTrue(result["query_part"]["is_query"])
+                self.assertEqual(len(result["query_part"]["position"]), 3)
+                self.assertFalse(result["persisted"])
+
+                # Overlay file must exist
+                overlay_path = pathlib.Path(tmp) / f"shape_map_{result['overlay_map_id']}.json"
+                self.assertTrue(overlay_path.exists())
+                overlay = json.loads(overlay_path.read_text())
+                self.assertEqual(overlay["count"], 4)  # 3 existing + 1 query
+                # Last part is the query
+                self.assertTrue(overlay["parts"][-1]["is_query"])
+                # Matrix is (4x4)
+                self.assertEqual(len(overlay["matrix"]), 4)
+                self.assertEqual(len(overlay["matrix"][0]), 4)
+            finally:
+                core.CAD_VIEWER_OUTPUT_DIR = orig_out
+
+    def test_map_not_found_raises_key_error(self):
+        """query_shape_map raises KeyError when the map JSON does not exist."""
+        import core, pathlib, tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            orig_out = core.CAD_VIEWER_OUTPUT_DIR
+            core.CAD_VIEWER_OUTPUT_DIR = pathlib.Path(tmp)
+            try:
+                with self.assertRaises(KeyError):
+                    core.query_shape_map("nonexistent", "q0")
+            finally:
+                core.CAD_VIEWER_OUTPUT_DIR = orig_out
+
+    def test_persist_updates_original_map(self):
+        """persist=True adds the query part to the original map JSON."""
+        import core, json, pathlib, tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            orig_out = core.CAD_VIEWER_OUTPUT_DIR
+            core.CAD_VIEWER_OUTPUT_DIR = pathlib.Path(tmp)
+            try:
+                self._make_map_file(tmp, "ccdd5566")
+
+                fake_emb = {
+                    "file_id": "qp",
+                    "vector": np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32),
+                    "dim": 4,
+                    "model_name": "m",
+                    "num_bodies": 1,
+                    "filename": "persist_query.step",
+                    "cached": False,
+                }
+
+                def fake_compute(fid):
+                    return {**fake_emb, "file_id": fid}
+
+                with (
+                    patch.object(core, "compute_embedding", side_effect=fake_compute),
+                    patch.object(core, "export_scs_for_part", side_effect=lambda fid: f"{fid}.scs"),
+                ):
+                    result = core.query_shape_map("ccdd5566", "qp", persist=True)
+
+                self.assertTrue(result["persisted"])
+                orig = json.loads(
+                    (pathlib.Path(tmp) / "shape_map_ccdd5566.json").read_text()
+                )
+                self.assertEqual(orig["count"], 4)
+                self.assertEqual(orig["parts"][-1]["file_id"], "qp")
+            finally:
+                core.CAD_VIEWER_OUTPUT_DIR = orig_out
+
+    def test_scs_failure_is_non_fatal(self):
+        """SCS export failure for the query part is collected in errors, not raised."""
+        import core, pathlib, tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            orig_out = core.CAD_VIEWER_OUTPUT_DIR
+            core.CAD_VIEWER_OUTPUT_DIR = pathlib.Path(tmp)
+            try:
+                self._make_map_file(tmp, "eeff7788")
+
+                fake_emb = {
+                    "file_id": "qf",
+                    "vector": np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+                    "dim": 4,
+                    "model_name": "m",
+                    "num_bodies": 1,
+                    "filename": "fail_query.step",
+                    "cached": False,
+                }
+
+                def fake_compute(fid):
+                    return {**fake_emb, "file_id": fid}
+
+                with (
+                    patch.object(core, "compute_embedding", side_effect=fake_compute),
+                    patch.object(core, "export_scs_for_part", side_effect=RuntimeError("scs boom")),
+                ):
+                    result = core.query_shape_map("eeff7788", "qf")
+
+                self.assertIsNone(result["query_part"]["scs_url"])
+                self.assertEqual(len(result["errors"]), 1)
+                self.assertIn("scs boom", result["errors"][0]["detail"])
+            finally:
+                core.CAD_VIEWER_OUTPUT_DIR = orig_out
+
+    def test_nearest_parts_sorted_by_score(self):
+        """nearest_parts is sorted by descending similarity score."""
+        import core, pathlib, tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            orig_out = core.CAD_VIEWER_OUTPUT_DIR
+            core.CAD_VIEWER_OUTPUT_DIR = pathlib.Path(tmp)
+            try:
+                self._make_map_file(tmp, "11223344", n=5)
+
+                # Give the query a specific vector so dot products are predictable
+                query_vec = np.array([0.6, 0.8, 0.0, 0.0], dtype=np.float32)
+                # Make each part's vector distinct so similarities differ
+                part_vecs = {
+                    "id_0": np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+                    "id_1": np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32),
+                    "id_2": np.array([-1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+                    "id_3": np.array([0.0, -1.0, 0.0, 0.0], dtype=np.float32),
+                    "id_4": np.array([0.0, 0.0, 1.0, 0.0], dtype=np.float32),
+                }
+                dummy = {
+                    "dim": 4, "model_name": "m", "num_bodies": 1,
+                    "filename": "x.step", "cached": False,
+                }
+
+                def fake_compute(fid):
+                    vec = part_vecs.get(fid, query_vec)
+                    return {**dummy, "file_id": fid, "vector": vec}
+
+                with (
+                    patch.object(core, "compute_embedding", side_effect=fake_compute),
+                    patch.object(core, "export_scs_for_part", side_effect=lambda fid: f"{fid}.scs"),
+                ):
+                    result = core.query_shape_map("11223344", "q_sort")
+
+                scores = [p["score"] for p in result["nearest_parts"]]
+                self.assertEqual(scores, sorted(scores, reverse=True))
+            finally:
+                core.CAD_VIEWER_OUTPUT_DIR = orig_out
+
+
+class MapQueryEndpointTests(unittest.TestCase):
+    """FastAPI TestClient tests for POST /similarity/map/{map_id}/query."""
+
+    def _client(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from routers.similarity import router
+
+        app = FastAPI()
+        app.include_router(router)
+        return TestClient(app)
+
+    def _fake_query_result(self, overlay_id="ov123456"):
+        return {
+            "overlay_map_id": overlay_id,
+            "viewer_url": f"/similarity/map/show?map={overlay_id}",
+            "query_part": {
+                "index": 2,
+                "file_id": "qid",
+                "filename": "query.step",
+                "scs_url": "/out/qid.scs",
+                "position": [0.5, 0.1, 0.0],
+                "is_query": True,
+            },
+            "nearest_parts": [
+                {"index": 0, "file_id": "a", "filename": "a.step", "score": 0.9},
+                {"index": 1, "file_id": "b", "filename": "b.step", "score": 0.7},
+            ],
+            "persisted": False,
+            "errors": [],
+        }
+
+    def test_no_input_returns_422(self):
+        """POST with no file/file_id → 422."""
+        client = self._client()
+        resp = client.post("/similarity/map/abcd1234/query")
+        self.assertEqual(resp.status_code, 422)
+
+    def test_map_not_found_returns_404(self):
+        """POST with a valid file_id but missing map → 404."""
+        import core, pathlib
+
+        client = self._client()
+        with (
+            patch.object(core, "find_persistent_CAD_file",
+                         return_value=pathlib.Path("/fake/q.step")),
+            patch.object(core, "query_shape_map",
+                         side_effect=KeyError("Shape map 'missing' not found.")),
+        ):
+            resp = client.post("/similarity/map/missing/query?file_id=some_id")
+        self.assertEqual(resp.status_code, 404)
+
+    def test_success_returns_200_with_expected_shape(self):
+        """POST with valid file_id and existing map → 200 with expected response."""
+        import core
+
+        client = self._client()
+        fake_result = self._fake_query_result()
+
+        with patch.object(core, "query_shape_map", return_value=fake_result):
+            resp = client.post("/similarity/map/abcd1234/query?file_id=qid")
+
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["overlay_map_id"], "ov123456")
+        self.assertTrue(body["viewer_url"].endswith("/similarity/map/show?map=ov123456"))
+        self.assertTrue(body["query_part"]["is_query"])
+        self.assertTrue(body["query_part"]["scs_url"].startswith("http"))
+        self.assertEqual(len(body["nearest_parts"]), 2)
+        self.assertAlmostEqual(body["nearest_parts"][0]["score"], 0.9)
+        self.assertFalse(body["persisted"])
+
+    def test_persist_flag_forwarded(self):
+        """persist=true is forwarded to core.query_shape_map."""
+        import core
+
+        client = self._client()
+        fake_result = {**self._fake_query_result(), "persisted": True}
+
+        with patch.object(core, "query_shape_map", return_value=fake_result) as mock_fn:
+            resp = client.post("/similarity/map/abcd1234/query?file_id=qid&persist=true")
+
+        self.assertEqual(resp.status_code, 200)
+        _, kwargs = mock_fn.call_args
+        self.assertTrue(kwargs.get("persist") or mock_fn.call_args[0][2])
+        self.assertTrue(resp.json()["persisted"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1351,6 +1351,185 @@ def compute_shape_map_data(file_ids: list[str]) -> dict[str, Any]:
     return result
 
 
+def _project_oos_mds(
+    coords: "Any",
+    dist_matrix: "Any",
+    query_dist: "Any",
+) -> "Any":
+    """Project a new point into an existing classical-MDS coordinate space.
+
+    Uses the out-of-sample extension formula (Bengio et al., 2004).  Given the
+    ``N×3`` coordinate matrix ``coords`` (mean-centred) and the ``N×N`` distance
+    matrix ``dist_matrix`` used to produce it, place the new point whose
+    distances to the N existing points are ``query_dist`` (length-N array) into
+    the same space.
+
+    Returns a length-3 numpy array.  Falls back gracefully when N < 3 or the
+    system is rank-deficient.
+    """
+    import numpy as np
+
+    coords = np.asarray(coords, dtype=float)
+    dist_matrix = np.asarray(dist_matrix, dtype=float)
+    query_dist = np.asarray(query_dist, dtype=float)
+
+    n = coords.shape[0]
+    if n == 0:
+        return np.zeros(3)
+
+    d_sq = dist_matrix ** 2
+    d_q_sq = query_dist ** 2
+
+    # Row/column means of D² (symmetric, so equal)
+    row_means = d_sq.mean(axis=0)      # (N,) — (1/N) Σ_i D²_ij for each j
+    grand_mean = float(d_sq.mean())
+    q_mean = float(d_q_sq.mean())
+
+    # Out-of-sample centering: b_j = <x_query, x_j> approximation
+    b = -0.5 * (d_q_sq - q_mean - row_means + grand_mean)  # (N,)
+
+    # Solve coords @ x_query ≈ b  (least-squares, handles rank-deficiency)
+    x_q, _, _, _ = np.linalg.lstsq(coords, b, rcond=None)
+
+    # Ensure output is exactly length 3
+    result = np.zeros(3)
+    result[: len(x_q)] = x_q[:3]
+    return result
+
+
+def query_shape_map(map_id: str, query_file_id: str, persist: bool = False) -> dict[str, Any]:
+    """Overlay a query CAD part on an existing shape-space map.
+
+    Steps:
+      1. Load the persisted map JSON for *map_id*.
+      2. Compute the query part's shape embedding.
+      3. Compute cosine similarities between the query and every existing part.
+      4. Project the query into the existing 3D coordinate space via the
+         out-of-sample MDS extension formula.
+      5. Export an SCS stream cache for the query part (non-fatal on failure).
+      6. Save a new *overlay* map JSON (``shape_map_{overlay_id}.json``) that
+         contains all original parts plus the query part tagged with
+         ``is_query=True`` for magenta highlighting in the viewer.
+      7. Optionally persist the query part into the original map JSON when
+         *persist* is ``True``.
+
+    Returns a dict with keys: ``overlay_map_id``, ``viewer_url``,
+    ``query_part``, ``nearest_parts`` (top-5), ``persisted``, ``errors``.
+
+    Raises:
+      ``KeyError``    – map *map_id* does not exist.
+      ``RuntimeError``– embedding computation fails for the query part.
+    """
+    import json
+
+    import numpy as np
+
+    map_path = CAD_VIEWER_OUTPUT_DIR / f"shape_map_{map_id}.json"
+    if not map_path.exists():
+        raise KeyError(f"Shape map '{map_id}' not found.")
+
+    with open(map_path, encoding="utf-8") as fh:
+        map_data = json.load(fh)
+
+    existing_parts: list[dict] = map_data["parts"]
+    existing_matrix: list[list[float]] = map_data["matrix"]
+    n = len(existing_parts)
+
+    # Compute query embedding (raises on failure — let caller handle)
+    query_emb = compute_embedding(query_file_id)
+    query_vec = query_emb["vector"]
+    query_filename = query_emb["filename"]
+
+    # Cosine similarities: query vs. each existing part (vectors are L2-normalised)
+    query_sims: list[float] = []
+    for part in existing_parts:
+        part_emb = compute_embedding(part["file_id"])
+        sim = float(np.dot(query_vec, part_emb["vector"]))
+        query_sims.append(round(sim, 6))
+
+    # Project query into existing coordinate space via out-of-sample MDS
+    coords = np.array([p["position"] for p in existing_parts], dtype=float)  # (N, 3)
+    sim_mat = np.array(existing_matrix, dtype=float)
+    dist_mat = 1.0 - sim_mat
+    np.fill_diagonal(dist_mat, 0.0)
+    query_dist = 1.0 - np.array(query_sims)
+    query_pos = _project_oos_mds(coords, dist_mat, query_dist)
+
+    # Export SCS for the query part (non-fatal)
+    errors: list[dict] = []
+    query_scs_url: Optional[str] = None
+    try:
+        scs_name = export_scs_for_part(query_file_id)
+        query_scs_url = f"/out/{scs_name}"
+    except Exception as exc:
+        errors.append({"filename": query_filename, "detail": str(exc)})
+
+    query_part_info: dict[str, Any] = {
+        "index": n,
+        "file_id": query_file_id,
+        "filename": query_filename,
+        "scs_url": query_scs_url,
+        "position": [float(query_pos[0]), float(query_pos[1]), float(query_pos[2])],
+        "is_query": True,
+    }
+
+    # Build (N+1)×(N+1) extended similarity matrix
+    ext_matrix = [row + [query_sims[i]] for i, row in enumerate(existing_matrix)]
+    ext_matrix.append(query_sims + [1.0])
+
+    # Save overlay map JSON (new map_id so the original is untouched)
+    overlay_map_id = uuid.uuid4().hex[:8]
+    overlay = {
+        "map_id": overlay_map_id,
+        "viewer_url": f"/similarity/map/show?map={overlay_map_id}",
+        "count": n + 1,
+        "parts": list(existing_parts) + [query_part_info],
+        "matrix": ext_matrix,
+        "stress": map_data.get("stress", 0.0),
+        "errors": errors,
+        "base_map_id": map_id,
+        "query_file_id": query_file_id,
+    }
+    CAD_VIEWER_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    overlay_path = CAD_VIEWER_OUTPUT_DIR / f"shape_map_{overlay_map_id}.json"
+    with open(overlay_path, "w", encoding="utf-8") as fh:
+        json.dump(overlay, fh)
+
+    # Optional: persist query part into the original map
+    if persist:
+        existing_ids = {p["file_id"] for p in existing_parts}
+        if query_file_id not in existing_ids:
+            map_data["parts"].append(query_part_info)
+            map_data["matrix"] = ext_matrix
+            map_data["count"] = n + 1
+            with open(map_path, "w", encoding="utf-8") as fh:
+                json.dump(map_data, fh)
+
+    # Top-5 nearest existing parts by similarity
+    nearest_parts = sorted(
+        [
+            {
+                "index": i,
+                "file_id": existing_parts[i]["file_id"],
+                "filename": existing_parts[i]["filename"],
+                "score": query_sims[i],
+            }
+            for i in range(n)
+        ],
+        key=lambda x: x["score"],
+        reverse=True,
+    )[:5]
+
+    return {
+        "overlay_map_id": overlay_map_id,
+        "viewer_url": f"/similarity/map/show?map={overlay_map_id}",
+        "query_part": query_part_info,
+        "nearest_parts": nearest_parts,
+        "persisted": persist,
+        "errors": errors,
+    }
+
+
 def search_MFR_files(feature_name: str) -> dict[str, Any]:
     explorer = get_MFR_dataset_explorer()
 

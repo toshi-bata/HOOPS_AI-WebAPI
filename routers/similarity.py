@@ -353,6 +353,7 @@ class MapPartInfo(BaseModel):
     filename: str
     scs_url: str
     position: list[float]  # [x, y, z]
+    is_query: bool = False
 
 
 class ShapeMapResponse(BaseModel):
@@ -515,6 +516,116 @@ def similarity_map_show(
     html_path = pathlib.Path(__file__).parent.parent / "static" / "shape_map.html"
     return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
 
+
+# ---------------------------------------------------------------------------
+# Response schemas – map query overlay
+# ---------------------------------------------------------------------------
+
+
+class MapQueryNearestPart(BaseModel):
+    index: int
+    file_id: str
+    filename: str
+    score: float
+
+
+class MapQueryResponse(BaseModel):
+    """Result of projecting a query part into an existing shape-space map.
+
+    ``overlay_map_id`` / ``viewer_url`` point to a new, temporary map that
+    renders all original parts plus the query (highlighted in magenta).
+    ``nearest_parts`` lists the top-5 most similar existing parts by cosine
+    similarity.  ``persisted`` is ``true`` when the query was written into the
+    original map JSON.
+    """
+
+    overlay_map_id: str
+    viewer_url: str
+    query_part: MapPartInfo
+    nearest_parts: list[MapQueryNearestPart]
+    persisted: bool
+    errors: list[CompareError]
+
+
+# ---------------------------------------------------------------------------
+# POST /similarity/map/{map_id}/query
+# ---------------------------------------------------------------------------
+
+
+@router.post("/map/{map_id}/query", response_model=MapQueryResponse)
+def similarity_map_query(
+    map_id: str,
+    request: Request,
+    file: Optional[UploadFile] = File(None),
+    file_id: Optional[str] = Query(
+        None,
+        description="file_id of an already-uploaded CAD file to use as the query.",
+    ),
+    persist: bool = Query(
+        False,
+        description="When true, add the query part permanently to the original map.",
+    ),
+):
+    """Overlay a query CAD part on an existing shape-space map.
+
+    The query part is embedded with the **same** pipeline used to build the map
+    and placed into the existing 3D coordinate space using the out-of-sample MDS
+    extension formula so it appears near its most similar parts.
+
+    Supply **either** a file upload *or* a ``file_id`` from a previous upload.
+
+    The returned ``viewer_url`` opens a new *overlay* map that includes all
+    original parts plus the query, which is rendered in **magenta** so it is
+    clearly distinguishable.
+
+    By default the query is a temporary overlay and is **not** written into the
+    original map.  Set ``persist=true`` to permanently add it.
+
+    Error codes:
+    * **404** – map not found
+    * **422** – no input supplied
+    * **500** – embedding or SCS conversion failure
+    """
+    try:
+        if file_id:
+            resolved_id = file_id
+        elif file:
+            resolved_id, _, _ = core.upload_CAD_file_persistent(file)
+        else:
+            raise HTTPException(status_code=422, detail="Either 'file' or 'file_id' is required.")
+
+        result = core.query_shape_map(map_id, resolved_id, persist=persist)
+    except HTTPException:
+        raise
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except (core.EnvConfigError, core.PathConfigError):
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Map query failed: {exc}") from exc
+
+    base = str(request.base_url).rstrip("/")
+    qp = result["query_part"]
+    scs_url = qp.get("scs_url")
+    abs_scs = f"{base}{scs_url}" if scs_url else ""
+
+    return MapQueryResponse(
+        overlay_map_id=result["overlay_map_id"],
+        viewer_url=f"{base}{result['viewer_url']}",
+        query_part=MapPartInfo(
+            index=qp["index"],
+            file_id=qp["file_id"],
+            filename=qp["filename"],
+            scs_url=abs_scs,
+            position=qp["position"],
+            is_query=True,
+        ),
+        nearest_parts=[MapQueryNearestPart(**p) for p in result["nearest_parts"]],
+        persisted=result["persisted"],
+        errors=[CompareError(**e) for e in result["errors"]],
+    )
 
 
 # ===========================================================================
