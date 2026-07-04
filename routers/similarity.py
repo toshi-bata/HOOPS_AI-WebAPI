@@ -23,10 +23,13 @@ class SimilarSearchIndexInfo(BaseModel):
     ``status`` is ``"loaded"`` when the index has been initialised, or
     ``"not_loaded"`` when no index has been loaded yet.
     All other fields are ``null`` / ``None`` when the index is not loaded.
+
+    Note: the server-side index file path is intentionally omitted from this
+    response and is only available via ``core.get_similar_search_index_info()``
+    for internal/maintenance use.
     """
 
     status: str
-    index_path: Optional[str] = None
     index_last_modified: Optional[str] = None
     index_count: Optional[int] = None
     model_name: Optional[str] = None
