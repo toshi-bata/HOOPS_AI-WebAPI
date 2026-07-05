@@ -9,11 +9,11 @@ A FastAPI-based REST API that exposes [HOOPS AI](https://www.techsoft3d.com/deve
 - Python 3.12
 - A valid **HOOPS AI license key**
 - HOOPS AI (CPU or GPU version) installed in the environment
-- **HOOPS AI Tutorials** – the notebooks folder and its contents (ML datasets and pre-trained models) are required to run this server.  
+- **HOOPS AI Tutorials**  Ethe notebooks folder and its contents (ML datasets and pre-trained models) are required to run this server.  
   The tutorials are available at [github.com/techsoft3d/HOOPS-AI-tutorials](https://github.com/techsoft3d/HOOPS-AI-tutorials/tree/main).  
   Data packages (datasets and trained model checkpoints) must be obtained from the Tech Soft 3D File Transfer service by following the HOOPS AI installation instructions.
 
-  **Directory layout** – `notebooks/` and `packages/` must both reside directly under the HOOPS AI install directory:
+  **Directory layout**  E`notebooks/` and `packages/` must both reside directly under the HOOPS AI install directory:
 
   ```
   <HOOPS_AI_INSTALL_DIR>/
@@ -23,15 +23,15 @@ A FastAPI-based REST API that exposes [HOOPS AI](https://www.techsoft3d.com/deve
       └── trained_ml_models/
   ```
 
-  **Pre-run requirements** – some endpoints require notebook output to be generated in advance:
+  **Pre-run requirements**  Esome endpoints require notebook output to be generated in advance:
 
   | Endpoint | Notebook to run | Generated files |
   |---|---|---|
-  | MFR endpoints | `3b_workflow_for_MFR_cadsynth.ipynb` | `notebooks/out/flows/<flow_name>/`<br>`.dataset` / `.infoset` / `.attribset` |
-  | `/similarity/search` | `5b_cad_search_using_HOOPS_embeddings.ipynb`<br>(up to **Saving an Index**) | `fabwave_embeddings_store.faiss` |
-  | `/part-classification/dataset/*` | `3c_workflow_for_Part_classification_fabwave.ipynb`<br>(up to **Pipeline execution**) | flow `.dataset` / `.infoset` / `.attribset`<br>`stream_cache/*.png` |
+  | MFR endpoints | `3b_workflow_for_MFR_cadsynth.ipynb` | `notebooks/out/flows/ETL_CADSYNTH_training_b2/`<br>`.dataset` / `.infoset` / `.attribset` <br>`stream_cache/*.png` |
+  | `/similarity/search` | `5b_cad_search_using_HOOPS_embeddings.ipynb`<br>(up to **Saving an Index**) | `notebooks/fabwave_embeddings_store.faiss` / `.meta` |
+  | `/part-classification/dataset/*` | `3c_workflow_for_Part_classification_fabwave.ipynb`<br>(up to **Pipeline execution**) | `notebooks/out/flows/ETL_Fabwave_training_b2/` <br> `.dataset` / `.infoset` / `.attribset`<br>`stream_cache/*.png` |
 
-  > **Tip:** Pre-generated dataset files are also available for download from the Tech Soft 3D File Transfer service — no need to run the notebooks yourself:  
+  > **Tip:** Pre-generated dataset files are also available for download from the Tech Soft 3D File Transfer service  Eno need to run the notebooks yourself:  
   > URL: https://transfer.techsoft3d.com/link/mb9c3d8eTHhVHFpnI0FFaD  
   > Password: `HOOPS-AI-RELEASE`
 
@@ -57,24 +57,11 @@ Then install the WebAPI dependencies into the **HOOPS AI virtual environment**:
 > On Ubuntu 22.04+ the system Python is externally managed (PEP 668) and will reject bare `pip install`.
 > Using the HOOPS AI venv's pip avoids this restriction and ensures the same Python that runs the server has all required packages.
 
-#### Additional steps for headless Linux (Ubuntu 22.04)
+#### Additional steps for headless Linux (Ubuntu)
 
-HOOPS AI requires OpenGL and a display to validate its license and render CAD files.
-On a headless server (no GPU, no monitor), install the following system packages:
+For running HOOPS AI on a headless Ubuntu server (no GPU, no monitor), refer to the following community forum post for step-by-step instructions:
 
-```bash
-sudo apt-get install -y libglu1-mesa libgl1 libgl1-mesa-dri libosmesa6 xvfb
-```
-
-| Package | Purpose |
-|---|---|
-| `libglu1-mesa` | OpenGL Utility Library |
-| `libgl1` | OpenGL runtime |
-| `libgl1-mesa-dri` | Mesa software renderer (swrast) |
-| `libosmesa6` | Off-screen Mesa rendering |
-| `xvfb` | Virtual framebuffer (headless display) |
-
-Then start a virtual display before launching the server (see [Step 4](#4-start-the-server)).
+**[I tried running HOOPS AI v1.1 headless on Ubuntu 24.04 EC2  ETech Soft 3D Forum](https://forum.techsoft3d.com/t/i-tried-running-hoops-ai-v1-1-headless-on-ubuntu-24-04-ec2/5165)**
 
 ### 2. Place the web viewer JS file
 
@@ -104,8 +91,8 @@ cp .env.example .env
 
 | Variable | Required | Description |
 |---|---|---|
-| `HOOPS_AI_LICENSE` | ✓ | Your HOOPS AI license key |
-| `HOOPS_AI_NOTEBOOK_DIR` | ✓ | Absolute path to your HOOPS AI notebooks directory |
+| `HOOPS_AI_LICENSE` | ✁E| Your HOOPS AI license key |
+| `HOOPS_AI_NOTEBOOK_DIR` | ✁E| Absolute path to your HOOPS AI notebooks directory |
 | `HOOPS_AI_MFR_FLOW_NAME` | optional | MFR flow name (dataset files are resolved relative to this) |
 | `HOOPS_AI_MFR_MODEL_NAME` | optional | MFR trained model checkpoint filename (e.g. `ts3d_162k_mfr.ckpt`) |
 | `HOOPS_AI_EMBEDDINGS_MODEL_NAME` | optional | Embeddings trained model checkpoint filename (e.g. `ts3d_1M_hoops_embeddings.ckpt`) |
@@ -131,7 +118,7 @@ HOOPS_AI_PART_CLASS_FLOW_NAME=ETL_Fabwave_training_b2
 
 ### 4. Start the server
 
-Run from the `` directory using the Python executable from your HOOPS AI virtual environment.
+Run the following command from the repository root, using the Python executable from your HOOPS AI virtual environment.
 
 **Windows:**
 
@@ -145,95 +132,27 @@ Run from the `` directory using the Python executable from your HOOPS AI virtual
 /path/to/HOOPS_AI/install/dir/.venv/bin/python main.py --host 0.0.0.0 --port 8000
 ```
 
-**Linux (headless – Ubuntu 22.04 without display):**
 
-HOOPS AI requires a display for license validation and 3D rendering. Start a virtual framebuffer first:
-
-```bash
-# Start virtual display (if not already running)
-Xvfb :99 -screen 0 1280x960x24 &
-
-# Launch the server with DISPLAY set
-DISPLAY=:99 /path/to/HOOPS_AI/install/dir/.venv/bin/python /path/to/HOOPS_AI-MCP/main.py --host 0.0.0.0 --port 8000
-```
-
-> The xkbcomp warnings printed by Xvfb (`Could not resolve keysym XF86...`) are harmless and can be ignored.
-
-> If Xvfb fails with `Server is already active for display 99`, the virtual display is already running – skip the `Xvfb` line and proceed directly to the `DISPLAY=:99 python ...` command.
-
-Alternatively, use the provided startup script which handles Xvfb automatically:
-
-```bash
-# Make executable (first time only)
-chmod +x start_server.sh
-
-# Run (default: --host 0.0.0.0 --port 8000)
-./start_server.sh
-
-# Custom port
-./start_server.sh --port 8001
-
-# Custom HOOPS AI venv path
-HOOPS_AI_VENV=/custom/path/.venv ./start_server.sh
-```
-
-> Replace the path prefix with the actual directory where HOOPS AI is installed.
-> The venv Python executable ensures HOOPS AI packages from that environment are used.
-
-> **Tip – Auto-start on boot (systemd) and file permission issues:**
->
-> If you run the server as a systemd service, make sure the service runs as the **same user** you use for manual testing (typically `ubuntu`), not as `root`.  
-> Running as `root` causes uploaded files to be owned by `root`, which then triggers a `PermissionError` when the server tries to clean the `uploads/` folder on the next startup by a non-root user.
->
-> Use `User=` and `Group=` in the `[Service]` section of your unit file:
->
-> ```ini
-> [Unit]
-> Description=HOOPS AI WebAPI Server
-> After=network.target
->
-> [Service]
-> Type=simple
-> User=ubuntu
-> Group=ubuntu
-> WorkingDirectory=/var/HOOPS_AI-WebAPI
-> ExecStart=/var/HOOPS_AI-MCP/start_server.sh --host 0.0.0.0 --port 8000
-> Restart=on-failure
-> RestartSec=5
->
-> [Install]
-> WantedBy=multi-user.target
+> **Note:** Port `8000` is the default. If port 8000 is already in use, the server will print an error and exit  Esimply retry with a different port (e.g. `--port 8001`).
+> When using the HOOPS AI MCP server, the WebAPI URL defaults to `http://127.0.0.1:8000` and no configuration is needed for local use on the default port.
+> If you change the port or run the WebAPI on a different machine, add `HOOPS_WEBAPI_URL` to the `"env"` section of your MCP client config (e.g. `claude_desktop_config.json`):
+> ```json
+> "env": { "HOOPS_WEBAPI_URL": "http://127.0.0.1:8001" }
 > ```
->
-> If you already have files owned by `root` in `uploads/`, fix ownership once with:
+
+> **Note (Linux):** If the server is not reachable from other machines, check the firewall. On Ubuntu with `ufw` enabled, open the port with:
 > ```bash
-> sudo chown -R ubuntu:ubuntu /var/HOOPS_AI-MCP/uploads
+> sudo ufw allow 8000/tcp
 > ```
 
-> **Note:** Port `8000` is the default. If port 8000 is already in use, the server will print an error and exit – simply retry with a different port (e.g. `--port 8001`) and update `HOOPS_WEBAPI_URL` in the MCP server config accordingly.
-
-> **Note (Windows):** To allow connections from other machines on the LAN, add a Windows Firewall inbound rule for port 8000 (TCP).
-
-For development with auto-reload:
-
-**Windows:**
-
-```bat
-<Path\to\HOOPS_AI\install\dir>\.venv\Scripts\python.exe main.py --host 0.0.0.0 --port 8000 --reload
-```
-
-**Linux:**
-
-```bash
-/path/to/HOOPS_AI/install/dir/.venv/bin/python main.py --host 0.0.0.0 --port 8000 --reload
-```
+Once the server is running, you can access it at:
 
 - API base URL: `http://<server-ip>:8000`
 - Interactive docs (Swagger UI): `http://<server-ip>:8000/docs`
 
 > **`<server-ip>` substitution:**  
-> - **Same machine** – use `127.0.0.1` (e.g. `http://127.0.0.1:8000`). No IP lookup needed.  
-> - **Different machine** – use the LAN IP of the server machine (e.g. `http://192.168.0.6:8000`).  
+> - **Same machine**  Euse `127.0.0.1` (e.g. `http://127.0.0.1:8000`). No IP lookup needed.  
+> - **Different machine**  Euse the LAN IP of the server machine (e.g. `http://192.168.0.6:8000`).  
 >   On Windows, run `ipconfig` on the server to find its IP address.
 
 ---
@@ -253,14 +172,12 @@ POST /files/upload
 
 **Windows (PowerShell):**
 ```powershell
-curl.exe -X POST "http://<server-ip>:8000/files/upload" `
-         -F "file=@C:\path\to\model.stp"
+curl.exe -X POST "http://127.0.0.1:8000/files/upload" -F "file=@C:\path\to\model.stp"
 ```
 
 **Linux:**
 ```bash
-curl -X POST "http://<server-ip>:8000/files/upload" \
-     -F "file=@/path/to/model.stp"
+curl -X POST "http://127.0.0.1:8000/files/upload" -F "file=@/path/to/model.stp"
 ```
 
 **Response:**
@@ -275,7 +192,7 @@ Pass the returned `file_id` to any processing endpoint instead of re-uploading t
 
 ### 3D CAD Viewer
 
-#### Launch viewer – Upload file
+#### Launch viewer  EUpload file
 
 Upload a local CAD file and open an interactive browser viewer.
 
@@ -285,29 +202,25 @@ POST /CAD/viewer
 
 **Windows (PowerShell):**
 ```powershell
-curl.exe -X POST "http://<server-ip>:8000/CAD/viewer" `
-         -F "file=@C:\path\to\model.stp"
+curl.exe -X POST "http://127.0.0.1:8000/CAD/viewer" -F "file=@C:\path\to\model.stp"
 ```
 
 **Linux:**
 ```bash
-curl -X POST "http://<server-ip>:8000/CAD/viewer" \
-     -F "file=@/path/to/model.stp"
+curl -X POST "http://127.0.0.1:8000/CAD/viewer" -F "file=@/path/to/model.stp"
 ```
 
 **Response:**
 
 ```json
-{ "viewer_url": "http://<server-ip>:<viewer_port>/index.html", "image_url": "http://<server-ip>:8000/out/<stem>.png" }
+{ "viewer_url": "http://<server-ip>:<viewer_port>/index.html", "image_url": "http://127.0.0.1:8000/out/<stem>.png" }
 ```
 
 Open the returned `viewer_url` in your browser to view the model. `image_url` is a PNG preview of the model.
 
-> The viewer runs on a **separate port** from the API server. Make sure that port is not blocked by a firewall.
-
 > **Note:** The `out/` and `uploads/` folders are automatically cleared on server startup.
 
-#### Launch viewer – Shared folder path
+#### Launch viewer  EShared folder path
 
 Open a CAD file already present in the shared folder (`HOOPS_AI_CAD_SHARED_DIR`).
 
@@ -317,14 +230,12 @@ POST /CAD/viewer/from-path
 
 **Windows (PowerShell):**
 ```powershell
-curl.exe -X POST "http://<server-ip>:8000/CAD/viewer/from-path" `
-         -d "cad_file_path=model.stp"
+curl.exe -X POST "http://127.0.0.1:8000/CAD/viewer/from-path" -d "cad_file_path=model.stp"
 ```
 
 **Linux:**
 ```bash
-curl -X POST "http://<server-ip>:8000/CAD/viewer/from-path" \
-     -d "cad_file_path=model.stp"
+curl -X POST "http://127.0.0.1:8000/CAD/viewer/from-path" -d "cad_file_path=model.stp"
 ```
 
 **Response:** same as above.
@@ -340,14 +251,14 @@ DELETE /CAD/viewer?all=true # terminate all viewers
 
 **Windows (PowerShell):**
 ```powershell
-Invoke-RestMethod -Method Delete -Uri "http://<server-ip>:8000/CAD/viewer"
-Invoke-RestMethod -Method Delete -Uri "http://<server-ip>:8000/CAD/viewer?all=true"
+curl.exe -X DELETE "http://127.0.0.1:8000/CAD/viewer"
+curl.exe -X DELETE "http://127.0.0.1:8000/CAD/viewer?all=true"
 ```
 
 **Linux:**
 ```bash
-curl -X DELETE "http://<server-ip>:8000/CAD/viewer"
-curl -X DELETE "http://<server-ip>:8000/CAD/viewer?all=true"
+curl -X DELETE "http://127.0.0.1:8000/CAD/viewer"
+curl -X DELETE "http://127.0.0.1:8000/CAD/viewer?all=true"
 ```
 
 **Response:** `{ "terminated": 1 }`
@@ -366,14 +277,12 @@ POST /BRep/adjacency-graph
 
 **Windows (PowerShell):**
 ```powershell
-curl.exe -X POST "http://<server-ip>:8000/BRep/adjacency-graph" `
-    -F "file=@C:\path\to\model.SLDPRT"
+curl.exe -X POST "http://127.0.0.1:8000/BRep/adjacency-graph" -F "file=@C:\path\to\model.SLDPRT"
 ```
 
 **Linux:**
 ```bash
-curl -X POST "http://<server-ip>:8000/BRep/adjacency-graph" \
-    -F "file=@/path/to/model.SLDPRT"
+curl -X POST "http://127.0.0.1:8000/BRep/adjacency-graph" -F "file=@/path/to/model.SLDPRT"
 ```
 
 **Response:**
@@ -386,7 +295,7 @@ curl -X POST "http://<server-ip>:8000/BRep/adjacency-graph" \
     "num_nodes": 144,
     "num_edges": 210
   },
-  "image_url": "http://<server-ip>:8000/out/<uuid>.png"
+  "image_url": "http://127.0.0.1:8000/out/<uuid>.png"
 }
 ```
 
@@ -400,14 +309,12 @@ POST /BRep/attributes
 
 **Windows (PowerShell):**
 ```powershell
-curl.exe -X POST "http://<server-ip>:8000/BRep/attributes" `
-    -F "file=@C:\path\to\model.SLDPRT"
+curl.exe -X POST "http://127.0.0.1:8000/BRep/attributes" -F "file=@C:\path\to\model.SLDPRT"
 ```
 
 **Linux:**
 ```bash
-curl -X POST "http://<server-ip>:8000/BRep/attributes" \
-    -F "file=@/path/to/model.SLDPRT"
+curl -X POST "http://127.0.0.1:8000/BRep/attributes" -F "file=@/path/to/model.SLDPRT"
 ```
 
 **Response:**
@@ -437,9 +344,15 @@ Returns a summary of the loaded MFR dataset.
 GET /MFR/dataset/table-of-contents
 ```
 
-**Windows (PowerShell):** `curl.exe "http://<server-ip>:8000/MFR/dataset/table-of-contents"`
+**Windows (PowerShell):**
+```powershell
+curl.exe "http://127.0.0.1:8000/MFR/dataset/table-of-contents"
+```
 
-**Linux:** `curl "http://<server-ip>:8000/MFR/dataset/table-of-contents"`
+**Linux:**
+```bash
+curl "http://127.0.0.1:8000/MFR/dataset/table-of-contents"
+```
 
 #### List label descriptions
 
@@ -449,9 +362,15 @@ Returns all MFR label IDs with their names and descriptions.
 GET /MFR/labels/description
 ```
 
-**Windows (PowerShell):** `curl.exe "http://<server-ip>:8000/MFR/labels/description"`
+**Windows (PowerShell):**
+```powershell
+curl.exe "http://127.0.0.1:8000/MFR/labels/description"
+```
 
-**Linux:** `curl "http://<server-ip>:8000/MFR/labels/description"`
+**Linux:**
+```bash
+curl "http://127.0.0.1:8000/MFR/labels/description"
+```
 
 #### Search files by feature
 
@@ -461,9 +380,15 @@ Returns CAD file names and IDs that contain a given manufacturing feature.
 GET /MFR/files/search?feature_name=<name>
 ```
 
-**Windows (PowerShell):** `curl.exe "http://<server-ip>:8000/MFR/files/search?feature_name=through%20hole"`
+**Windows (PowerShell):**
+```powershell
+curl.exe "http://127.0.0.1:8000/MFR/files/search?feature_name=through%20hole"
+```
 
-**Linux:** `curl "http://<server-ip>:8000/MFR/files/search?feature_name=through%20hole"`
+**Linux:**
+```bash
+curl "http://127.0.0.1:8000/MFR/files/search?feature_name=through%20hole"
+```
 
 **Response:**
 
@@ -484,12 +409,12 @@ GET /MFR/files/{file_id}/thumbnail
 
 **Windows (PowerShell):**
 ```powershell
-Invoke-RestMethod -Uri "http://<server-ip>:8000/MFR/files/1/thumbnail" -OutFile "thumbnail.png"
+curl.exe "http://127.0.0.1:8000/MFR/files/1/thumbnail" -o thumbnail.png
 ```
 
 **Linux:**
 ```bash
-curl "http://<server-ip>:8000/MFR/files/1/thumbnail" -o thumbnail.png
+curl "http://127.0.0.1:8000/MFR/files/1/thumbnail" -o thumbnail.png
 ```
 
 **Response:** PNG image (`image/png`)
@@ -504,14 +429,12 @@ POST /MFR/inference
 
 **Windows (PowerShell):**
 ```powershell
-curl.exe -X POST "http://<server-ip>:8000/MFR/inference" `
-    -F "file=@C:\path\to\model.SLDPRT"
+curl.exe -X POST "http://127.0.0.1:8000/MFR/inference" -F "file=@C:\path\to\model.SLDPRT"
 ```
 
 **Linux:**
 ```bash
-curl -X POST "http://<server-ip>:8000/MFR/inference" \
-    -F "file=@/path/to/model.SLDPRT"
+curl -X POST "http://127.0.0.1:8000/MFR/inference" -F "file=@/path/to/model.SLDPRT"
 ```
 
 **Response:**
@@ -521,38 +444,10 @@ curl -X POST "http://<server-ip>:8000/MFR/inference" \
   "predictions": [...],
   "probabilities": [...],
   "viewer_url": "http://<server-ip>:<viewer_port>/index.html",
-  "image_url": "http://<server-ip>:8000/out/<stem>.png"
+  "image_url": "http://127.0.0.1:8000/out/<stem>.png"
 }
 ```
 
-#### Colorize viewer
-
-Apply MFR prediction colors to the last active CAD viewer. Call this **after** the model has fully loaded in the browser.
-
-```
-POST /MFR/viewer/colorize
-```
-
-**Windows (PowerShell):**
-```powershell
-Invoke-RestMethod -Method Post -Uri "http://<server-ip>:8000/MFR/viewer/colorize"
-```
-
-**Linux:**
-```bash
-curl -X POST "http://<server-ip>:8000/MFR/viewer/colorize"
-```
-
-**Response:**
-
-```json
-{
-  "color_map": {
-    "17": {"name": "through hole", "color_rgb": [255, 0, 0]},
-    "18": {"name": "circular blind step", "color_rgb": [0, 255, 0]}
-  }
-}
-```
 
 ---
 
@@ -566,14 +461,12 @@ POST /similarity/search?top_k=<n>
 
 **Windows (PowerShell):**
 ```powershell
-curl.exe -X POST "http://<server-ip>:8000/similarity/search?top_k=10" `
-    -F "file=@C:\path\to\model.step"
+curl.exe -X POST "http://127.0.0.1:8000/similarity/search?top_k=10" -F "file=@C:\path\to\model.step"
 ```
 
 **Linux:**
 ```bash
-curl -X POST "http://<server-ip>:8000/similarity/search?top_k=10" \
-    -F "file=@/path/to/model.step"
+curl -X POST "http://127.0.0.1:8000/similarity/search?top_k=10" -F "file=@/path/to/model.step"
 ```
 
 **Response:**
@@ -584,16 +477,18 @@ curl -X POST "http://<server-ip>:8000/similarity/search?top_k=10" \
     {"id": "part_042", "score": 0.997},
     {"id": "part_018", "score": 0.991}
   ],
-  "image_url": "http://<server-ip>:8000/out/<uuid>.png"
+  "image_url": "http://127.0.0.1:8000/out/<uuid>.png"
 }
 ```
 
-- `results` – top-k matches sorted by similarity score (higher = more similar)
-- `image_url` – URL to a PNG grid image of the search results
+- `results`  Etop-k matches sorted by similarity score (higher = more similar)
+- `image_url`  EURL to a PNG grid image of the search results
 
 #### Part thumbnail image
 
 Return the pre-generated PNG thumbnail for a trained part by filename.
+
+> **Note:** Requires thumbnail images pre-generated by the embeddings notebook (`5b_cad_search_using_HOOPS_embeddings.ipynb`). Images are expected at `notebooks/out/images/STEP/<stem>.png` (or `<stem>_white.png`). Returns 404 if the images have not been generated.
 
 ```
 GET /similarity/part-image?filename=<name>
@@ -601,12 +496,12 @@ GET /similarity/part-image?filename=<name>
 
 **Windows (PowerShell):**
 ```powershell
-curl.exe "http://<server-ip>:8000/similarity/part-image?filename=part_042.stp" -o part_042.png
+curl.exe "http://127.0.0.1:8000/similarity/part-image?filename=part_042.stp" -o part_042.png
 ```
 
 **Linux:**
 ```bash
-curl "http://<server-ip>:8000/similarity/part-image?filename=part_042.stp" -o part_042.png
+curl "http://127.0.0.1:8000/similarity/part-image?filename=part_042.stp" -o part_042.png
 ```
 
 **Response:** PNG image (`image/png`)
@@ -626,12 +521,12 @@ GET /similarity/index-info
 
 **Windows (PowerShell):**
 ```powershell
-curl.exe "http://<server-ip>:8000/similarity/index-info"
+curl.exe "http://127.0.0.1:8000/similarity/index-info"
 ```
 
 **Linux:**
 ```bash
-curl "http://<server-ip>:8000/similarity/index-info"
+curl "http://127.0.0.1:8000/similarity/index-info"
 ```
 
 **Response (index loaded):**
@@ -677,7 +572,7 @@ curl "http://<server-ip>:8000/similarity/index-info"
 #### Compute shape embedding (index-free)
 
 Compute (or retrieve from cache) the shape embedding vector for a single CAD part.
-This endpoint does **not** require a FAISS index — the embedding model alone is sufficient.
+This endpoint does **not** require a FAISS index  Ethe embedding model alone is sufficient.
 
 ```
 POST /similarity/embed
@@ -688,17 +583,15 @@ Supply **either** a file upload or a `file_id` from a previous `POST /files/uplo
 **Windows (PowerShell):**
 ```powershell
 # Upload a file and get its embedding
-curl.exe -X POST "http://<server-ip>:8000/similarity/embed" `
-    -F "file=@C:\path\to\bracket.step"
+curl.exe -X POST "http://127.0.0.1:8000/similarity/embed" -F "file=@C:\path\to\bracket.step"
 
 # Or use an already-uploaded file_id
-curl.exe -X POST "http://<server-ip>:8000/similarity/embed?file_id=a3f8c2..."
+curl.exe -X POST "http://127.0.0.1:8000/similarity/embed?file_id=a3f8c2..."
 ```
 
 **Linux:**
 ```bash
-curl -X POST "http://<server-ip>:8000/similarity/embed" \
-    -F "file=@/path/to/bracket.step"
+curl -X POST "http://127.0.0.1:8000/similarity/embed" -F "file=@/path/to/bracket.step"
 ```
 
 **Response:**
@@ -747,29 +640,24 @@ POST /similarity/compare
 At least **two** valid parts are required.  Per-file failures are collected in `errors`
 and do not abort the request (unless fewer than two parts succeed).
 
-**Windows (PowerShell) – upload two files directly:**
+**Windows (PowerShell)  Eupload two files directly:**
 ```powershell
-curl.exe -X POST "http://<server-ip>:8000/similarity/compare" `
-    -F "files=@C:\path\to\bracket_a.step" `
-    -F "files=@C:\path\to\bracket_b.step"
+curl.exe -X POST "http://127.0.0.1:8000/similarity/compare" -F "files=@C:\path\to\bracket_a.step" -F "files=@C:\path\to\bracket_b.step"
 ```
 
-**Linux – upload two files directly:**
+**Linux  Eupload two files directly:**
 ```bash
-curl -X POST "http://<server-ip>:8000/similarity/compare" \
-    -F "files=@/path/to/bracket_a.step" \
-    -F "files=@/path/to/bracket_b.step"
+curl -X POST "http://127.0.0.1:8000/similarity/compare" -F "files=@/path/to/bracket_a.step" -F "files=@/path/to/bracket_b.step"
 ```
 
-**Linux – compare using already-uploaded file_ids:**
+**Linux  Ecompare using already-uploaded file_ids:**
 ```bash
-curl -X POST "http://<server-ip>:8000/similarity/compare?file_ids=a3f8c2...,cd34ef..."
+curl -X POST "http://127.0.0.1:8000/similarity/compare?file_ids=a3f8c2...,cd34ef..."
 ```
 
-**Linux – compare files inside a ZIP archive:**
+**Linux  Ecompare files inside a ZIP archive:**
 ```bash
-curl -X POST "http://<server-ip>:8000/similarity/compare" \
-    -F "zip_file=@/path/to/parts.zip"
+curl -X POST "http://127.0.0.1:8000/similarity/compare" -F "zip_file=@/path/to/parts.zip"
 ```
 
 **Response:**
@@ -836,7 +724,7 @@ similarity `matrix`, a Kruskal `stress` value (layout accuracy: `0.0` is exact),
 absolute `viewer_url` that opens the interactive map.  The viewer page fetches its layout
 data from `/out/shape_map_<map_id>.json`.
 
-**Linux – generate a shape map from uploaded files:**
+**Linux  Egenerate a shape map from uploaded files:**
 ```bash
 # Upload parts
 curl -s -X POST http://localhost:8000/files/upload -F "file=@part_a.step"
@@ -848,11 +736,9 @@ curl -s -X POST "http://localhost:8000/similarity/map?file_ids=<id_a>,<id_b>" | 
 # Open the viewer_url from the response in a browser
 ```
 
-**Windows (PowerShell) – upload parts directly:**
+**Windows (PowerShell)  Eupload parts directly:**
 ```powershell
-curl.exe -X POST "http://<server-ip>:8000/similarity/map" `
-    -F "files=@C:\path\to\bracket_a.step" `
-    -F "files=@C:\path\to\bracket_b.step"
+curl.exe -X POST "http://127.0.0.1:8000/similarity/map" -F "files=@C:\path\to\bracket_a.step" -F "files=@C:\path\to\bracket_b.step"
 ```
 
 **Response (abridged):**
@@ -889,7 +775,7 @@ accuracy indicator, and per-part filename labels that track the camera.
 
 ---
 
-### Shape Space Map – Query Overlay
+### Shape Space Map  EQuery Overlay
 
 Highlight a single query CAD part inside an **existing** shape-space map.  The query
 part is embedded with the same pipeline used to build the map and projected into the
@@ -905,18 +791,13 @@ POST /similarity/map/{map_id}/query
 | `map_id` | path | `map_id` returned by `POST /similarity/map` |
 | `file_id` | query | `file_id` of an already-uploaded part |
 | `file` | multipart | CAD file upload (alternative to `file_id`) |
-| `persist` | query | `false` (default) — overlay only; `true` — add to original map permanently |
+| `persist` | query | `false` (default)  Eoverlay only; `true`  Eadd to original map permanently |
 
 Supply **either** `file_id` **or** a `file` upload.
 
-**Windows (PowerShell) – direct upload:**
+**Windows (PowerShell)  Edirect upload:**
 ```powershell
-curl.exe -X POST "http://localhost:8000/similarity/map/d2a7f205/query" `
-    -F "file=@C:\temp\Sprocket.step"
-
-# Or with PowerShell native:
-$form = @{ file = Get-Item "C:\temp\Sprocket.step" }
-Invoke-RestMethod -Uri "http://localhost:8000/similarity/map/d2a7f205/query" -Method POST -Form $form
+curl.exe -X POST "http://localhost:8000/similarity/map/d2a7f205/query" -F "file=@C:\temp\Sprocket.step"
 ```
 
 **Linux – use an already-uploaded file:**
@@ -946,12 +827,12 @@ curl -s -X POST "http://localhost:8000/similarity/map/d2a7f205/query?file_id=<id
 | Field | Description |
 |---|---|
 | `overlay_map_id` | New temporary map that includes the query part |
-| `viewer_url` | Absolute URL — open in browser to see the query highlighted in magenta |
+| `viewer_url` | Absolute URL  Eopen in browser to see the query highlighted in magenta |
 | `query_part` | Query part metadata, position, and `is_query: true` flag |
 | `nearest_parts` | Top-5 most similar existing parts sorted by cosine similarity |
 | `persisted` | `true` when `persist=true` was used and the query was added to the original map |
 
-The overlay map is independent of the original — by default it exists only until the
+The overlay map is independent of the original  Eby default it exists only until the
 server restarts.  Use `persist=true` to permanently add the query part to the source map.
 
 ---
@@ -961,7 +842,7 @@ server restarts.  Use `persist=true` to permanently add the query part to the so
 Manage user-created similarity indexes that grow over time.  Unlike the built-in
 read-only ``default`` index (backed by ``HOOPS_AI_FAISS_INDEX_PATH``), named indexes
 are fully writable: create an empty index, register new parts whenever they arrive,
-and query immediately — all via Web API with no notebook re-runs.
+and query immediately  Eall via Web API with no notebook re-runs.
 
 Indexes are stored under ``APP_ROOT/indexes/<name>.faiss`` (+ ``.meta``).
 Index names must match ``^[a-z0-9_-]{1,64}$``; ``default`` is reserved.
@@ -987,7 +868,7 @@ POST /similarity/index/add?name=my-parts
 # 5. Remove a part
 DELETE /similarity/index/my-parts/parts?part_ids=<file_id>
 
-# 6. Delete the whole index (destructive — requires confirm=true)
+# 6. Delete the whole index (destructive  Erequires confirm=true)
 DELETE /similarity/index/my-parts?confirm=true
 ```
 
@@ -1001,12 +882,12 @@ Returns **201** on success, **409** if the name already exists, **422** for inva
 
 **Windows (PowerShell):**
 ```powershell
-curl.exe -X POST "http://<server-ip>:8000/similarity/index/create?name=my-parts"
+curl.exe -X POST "http://127.0.0.1:8000/similarity/index/create?name=my-parts"
 ```
 
 **Linux:**
 ```bash
-curl -X POST "http://<server-ip>:8000/similarity/index/create?name=my-parts"
+curl -X POST "http://127.0.0.1:8000/similarity/index/create?name=my-parts"
 ```
 
 **Response:**
@@ -1024,9 +905,15 @@ GET /similarity/index/list
 
 Returns all named indexes plus the built-in ``default`` index (``is_readonly: true``).
 
-**Windows (PowerShell):** `curl.exe "http://<server-ip>:8000/similarity/index/list"`
+**Windows (PowerShell):**
+```powershell
+curl.exe "http://127.0.0.1:8000/similarity/index/list"
+```
 
-**Linux:** `curl "http://<server-ip>:8000/similarity/index/list"`
+**Linux:**
+```bash
+curl "http://127.0.0.1:8000/similarity/index/list"
+```
 
 **Response:**
 ```json
@@ -1053,23 +940,20 @@ Accepts the same three input sources as ``POST /similarity/compare``:
 | ZIP archive | `zip_file` multipart field |
 
 Re-registering a part ID overwrites the existing entry (``updated`` counter).
-Embedding results are cached on disk — re-adding the same file is fast.
+Embedding results are cached on disk  Ere-adding the same file is fast.
 
 **Windows (PowerShell):**
 ```powershell
 # Upload a new part directly
-curl.exe -X POST "http://<server-ip>:8000/similarity/index/add?name=my-parts" `
-    -F "files=@C:\path\to\new_bracket.step"
+curl.exe -X POST "http://127.0.0.1:8000/similarity/index/add?name=my-parts" -F "files=@C:\path\to\new_bracket.step"
 
 # Add an already-uploaded part by file_id
-curl.exe -X POST "http://<server-ip>:8000/similarity/index/add?name=my-parts" `
-    -F "" --data-urlencode "file_ids=a3f8c2..."
+curl.exe -X POST "http://127.0.0.1:8000/similarity/index/add?name=my-parts" -F "" --data-urlencode "file_ids=a3f8c2..."
 ```
 
 **Linux:**
 ```bash
-curl -X POST "http://<server-ip>:8000/similarity/index/add?name=my-parts" \
-    -F "files=@/path/to/new_bracket.step"
+curl -X POST "http://127.0.0.1:8000/similarity/index/add?name=my-parts" -F "files=@/path/to/new_bracket.step"
 ```
 
 **Response:**
@@ -1090,14 +974,12 @@ when the index contains zero entries (no error).
 
 **Windows (PowerShell):**
 ```powershell
-curl.exe -X POST "http://<server-ip>:8000/similarity/index/my-parts/search?top_k=5" `
-    -F "file=@C:\path\to\query.step"
+curl.exe -X POST "http://127.0.0.1:8000/similarity/index/my-parts/search?top_k=5" -F "file=@C:\path\to\query.step"
 ```
 
 **Linux:**
 ```bash
-curl -X POST "http://<server-ip>:8000/similarity/index/my-parts/search?top_k=5" \
-    -F "file=@/path/to/query.step"
+curl -X POST "http://127.0.0.1:8000/similarity/index/my-parts/search?top_k=5" -F "file=@/path/to/query.step"
 ```
 
 **Response:**
@@ -1120,13 +1002,12 @@ DELETE /similarity/index/{name}/parts?part_ids=<id1>,<id2>,...
 
 **Windows (PowerShell):**
 ```powershell
-Invoke-RestMethod -Method Delete `
-    -Uri "http://<server-ip>:8000/similarity/index/my-parts/parts?part_ids=a3f8c2...,cd34ef..."
+curl.exe -X DELETE "http://127.0.0.1:8000/similarity/index/my-parts/parts?part_ids=a3f8c2...,cd34ef..."
 ```
 
 **Linux:**
 ```bash
-curl -X DELETE "http://<server-ip>:8000/similarity/index/my-parts/parts?part_ids=a3f8c2...,cd34ef..."
+curl -X DELETE "http://127.0.0.1:8000/similarity/index/my-parts/parts?part_ids=a3f8c2...,cd34ef..."
 ```
 
 **Response:**
@@ -1147,12 +1028,12 @@ an instruction.  Returns **403** for the read-only ``default`` index.
 
 **Windows (PowerShell):**
 ```powershell
-Invoke-RestMethod -Method Delete -Uri "http://<server-ip>:8000/similarity/index/my-parts?confirm=true"
+curl.exe -X DELETE "http://127.0.0.1:8000/similarity/index/my-parts?confirm=true"
 ```
 
 **Linux:**
 ```bash
-curl -X DELETE "http://<server-ip>:8000/similarity/index/my-parts?confirm=true"
+curl -X DELETE "http://127.0.0.1:8000/similarity/index/my-parts?confirm=true"
 ```
 
 **Response:**
@@ -1174,24 +1055,22 @@ POST /part-classification/predict?top_k=5
 
 **Windows (PowerShell):**
 ```powershell
-curl.exe -X POST "http://<server-ip>:8000/part-classification/predict?top_k=5" `
-    -F "file=@C:\path\to\model.stp"
+curl.exe -X POST "http://127.0.0.1:8000/part-classification/predict?top_k=5" -F "file=@C:\path\to\model.stp"
 ```
 
 **Linux:**
 ```bash
-curl -X POST "http://<server-ip>:8000/part-classification/predict?top_k=5" \
-    -F "file=@/path/to/model.stp"
+curl -X POST "http://127.0.0.1:8000/part-classification/predict?top_k=5" -F "file=@/path/to/model.stp"
 ```
 
 **Reuse an uploaded file by `file_id`:**
 ```powershell
 # Windows
-curl.exe -X POST "http://<server-ip>:8000/part-classification/predict?file_id=<file_id>&top_k=5"
+curl.exe -X POST "http://127.0.0.1:8000/part-classification/predict?file_id=<file_id>&top_k=5"
 ```
 ```bash
 # Linux
-curl -X POST "http://<server-ip>:8000/part-classification/predict?file_id=<file_id>&top_k=5"
+curl -X POST "http://127.0.0.1:8000/part-classification/predict?file_id=<file_id>&top_k=5"
 ```
 
 **Response:**
@@ -1218,9 +1097,15 @@ Returns the full 45-class label dictionary.
 GET /part-classification/labels
 ```
 
-**Windows (PowerShell):** `curl.exe "http://<server-ip>:8000/part-classification/labels"`
+**Windows (PowerShell):**
+```powershell
+curl.exe "http://127.0.0.1:8000/part-classification/labels"
+```
 
-**Linux:** `curl "http://<server-ip>:8000/part-classification/labels"`
+**Linux:**
+```bash
+curl "http://127.0.0.1:8000/part-classification/labels"
+```
 
 #### Dataset table of contents
 
@@ -1228,9 +1113,15 @@ GET /part-classification/labels
 GET /part-classification/dataset/table-of-contents
 ```
 
-**Windows (PowerShell):** `curl.exe "http://<server-ip>:8000/part-classification/dataset/table-of-contents"`
+**Windows (PowerShell):**
+```powershell
+curl.exe "http://127.0.0.1:8000/part-classification/dataset/table-of-contents"
+```
 
-**Linux:** `curl "http://<server-ip>:8000/part-classification/dataset/table-of-contents"`
+**Linux:**
+```bash
+curl "http://127.0.0.1:8000/part-classification/dataset/table-of-contents"
+```
 
 #### Per-class file count distribution
 
@@ -1238,9 +1129,15 @@ GET /part-classification/dataset/table-of-contents
 GET /part-classification/dataset/label-distribution
 ```
 
-**Windows (PowerShell):** `curl.exe "http://<server-ip>:8000/part-classification/dataset/label-distribution"`
+**Windows (PowerShell):**
+```powershell
+curl.exe "http://127.0.0.1:8000/part-classification/dataset/label-distribution"
+```
 
-**Linux:** `curl "http://<server-ip>:8000/part-classification/dataset/label-distribution"`
+**Linux:**
+```bash
+curl "http://127.0.0.1:8000/part-classification/dataset/label-distribution"
+```
 
 **Response:**
 ```json
@@ -1261,9 +1158,15 @@ Returns the file IDs in the dataset that belong to a specific class.
 GET /part-classification/dataset/files?label_id=<0-44>
 ```
 
-**Windows (PowerShell):** `curl.exe "http://<server-ip>:8000/part-classification/dataset/files?label_id=30"`
+**Windows (PowerShell):**
+```powershell
+curl.exe "http://127.0.0.1:8000/part-classification/dataset/files?label_id=30"
+```
 
-**Linux:** `curl "http://<server-ip>:8000/part-classification/dataset/files?label_id=30"`
+**Linux:**
+```bash
+curl "http://127.0.0.1:8000/part-classification/dataset/files?label_id=30"
+```
 
 #### Dataset thumbnail preview
 
@@ -1275,12 +1178,12 @@ GET /part-classification/dataset/preview?label_id=<0-44>&k=25&grid_cols=8
 
 **Windows (PowerShell):**
 ```powershell
-curl.exe "http://<server-ip>:8000/part-classification/dataset/preview?label_id=30&k=25"
+curl.exe "http://127.0.0.1:8000/part-classification/dataset/preview?label_id=30&k=25"
 ```
 
 **Linux:**
 ```bash
-curl "http://<server-ip>:8000/part-classification/dataset/preview?label_id=30&k=25"
+curl "http://127.0.0.1:8000/part-classification/dataset/preview?label_id=30&k=25"
 ```
 
 **Response:**
@@ -1289,7 +1192,7 @@ curl "http://<server-ip>:8000/part-classification/dataset/preview?label_id=30&k=
 {
   "label_id": 30,
   "part_name": "Gears",
-  "image_url": "http://<server-ip>:8000/out/<uuid>.png"
+  "image_url": "http://127.0.0.1:8000/out/<uuid>.png"
 }
 ```
 

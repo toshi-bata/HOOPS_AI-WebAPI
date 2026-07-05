@@ -510,7 +510,8 @@ def _build_search_grid_image(
         return None
 
 
-
+def get_MFR_dataset_explorer():
+    global MFR_dataset_explorer
     if MFR_dataset_explorer is None:
         MFR_dataset_explorer = create_MFR_dataset_explorer()
     return MFR_dataset_explorer
@@ -1739,19 +1740,18 @@ def create_CAD_viewer(cad_file_path: pathlib.Path, session_id: Optional[str] = N
     CAD_VIEWER_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     file_key = str(cad_file_path.resolve())
 
-    # Reuse existing SCS only when a stable session_id is provided and the file was
-    # already converted for that session.  Without a session_id every call is treated
-    # as a fresh request so different clients never share the same SCS file.
+    # Always track under a session key (fall back to "" when no session ID is provided)
+    # so that terminate_CAD_viewer can find and delete the files.
+    # Reuse existing SCS only when a stable session_id is provided.
+    track_key = session_id or ""
+    session_viewers = CAD_viewers.setdefault(track_key, {})
     if session_id:
-        session_viewers = CAD_viewers.setdefault(session_id, {})
         existing = session_viewers.get(file_key)
         if existing:
             scs_path = CAD_VIEWER_OUTPUT_DIR / existing["scs_filename"]
             if scs_path.exists():
                 png_url = f"/out/{existing['png_filename']}" if existing.get("png_filename") else None
                 return {"viewer_url": f"/CAD/viewer/show?scs={scs_path.name}", "image_url": png_url, "_scs_filename": scs_path.name}
-    else:
-        session_viewers = None
 
     # Always generate a UUID-based SCS filename so that different clients (or
     # different sessions) never collide even when opening the same source file.
@@ -1773,8 +1773,7 @@ def create_CAD_viewer(cad_file_path: pathlib.Path, session_id: Optional[str] = N
     png_path = pathlib.Path(png_path) if png_path else None
 
     png_filename = png_path.name if png_path and png_path.exists() else None
-    if session_viewers is not None:
-        session_viewers[file_key] = {"scs_filename": scs_path.name, "png_filename": png_filename}
+    session_viewers[file_key] = {"scs_filename": scs_path.name, "png_filename": png_filename}
 
     png_url = f"/out/{png_filename}" if png_filename else None
     return {"viewer_url": f"/CAD/viewer/show?scs={scs_path.name}", "image_url": png_url, "_scs_filename": scs_path.name}
@@ -1782,17 +1781,31 @@ def create_CAD_viewer(cad_file_path: pathlib.Path, session_id: Optional[str] = N
 
 def terminate_CAD_viewer(session_id: Optional[str] = None, terminate_all: bool = False) -> dict[str, Any]:
     session_viewers = CAD_viewers.get(session_id or "", {})
-    if not session_viewers:
-        raise RuntimeError("No active CAD viewer.")
+
+    def _delete_viewer_files(info: dict) -> None:
+        for key in ("scs_filename", "png_filename"):
+            fname = info.get(key)
+            if fname:
+                fpath = CAD_VIEWER_OUTPUT_DIR / fname
+                fpath.unlink(missing_ok=True)
+        scs = info.get("scs_filename")
+        if scs:
+            CAD_face_colors.pop(scs, None)
 
     if terminate_all:
         count = len(session_viewers)
+        for info in session_viewers.values():
+            _delete_viewer_files(info)
         session_viewers.clear()
         return {"terminated": count}
-    else:
-        file_key = next(reversed(session_viewers))
-        del session_viewers[file_key]
-        return {"terminated": 1}
+
+    if not session_viewers:
+        raise RuntimeError("No active CAD viewer.")
+
+    file_key = next(reversed(session_viewers))
+    _delete_viewer_files(session_viewers[file_key])
+    del session_viewers[file_key]
+    return {"terminated": 1}
 
 
 def build_brep_adjacency_graph(cad_file_path: pathlib.Path) -> dict[str, Any]:
