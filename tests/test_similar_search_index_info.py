@@ -46,7 +46,7 @@ class SimilarSearchIndexInfoTests(unittest.TestCase):
         self.assertIsNone(result["metadata"])
 
     def test_not_loaded_includes_index_path_from_env(self):
-        """Even when not loaded, index_path is populated from env vars."""
+        """Even when not loaded, index_path is populated from env vars (internal use)."""
         import core
 
         env = {
@@ -247,6 +247,7 @@ class SimilarSearchIndexInfoTests(unittest.TestCase):
         self.assertEqual(body["model_name"], "hoops_embeddings_model")
         self.assertEqual(body["embedding_dim"], 512)
         self.assertEqual(body["metadata"]["failed_count"], 0)
+        self.assertNotIn("index_path", body)
 
 
 if __name__ == "__main__":

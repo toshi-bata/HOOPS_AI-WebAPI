@@ -1,11 +1,14 @@
 import ast
+import datetime
 import hashlib
 import io
 import logging
 import os
 import pathlib
+import re
 import shutil
 import ssl
+import threading
 import uuid
 from contextlib import redirect_stdout
 from typing import Any, Optional
@@ -18,6 +21,14 @@ APP_ROOT = pathlib.Path(__file__).resolve().parent
 ENV_FILE_PATH = pathlib.Path(__file__).with_name(".env")
 CAD_UPLOAD_DIR = APP_ROOT.joinpath("uploads")
 CAD_VIEWER_OUTPUT_DIR = APP_ROOT.joinpath("out")
+EMBEDDINGS_CACHE_DIR = APP_ROOT.joinpath("embeddings_cache")
+INDEXES_DIR = APP_ROOT.joinpath("indexes")
+
+# Allowed CAD file extensions for upload/ZIP extraction
+CAD_ALLOWED_EXTENSIONS = frozenset({
+    ".step", ".stp", ".iges", ".igs", ".x_t", ".x_b",
+    ".sat", ".ipt", ".prt", ".sldprt", ".catpart",
+})
 MFR_LABELS_DESCRIPTION_ENV_NAMES = ("HOOPS_AI_MFR_LABELS_DESCRIPTION", "labels_description")
 
 MFR_dataset_explorer = None
@@ -28,6 +39,475 @@ cad_searcher = None
 shape_index = None
 PART_CLASS_inference_model = None
 PART_CLASS_dataset_explorer = None
+_embedder = None
+_embedding_memory_cache: dict[str, dict] = {}  # cache_key -> embedding entry
+
+# ---------------------------------------------------------------------------
+# Named index registry (incremental index management)
+# ---------------------------------------------------------------------------
+
+# SDK verification notes (verified against hoops_ai.ml.embeddings):
+#   - FaissVectorStore.load(path) is a CLASSMETHOD returning a new store instance.
+#     Calling vs_instance.load(path) does NOT load data into the existing instance.
+#   - upsert() accepts VectorRecord(id, embedding, metadata) where `embedding` must
+#     be an Embedding(values=np.ndarray, model=str, dim=int) object, not a raw array.
+#   - upsert() with a duplicate ID inserts a second entry in the FAISS index;
+#     get_ids() deduplicates IDs but count() reflects raw FAISS entries.
+#     Solution: always delete(id) before upserting an existing ID to avoid duplicates.
+#   - Empty-index query() returns [] without error.
+#   - HOOPSEmbeddings exposes an `embedding_dim` attribute for dimension discovery.
+
+_INDEX_NAME_RE = re.compile(r"^[a-z0-9_-]{1,64}$")
+_RESERVED_INDEX_NAMES = frozenset({"default"})
+
+# name -> FaissVectorStore (in-memory cache, updated on every write)
+_named_indexes: dict[str, Any] = {}
+
+# per-index write lock; also held during searches to prevent torn reads
+_index_locks: dict[str, threading.Lock] = {}
+_index_locks_mutex = threading.Lock()
+
+
+def _get_index_lock(name: str) -> threading.Lock:
+    with _index_locks_mutex:
+        if name not in _index_locks:
+            _index_locks[name] = threading.Lock()
+        return _index_locks[name]
+
+
+def _validate_index_name(name: str) -> None:
+    """Raise ValueError for invalid names, PermissionError for reserved names."""
+    if not _INDEX_NAME_RE.match(name):
+        raise ValueError(
+            f"Invalid index name '{name}'. "
+            r"Must match ^[a-z0-9_-]{1,64}$ (lowercase alphanumerics, hyphens, underscores)."
+        )
+    if name in _RESERVED_INDEX_NAMES:
+        raise PermissionError(
+            f"Index name '{name}' is reserved and cannot be created, modified, or deleted."
+        )
+
+
+def _index_base_path(name: str) -> pathlib.Path:
+    """Base path (no extension) passed to FaissVectorStore.save/load.
+    Generates indexes/{name}/index.faiss and indexes/{name}/index.meta.
+    """
+    return INDEXES_DIR / name / "index"
+
+
+def _index_faiss_path(name: str) -> pathlib.Path:
+    return INDEXES_DIR / name / "index.faiss"
+
+
+def _get_embedder_dim() -> int:
+    """Return the embedding dimension from the lazy-loaded HOOPSEmbeddings model."""
+    embedder = get_embedder()
+    dim = getattr(embedder, "embedding_dim", None)
+    if dim is not None:
+        return int(dim)
+    raise RuntimeError(
+        "Cannot determine embedding dimension from HOOPSEmbeddings. "
+        "Ensure the embeddings model is correctly configured."
+    )
+
+
+def _load_named_index(name: str) -> Any:
+    """Return the in-memory FaissVectorStore for `name`, loading from disk if needed.
+
+    Must be called while holding the per-index lock.
+    Raises KeyError if the index does not exist on disk.
+    """
+    if name in _named_indexes:
+        return _named_indexes[name]
+
+    faiss_file = _index_faiss_path(name)
+    if not faiss_file.exists():
+        raise KeyError(f"Index '{name}' does not exist.")
+
+    from hoops_ai.ml.embeddings import FaissVectorStore
+
+    vs = FaissVectorStore.load(str(_index_base_path(name)))
+    _named_indexes[name] = vs
+    return vs
+
+
+def _save_named_index_atomic(name: str, vs: Any) -> None:
+    """Persist *vs* to disk atomically using temp-file + replace pattern.
+
+    Writes to ``_tmp_{uuid}.faiss`` / ``.meta`` in INDEXES_DIR and then calls
+    ``Path.replace()`` to swap them in place.  replace() is atomic on POSIX and
+    as close to atomic as Windows allows (non-atomic but crash-safe for our use case).
+    """
+    INDEXES_DIR.mkdir(parents=True, exist_ok=True)
+    index_dir = INDEXES_DIR / name
+    index_dir.mkdir(parents=True, exist_ok=True)
+    tmp_base = index_dir / f"_tmp_{uuid.uuid4().hex}"
+    try:
+        vs.save(str(tmp_base))
+        pathlib.Path(str(tmp_base) + ".faiss").replace(_index_faiss_path(name))
+        pathlib.Path(str(tmp_base) + ".meta").replace(INDEXES_DIR / name / "index.meta")
+    except Exception:
+        for suffix in (".faiss", ".meta"):
+            tmp = pathlib.Path(str(tmp_base) + suffix)
+            if tmp.exists():
+                tmp.unlink(missing_ok=True)
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Named index public API
+# ---------------------------------------------------------------------------
+
+
+def create_index(name: str) -> dict[str, Any]:
+    """Create a new empty named index.
+
+    Raises ValueError for invalid names, PermissionError for reserved names,
+    and FileExistsError if an index with that name already exists.
+    """
+    _validate_index_name(name)
+    lock = _get_index_lock(name)
+    with lock:
+        if _index_faiss_path(name).exists():
+            raise FileExistsError(f"Index '{name}' already exists.")
+
+        from hoops_ai.ml.embeddings import FaissVectorStore
+
+        dim = _get_embedder_dim()
+        vs = FaissVectorStore(dim)
+        _save_named_index_atomic(name, vs)
+        _named_indexes[name] = vs
+        return {"name": name, "count": 0, "dim": dim}
+
+
+def list_indexes() -> list[dict[str, Any]]:
+    """Return metadata for all known indexes, including the read-only ``default`` index."""
+    result: list[dict[str, Any]] = []
+
+    # "default" index – read-only, backed by the env-configured FAISS file
+    load_env_file()
+    faiss_name = os.environ.get("HOOPS_AI_FAISS_INDEX_PATH")
+    if faiss_name:
+        notebooks_dir_str = os.environ.get("HOOPS_AI_NOTEBOOK_DIR")
+        if notebooks_dir_str:
+            default_path = pathlib.Path(notebooks_dir_str) / faiss_name
+            last_modified: Optional[str] = None
+            if default_path.exists():
+                mtime = default_path.stat().st_mtime
+                last_modified = (
+                    datetime.datetime.fromtimestamp(mtime, tz=datetime.timezone.utc)
+                    .strftime("%Y-%m-%dT%H:%M:%SZ")
+                )
+            default_count: Optional[int] = None
+            if shape_index is not None:
+                ids = getattr(shape_index, "ids", None)
+                if ids is not None:
+                    try:
+                        default_count = int(len(ids))
+                    except (TypeError, ValueError):
+                        pass
+            result.append(
+                {
+                    "name": "default",
+                    "count": default_count,
+                    "last_modified": last_modified,
+                    "is_readonly": True,
+                }
+            )
+
+    # Named indexes from INDEXES_DIR — each lives in its own subdirectory
+    if INDEXES_DIR.exists():
+        for faiss_file in sorted(INDEXES_DIR.glob("*/index.faiss")):
+            idx_name = faiss_file.parent.name
+            last_modified_idx: Optional[str] = None
+            mtime = faiss_file.stat().st_mtime
+            last_modified_idx = (
+                datetime.datetime.fromtimestamp(mtime, tz=datetime.timezone.utc)
+                .strftime("%Y-%m-%dT%H:%M:%SZ")
+            )
+            idx_count: Optional[int] = None
+            lock = _get_index_lock(idx_name)
+            with lock:
+                try:
+                    vs = _load_named_index(idx_name)
+                    idx_count = len(vs.get_ids())
+                except Exception:
+                    pass
+            result.append(
+                {
+                    "name": idx_name,
+                    "count": idx_count,
+                    "last_modified": last_modified_idx,
+                    "is_readonly": False,
+                }
+            )
+
+    return result
+
+
+def add_to_index(name: str, file_ids: list[str]) -> dict[str, Any]:
+    """Compute embeddings for *file_ids* and upsert them into the named index.
+
+    Re-uses the ``compute_embedding()`` disk cache.  Re-inserting the same
+    file_id overwrites the existing entry (delete-then-upsert to avoid FAISS
+    duplicate entries).
+
+    Returns ``added``, ``updated``, ``index_count``, and per-file ``errors``.
+    """
+    _validate_index_name(name)
+    lock = _get_index_lock(name)
+    with lock:
+        vs = _load_named_index(name)
+
+        from hoops_ai.ml.embeddings import Embedding, FaissVectorStore, VectorRecord
+
+        existing_ids: set[str] = set(vs.get_ids())
+        added = 0
+        updated = 0
+        errors: list[dict[str, Any]] = []
+
+        for fid in file_ids:
+            try:
+                emb_result = compute_embedding(fid)
+                v = emb_result["vector"]
+                emb_obj = Embedding(values=v, model=emb_result["model_name"], dim=emb_result["dim"])
+                meta = {
+                    "file_id": fid,
+                    "filename": emb_result["filename"],
+                    "registered_at": datetime.datetime.now(datetime.timezone.utc).strftime(
+                        "%Y-%m-%dT%H:%M:%SZ"
+                    ),
+                }
+                rec = VectorRecord(id=fid, embedding=emb_obj, metadata=meta)
+
+                if fid in existing_ids:
+                    # delete first to prevent FAISS duplicate entries on re-insert
+                    vs.delete([fid])
+                    updated += 1
+                else:
+                    added += 1
+                    existing_ids.add(fid)
+
+                vs.upsert([rec])
+            except Exception as exc:
+                errors.append({"file_id": fid, "detail": str(exc)})
+
+        _save_named_index_atomic(name, vs)
+        result = {
+            "name": name,
+            "added": added,
+            "updated": updated,
+            "index_count": len(vs.get_ids()),
+            "errors": errors,
+        }
+
+    # Generate thumbnails outside the lock (non-fatal, can be slow)
+    for fid in [f for f in file_ids if f not in [e["file_id"] for e in errors]]:
+        _generate_part_thumbnail(fid, name)
+
+    return result
+
+
+def remove_from_index(name: str, part_ids: list[str]) -> dict[str, Any]:
+    """Delete *part_ids* from the named index, persist, and remove their thumbnails."""
+    _validate_index_name(name)
+    lock = _get_index_lock(name)
+    with lock:
+        vs = _load_named_index(name)
+        vs.delete(part_ids)
+        _save_named_index_atomic(name, vs)
+
+    # Remove thumbnails outside the lock (non-fatal)
+    thumb_dir = _index_thumbnails_dir(name)
+    for pid in part_ids:
+        png = thumb_dir / f"{pid}.png"
+        png.unlink(missing_ok=True)
+
+    return {"name": name, "removed": len(part_ids), "index_count": len(vs.get_ids())}
+
+
+def search_index(name: str, file_id: str, top_k: int) -> dict[str, Any]:
+    """Search the named index for the top-k most similar parts to *file_id*.
+
+    Returns an empty hits list (and no image_url) when the index has no entries.
+    Generates a result-grid PNG in out/ and returns its relative URL as ``image_url``.
+    """
+    _validate_index_name(name)
+    lock = _get_index_lock(name)
+
+    # Phase 1: vector store operations (locked)
+    with lock:
+        vs = _load_named_index(name)
+        if len(vs.get_ids()) == 0:
+            return {"hits": [], "count": 0, "image_url": None}
+        emb_result = compute_embedding(file_id)
+        raw_hits = vs.query(emb_result["vector"], top_k=top_k)
+
+    hit_dicts = [
+        {"id": h.id, "score": round(float(h.score), 6), "metadata": h.metadata}
+        for h in raw_hits
+    ]
+
+    # Phase 2: thumbnail + grid generation (outside lock, non-fatal)
+    _generate_part_thumbnail(file_id, name)
+    image_url = _build_search_grid_image(file_id, hit_dicts, name) if hit_dicts else None
+
+    return {"hits": hit_dicts, "count": len(hit_dicts), "image_url": image_url}
+
+
+def delete_index(name: str) -> dict[str, Any]:
+    """Delete the named index, its on-disk FAISS files, and all stored thumbnails.
+
+    Raises PermissionError for reserved names, KeyError if the index does not exist.
+    """
+    _validate_index_name(name)
+    lock = _get_index_lock(name)
+    with lock:
+        faiss_file = _index_faiss_path(name)
+        if not faiss_file.exists():
+            raise KeyError(f"Index '{name}' does not exist.")
+        _named_indexes.pop(name, None)
+
+    # Remove the entire index directory (faiss + meta + thumbnails)
+    index_dir = INDEXES_DIR / name
+    if index_dir.exists():
+        shutil.rmtree(index_dir, ignore_errors=True)
+
+    return {"name": name, "deleted": True}
+
+
+def _index_thumbnails_dir(name: str) -> pathlib.Path:
+    """Return the per-index thumbnail image directory path."""
+    return INDEXES_DIR / name / "thumbnails"
+
+
+def _generate_part_thumbnail(file_id: str, index_name: str) -> Optional[pathlib.Path]:
+    """Render a CAD part as a white-background PNG and store it in the index thumbnails dir.
+
+    Idempotent: skips generation when the PNG already exists.
+    Non-fatal: returns None on any failure so callers are never interrupted.
+    The SCS intermediate file is deleted after the PNG is extracted.
+    """
+    thumb_dir = _index_thumbnails_dir(index_name)
+    dest_png = thumb_dir / f"{file_id}.png"
+
+    if dest_png.exists():
+        return dest_png
+
+    try:
+        from hoops_ai.cadaccess import HOOPSLoader, HOOPSTools
+
+        cad_path = find_persistent_CAD_file(file_id)
+        thumb_dir.mkdir(parents=True, exist_ok=True)
+
+        # exportStreamCache writes {stem}.scs and {stem}.png next to the given filename.
+        tmp_scs = thumb_dir / f"_tmp_{uuid.uuid4().hex}.scs"
+        cad_loader = HOOPSLoader()
+        model = cad_loader.create_from_file(str(cad_path))
+        tools = HOOPSTools()
+        png_result, scs_result = tools.exportStreamCache(
+            model,
+            filename=str(tmp_scs),
+            is_white_background=True,
+            overwrite=True,
+        )
+
+        # Move the generated PNG to the final destination
+        png_file = pathlib.Path(png_result) if png_result else None
+        if png_file and png_file.exists():
+            png_file.replace(dest_png)
+
+        # Remove the SCS file — we only need the PNG for thumbnails
+        for p_str in (scs_result, str(tmp_scs)):
+            if p_str:
+                p = pathlib.Path(p_str)
+                if p.exists():
+                    p.unlink(missing_ok=True)
+
+        return dest_png if dest_png.exists() else None
+    except Exception:
+        return None
+
+
+def _build_search_grid_image(
+    query_file_id: str,
+    hits: list[dict[str, Any]],
+    index_name: str,
+) -> Optional[str]:
+    """Generate a matplotlib result-grid PNG (query + top-k hits) and save to out/.
+
+    Returns a ``/out/{uuid}.png`` relative URL, or None on failure.
+    Thumbnails are looked up from the index thumbnails directory.
+    """
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.image as mpimg
+        import matplotlib.pyplot as plt
+
+        thumb_dir = _index_thumbnails_dir(index_name)
+        n_total = len(hits) + 1  # query cell + one cell per hit
+        cols = min(4, n_total)
+        rows = (n_total + cols - 1) // cols
+
+        fig, raw_axes = plt.subplots(rows, cols, figsize=(cols * 3, rows * 3 + 0.4))
+        # Normalise axes to a flat list regardless of shape
+        import numpy as np
+
+        axes: list = list(np.array(raw_axes).flatten())
+
+        def _show_cell(ax, png_path: Optional[pathlib.Path], title: str, subtitle: str = "") -> None:
+            if png_path and png_path.exists():
+                try:
+                    img = mpimg.imread(str(png_path))
+                    ax.imshow(img)
+                except Exception:
+                    ax.set_facecolor("#e8e8e8")
+            else:
+                ax.set_facecolor("#e8e8e8")
+                ax.text(
+                    0.5, 0.5, title, ha="center", va="center",
+                    transform=ax.transAxes, fontsize=7, wrap=True,
+                )
+            ax.set_title(title[:30], fontsize=7, pad=2)
+            if subtitle:
+                ax.set_xlabel(subtitle, fontsize=6, labelpad=2)
+            ax.set_xticks([])
+            ax.set_yticks([])
+
+        # Query cell — look up embedding cache for filename
+        query_name = "query"
+        cached = _embedding_memory_cache.get(f"hoops_embeddings_model__{query_file_id}")
+        if cached:
+            query_name = cached.get("filename", query_file_id[:12])
+        query_thumb = thumb_dir / f"{query_file_id}.png"
+        _show_cell(axes[0], query_thumb, f"Query\n{pathlib.Path(query_name).name}")
+
+        # Hit cells
+        for i, hit in enumerate(hits):
+            if i + 1 >= len(axes):
+                break
+            hit_thumb = thumb_dir / f"{hit['id']}.png"
+            meta = hit.get("metadata") or {}
+            hit_name = pathlib.Path(meta.get("filename", hit["id"][:12])).name
+            _show_cell(axes[i + 1], hit_thumb, hit_name, f"score: {hit['score']:.4f}")
+
+        # Hide surplus axes
+        for i in range(n_total, len(axes)):
+            axes[i].axis("off")
+
+        plt.tight_layout(pad=0.5)
+
+        image_filename = f"{uuid.uuid4()}.png"
+        image_path = CAD_VIEWER_OUTPUT_DIR / image_filename
+        CAD_VIEWER_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        fig.savefig(str(image_path), format="png", bbox_inches="tight", dpi=100)
+        plt.close(fig)
+
+        return f"/out/{image_filename}"
+    except Exception:
+        return None
 
 
 def get_MFR_dataset_explorer():
@@ -517,6 +997,540 @@ def get_similar_search_index_info() -> dict[str, Any]:
     return info
 
 
+# ---------------------------------------------------------------------------
+# Embedding-only helpers (no FAISS index required)
+# ---------------------------------------------------------------------------
+
+
+def get_embedder():
+    """Lazy-initialise HOOPSEmbeddings without loading a FAISS index.
+
+    Safe to call alongside (or after) ``create_cad_searcher()`` — the model
+    registration is guarded so it is never performed twice.
+    """
+    global _embedder
+    if _embedder is not None:
+        return _embedder
+
+    from hoops_ai.ml.embeddings import HOOPSEmbeddings
+
+    load_env_file()
+
+    notebooks_dir = require_path(
+        pathlib.Path(get_required_env("HOOPS_AI_NOTEBOOK_DIR")),
+        env_name="HOOPS_AI_NOTEBOOK_DIR",
+    )
+    ckpt_name = get_required_env("HOOPS_AI_EMBEDDINGS_MODEL_NAME")
+    trained_model = require_path(
+        notebooks_dir.parent.joinpath("packages", "trained_ml_models", ckpt_name),
+        env_name="HOOPS_AI_EMBEDDINGS_MODEL_NAME",
+    )
+
+    try:
+        HOOPSEmbeddings.register_model(
+            model_name="hoops_embeddings_model",
+            checkpoint_path=str(trained_model),
+        )
+    except Exception:
+        pass  # already registered (e.g. by create_cad_searcher)
+
+    _embedder = HOOPSEmbeddings(model="hoops_embeddings_model")
+    return _embedder
+
+
+def _l2_normalize(v):
+    """L2-normalise a 1-D numpy float32 array. Returns a zero vector unchanged."""
+    import numpy as np
+
+    norm = float(np.linalg.norm(v))
+    if norm == 0.0:
+        return v.astype(np.float32)
+    return (v / norm).astype(np.float32)
+
+
+def compute_embedding(file_id: str) -> dict[str, Any]:
+    """Compute (or retrieve from cache) the shape embedding for a CAD file.
+
+    The result vector is a single L2-normalised float32 array representing the
+    whole part.  For multi-body models the per-body vectors are individually
+    L2-normalised, averaged, then re-normalised.
+
+    Returns a dict with keys:
+      ``file_id``, ``vector`` (np.ndarray), ``dim``, ``model_name``,
+      ``num_bodies``, ``filename``, ``cached`` (bool).
+    """
+    import numpy as np
+
+    embedder = get_embedder()
+    model_name = (
+        getattr(embedder, "model_name", None)
+        or getattr(embedder, "model", None)
+        or "hoops_embeddings_model"
+    )
+
+    # Build a filesystem-safe cache key that includes the model name.
+    safe_model = "".join(c if c.isalnum() or c in "-_." else "_" for c in model_name)
+    cache_key = f"{safe_model}__{file_id}"
+
+    # 1. Memory cache (fastest)
+    if cache_key in _embedding_memory_cache:
+        entry = _embedding_memory_cache[cache_key]
+        return {**entry, "cached": True}
+
+    # 2. Disk cache (survives server restart)
+    EMBEDDINGS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    disk_vec_path = EMBEDDINGS_CACHE_DIR / f"{cache_key}.npy"
+    disk_meta_path = EMBEDDINGS_CACHE_DIR / f"{cache_key}.meta.npy"
+
+    if disk_vec_path.exists() and disk_meta_path.exists():
+        try:
+            vector = np.load(str(disk_vec_path))
+            meta = np.load(str(disk_meta_path), allow_pickle=True).item()
+            entry: dict[str, Any] = {
+                "file_id": file_id,
+                "vector": vector,
+                "dim": int(vector.shape[0]),
+                "model_name": model_name,
+                "num_bodies": int(meta.get("num_bodies", 1)),
+                "filename": str(meta.get("filename", "")),
+            }
+            _embedding_memory_cache[cache_key] = entry
+            return {**entry, "cached": True}
+        except Exception:
+            pass  # corrupted cache — fall through to recompute
+
+    # 3. Compute via HOOPS embedder
+    cad_path = find_persistent_CAD_file(file_id)
+    # The stored file name pattern is "{file_id}_{original_filename}".
+    parts = cad_path.name.split("_", 1)
+    filename = parts[1] if len(parts) == 2 and len(parts[0]) == 64 else cad_path.name
+
+    raw_embeddings = embedder.embed_shape(str(cad_path))
+
+    body_vectors: list = []
+    for emb in raw_embeddings:
+        v = getattr(emb, "values", None)
+        if v is None:
+            v = np.array(emb)
+        v = np.array(v, dtype=np.float32).flatten()
+        body_vectors.append(_l2_normalize(v))
+
+    if not body_vectors:
+        raise RuntimeError(f"embed_shape() returned no embeddings for file_id '{file_id}'.")
+
+    if len(body_vectors) == 1:
+        vector = body_vectors[0]
+    else:
+        stacked = np.stack(body_vectors, axis=0)  # (N, D)
+        vector = _l2_normalize(stacked.mean(axis=0))
+
+    num_bodies = len(body_vectors)
+
+    entry = {
+        "file_id": file_id,
+        "vector": vector,
+        "dim": int(vector.shape[0]),
+        "model_name": model_name,
+        "num_bodies": num_bodies,
+        "filename": filename,
+    }
+
+    # Persist to disk (non-fatal on failure)
+    try:
+        np.save(str(disk_vec_path), vector)
+        np.save(str(disk_meta_path), {"num_bodies": num_bodies, "filename": filename})
+    except Exception:
+        pass
+
+    _embedding_memory_cache[cache_key] = entry
+    return {**entry, "cached": False}
+
+
+def compare_embeddings(file_ids: list[str]) -> dict[str, Any]:
+    """Compute an N×N cosine similarity matrix for the given file_ids.
+
+    All embedding vectors are L2-normalised, so cosine similarity equals their
+    dot product.  Diagonal entries are forced to exactly ``1.0``.
+
+    Returns a dict with keys:
+      ``count``, ``model_name``, ``files``, ``matrix`` (N×N list of lists),
+      ``pairs`` (all i<j combos sorted by score descending).
+    """
+    import numpy as np
+
+    embeddings = [compute_embedding(fid) for fid in file_ids]
+    vectors = np.stack([e["vector"] for e in embeddings], axis=0)  # (N, D)
+
+    # Cosine similarity via dot product (vectors are already L2-normalised)
+    raw_matrix = (vectors @ vectors.T).tolist()
+    n = len(embeddings)
+    matrix = [[round(float(raw_matrix[i][j]), 6) for j in range(n)] for i in range(n)]
+    for i in range(n):
+        matrix[i][i] = 1.0  # enforce exact diagonal
+
+    files = [
+        {
+            "index": i,
+            "file_id": e["file_id"],
+            "filename": e["filename"],
+            "num_bodies": e["num_bodies"],
+        }
+        for i, e in enumerate(embeddings)
+    ]
+
+    pairs = [
+        {"a": i, "b": j, "score": matrix[i][j]}
+        for i in range(n)
+        for j in range(i + 1, n)
+    ]
+    pairs.sort(key=lambda p: p["score"], reverse=True)
+
+    model_name = embeddings[0]["model_name"] if embeddings else "hoops_embeddings_model"
+    return {
+        "count": n,
+        "model_name": model_name,
+        "files": files,
+        "matrix": matrix,
+        "pairs": pairs,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Shape Space Map (classical MDS layout of CAD parts)
+# ---------------------------------------------------------------------------
+
+
+def _classical_mds(dist_matrix: "Any") -> tuple:
+    """Classical (Torgerson) multidimensional scaling into 3 dimensions.
+
+    Given an ``N×N`` symmetric distance matrix, returns ``(coords, stress)``
+    where ``coords`` has shape ``(N, 3)`` (mean-centred) and ``stress`` is the
+    Kruskal stress-1 goodness-of-fit value in ``[0, 1]``.
+
+    Implemented with numpy only (no sklearn/scipy).
+    """
+    import numpy as np
+
+    D = np.asarray(dist_matrix, dtype=float)
+    n = D.shape[0]
+
+    # Double-centering: B = -0.5 * H @ D^2 @ H,  H = I - (1/n) * ones
+    H = np.eye(n) - np.ones((n, n)) / n
+    D_squared = D ** 2
+    B = -0.5 * H @ D_squared @ H
+
+    # eigh returns eigenvalues in ascending order → take the largest 3
+    eigenvalues, eigenvectors = np.linalg.eigh(B)
+    eigenvalues = np.maximum(eigenvalues, 0.0)  # clamp negatives to 0
+
+    top_vals = eigenvalues[-3:]
+    top_vecs = eigenvectors[:, -3:]
+    coords = top_vecs @ np.diag(np.sqrt(top_vals))  # (N, up-to-3)
+
+    # Pad to 3 columns when N < 3
+    if coords.shape[1] < 3:
+        pad = np.zeros((n, 3 - coords.shape[1]))
+        coords = np.hstack([coords, pad])
+
+    # Reverse so columns are in descending eigenvalue order
+    coords = coords[:, ::-1]
+
+    # Mean-centre
+    coords = coords - coords.mean(axis=0)
+
+    # Kruskal stress-1 over all i<j pairs
+    iu = np.triu_indices(n, k=1)
+    d_target = D[iu]
+    diff = coords[iu[0]] - coords[iu[1]]
+    d_hat = np.sqrt((diff ** 2).sum(axis=1))
+    denom = float((d_target ** 2).sum())
+    if denom == 0.0:
+        stress = 0.0
+    else:
+        stress = float(np.sqrt(((d_hat - d_target) ** 2).sum() / denom))
+
+    return coords, stress
+
+
+def export_scs_for_part(file_id: str) -> str:
+    """Convert a persistent CAD file to an SCS stream cache and return its filename.
+
+    A thin wrapper around the conversion logic in ``create_CAD_viewer`` — it does
+    NOT touch the per-session viewer cache.  Returns just the SCS filename (served
+    under ``/out/``), not a full path or URL.
+    """
+    from hoops_ai.cadaccess import HOOPSLoader, HOOPSTools
+
+    cad_file_path = find_persistent_CAD_file(file_id)
+    CAD_VIEWER_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    unique_id = uuid.uuid4().hex[:12]
+    scs_name = f"{unique_id}_{cad_file_path.stem}.scs"
+    scs_path = CAD_VIEWER_OUTPUT_DIR / scs_name
+
+    cad_loader = HOOPSLoader()
+    model = cad_loader.create_from_file(str(cad_file_path))
+
+    tools = HOOPSTools()
+    _png_path, scs_path = tools.exportStreamCache(
+        model,
+        filename=str(scs_path),
+        is_white_background=True,
+        overwrite=True,
+    )
+    return pathlib.Path(scs_path).name
+
+
+def compute_shape_map_data(file_ids: list[str]) -> dict[str, Any]:
+    """Compute a 3D "Shape Space Map" layout for a set of CAD parts.
+
+    Steps:
+      1. Compute the N×N cosine-similarity matrix via ``compare_embeddings``.
+      2. Convert each part to an SCS stream cache (failures are non-fatal and
+         collected in ``errors``).
+      3. Lay the parts out in 3D with classical MDS so that similar parts sit
+         closer together (distance ``d_ij = 1 - similarity_ij``).
+      4. Persist the result to ``out/shape_map_{map_id}.json`` and return it.
+    """
+    import json
+
+    import numpy as np
+
+    compare = compare_embeddings(file_ids)
+    matrix = compare["matrix"]
+    files = compare["files"]
+    n = compare["count"]
+
+    sim = np.asarray(matrix, dtype=float)
+    dist = 1.0 - sim
+    np.fill_diagonal(dist, 0.0)
+
+    coords, stress = _classical_mds(dist)
+
+    errors: list[dict] = []
+    parts: list[dict] = []
+    for i, finfo in enumerate(files):
+        fid = finfo["file_id"]
+        filename = finfo["filename"]
+        scs_url = None
+        try:
+            scs_filename = export_scs_for_part(fid)
+            scs_url = f"/out/{scs_filename}"
+        except Exception as exc:  # SCS conversion failure is non-fatal
+            errors.append({"filename": filename, "detail": str(exc)})
+
+        parts.append(
+            {
+                "index": i,
+                "file_id": fid,
+                "filename": filename,
+                "scs_url": scs_url,
+                "position": [
+                    float(coords[i, 0]),
+                    float(coords[i, 1]),
+                    float(coords[i, 2]),
+                ],
+            }
+        )
+
+    map_id = uuid.uuid4().hex[:8]
+    result = {
+        "map_id": map_id,
+        "viewer_url": f"/similarity/map/show?map={map_id}",
+        "count": n,
+        "parts": parts,
+        "matrix": matrix,
+        "stress": float(stress),
+        "errors": errors,
+    }
+
+    CAD_VIEWER_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = CAD_VIEWER_OUTPUT_DIR / f"shape_map_{map_id}.json"
+    with open(out_path, "w", encoding="utf-8") as fh:
+        json.dump(result, fh)
+
+    return result
+
+
+def _project_oos_mds(
+    coords: "Any",
+    dist_matrix: "Any",
+    query_dist: "Any",
+) -> "Any":
+    """Project a new point into an existing classical-MDS coordinate space.
+
+    Uses the out-of-sample extension formula (Bengio et al., 2004).  Given the
+    ``N×3`` coordinate matrix ``coords`` (mean-centred) and the ``N×N`` distance
+    matrix ``dist_matrix`` used to produce it, place the new point whose
+    distances to the N existing points are ``query_dist`` (length-N array) into
+    the same space.
+
+    Returns a length-3 numpy array.  Falls back gracefully when N < 3 or the
+    system is rank-deficient.
+    """
+    import numpy as np
+
+    coords = np.asarray(coords, dtype=float)
+    dist_matrix = np.asarray(dist_matrix, dtype=float)
+    query_dist = np.asarray(query_dist, dtype=float)
+
+    n = coords.shape[0]
+    if n == 0:
+        return np.zeros(3)
+
+    d_sq = dist_matrix ** 2
+    d_q_sq = query_dist ** 2
+
+    # Row/column means of D² (symmetric, so equal)
+    row_means = d_sq.mean(axis=0)      # (N,) — (1/N) Σ_i D²_ij for each j
+    grand_mean = float(d_sq.mean())
+    q_mean = float(d_q_sq.mean())
+
+    # Out-of-sample centering: b_j = <x_query, x_j> approximation
+    b = -0.5 * (d_q_sq - q_mean - row_means + grand_mean)  # (N,)
+
+    # Solve coords @ x_query ≈ b  (least-squares, handles rank-deficiency)
+    x_q, _, _, _ = np.linalg.lstsq(coords, b, rcond=None)
+
+    # Ensure output is exactly length 3
+    result = np.zeros(3)
+    result[: len(x_q)] = x_q[:3]
+    return result
+
+
+def query_shape_map(map_id: str, query_file_id: str, persist: bool = False) -> dict[str, Any]:
+    """Overlay a query CAD part on an existing shape-space map.
+
+    Steps:
+      1. Load the persisted map JSON for *map_id*.
+      2. Compute the query part's shape embedding.
+      3. Compute cosine similarities between the query and every existing part.
+      4. Project the query into the existing 3D coordinate space via the
+         out-of-sample MDS extension formula.
+      5. Export an SCS stream cache for the query part (non-fatal on failure).
+      6. Save a new *overlay* map JSON (``shape_map_{overlay_id}.json``) that
+         contains all original parts plus the query part tagged with
+         ``is_query=True`` for magenta highlighting in the viewer.
+      7. Optionally persist the query part into the original map JSON when
+         *persist* is ``True``.
+
+    Returns a dict with keys: ``overlay_map_id``, ``viewer_url``,
+    ``query_part``, ``nearest_parts`` (top-5), ``persisted``, ``errors``.
+
+    Raises:
+      ``KeyError``    – map *map_id* does not exist.
+      ``RuntimeError``– embedding computation fails for the query part.
+    """
+    import json
+
+    import numpy as np
+
+    map_path = CAD_VIEWER_OUTPUT_DIR / f"shape_map_{map_id}.json"
+    if not map_path.exists():
+        raise KeyError(f"Shape map '{map_id}' not found.")
+
+    with open(map_path, encoding="utf-8") as fh:
+        map_data = json.load(fh)
+
+    existing_parts: list[dict] = map_data["parts"]
+    existing_matrix: list[list[float]] = map_data["matrix"]
+    n = len(existing_parts)
+
+    # Compute query embedding (raises on failure — let caller handle)
+    query_emb = compute_embedding(query_file_id)
+    query_vec = query_emb["vector"]
+    query_filename = query_emb["filename"]
+
+    # Cosine similarities: query vs. each existing part (vectors are L2-normalised)
+    query_sims: list[float] = []
+    for part in existing_parts:
+        part_emb = compute_embedding(part["file_id"])
+        sim = float(np.dot(query_vec, part_emb["vector"]))
+        query_sims.append(round(sim, 6))
+
+    # Project query into existing coordinate space via out-of-sample MDS
+    coords = np.array([p["position"] for p in existing_parts], dtype=float)  # (N, 3)
+    sim_mat = np.array(existing_matrix, dtype=float)
+    dist_mat = 1.0 - sim_mat
+    np.fill_diagonal(dist_mat, 0.0)
+    query_dist = 1.0 - np.array(query_sims)
+    query_pos = _project_oos_mds(coords, dist_mat, query_dist)
+
+    # Export SCS for the query part (non-fatal)
+    errors: list[dict] = []
+    query_scs_url: Optional[str] = None
+    try:
+        scs_name = export_scs_for_part(query_file_id)
+        query_scs_url = f"/out/{scs_name}"
+    except Exception as exc:
+        errors.append({"filename": query_filename, "detail": str(exc)})
+
+    query_part_info: dict[str, Any] = {
+        "index": n,
+        "file_id": query_file_id,
+        "filename": query_filename,
+        "scs_url": query_scs_url,
+        "position": [float(query_pos[0]), float(query_pos[1]), float(query_pos[2])],
+        "is_query": True,
+    }
+
+    # Build (N+1)×(N+1) extended similarity matrix
+    ext_matrix = [row + [query_sims[i]] for i, row in enumerate(existing_matrix)]
+    ext_matrix.append(query_sims + [1.0])
+
+    # Save overlay map JSON (new map_id so the original is untouched)
+    overlay_map_id = uuid.uuid4().hex[:8]
+    overlay = {
+        "map_id": overlay_map_id,
+        "viewer_url": f"/similarity/map/show?map={overlay_map_id}",
+        "count": n + 1,
+        "parts": list(existing_parts) + [query_part_info],
+        "matrix": ext_matrix,
+        "stress": map_data.get("stress", 0.0),
+        "errors": errors,
+        "base_map_id": map_id,
+        "query_file_id": query_file_id,
+    }
+    CAD_VIEWER_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    overlay_path = CAD_VIEWER_OUTPUT_DIR / f"shape_map_{overlay_map_id}.json"
+    with open(overlay_path, "w", encoding="utf-8") as fh:
+        json.dump(overlay, fh)
+
+    # Optional: persist query part into the original map
+    if persist:
+        existing_ids = {p["file_id"] for p in existing_parts}
+        if query_file_id not in existing_ids:
+            map_data["parts"].append(query_part_info)
+            map_data["matrix"] = ext_matrix
+            map_data["count"] = n + 1
+            with open(map_path, "w", encoding="utf-8") as fh:
+                json.dump(map_data, fh)
+
+    # Top-5 nearest existing parts by similarity
+    nearest_parts = sorted(
+        [
+            {
+                "index": i,
+                "file_id": existing_parts[i]["file_id"],
+                "filename": existing_parts[i]["filename"],
+                "score": query_sims[i],
+            }
+            for i in range(n)
+        ],
+        key=lambda x: x["score"],
+        reverse=True,
+    )[:5]
+
+    return {
+        "overlay_map_id": overlay_map_id,
+        "viewer_url": f"/similarity/map/show?map={overlay_map_id}",
+        "query_part": query_part_info,
+        "nearest_parts": nearest_parts,
+        "persisted": persist,
+        "errors": errors,
+    }
+
+
 def search_MFR_files(feature_name: str) -> dict[str, Any]:
     explorer = get_MFR_dataset_explorer()
 
@@ -726,19 +1740,18 @@ def create_CAD_viewer(cad_file_path: pathlib.Path, session_id: Optional[str] = N
     CAD_VIEWER_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     file_key = str(cad_file_path.resolve())
 
-    # Reuse existing SCS only when a stable session_id is provided and the file was
-    # already converted for that session.  Without a session_id every call is treated
-    # as a fresh request so different clients never share the same SCS file.
+    # Always track under a session key (fall back to "" when no session ID is provided)
+    # so that terminate_CAD_viewer can find and delete the files.
+    # Reuse existing SCS only when a stable session_id is provided.
+    track_key = session_id or ""
+    session_viewers = CAD_viewers.setdefault(track_key, {})
     if session_id:
-        session_viewers = CAD_viewers.setdefault(session_id, {})
         existing = session_viewers.get(file_key)
         if existing:
             scs_path = CAD_VIEWER_OUTPUT_DIR / existing["scs_filename"]
             if scs_path.exists():
                 png_url = f"/out/{existing['png_filename']}" if existing.get("png_filename") else None
                 return {"viewer_url": f"/CAD/viewer/show?scs={scs_path.name}", "image_url": png_url, "_scs_filename": scs_path.name}
-    else:
-        session_viewers = None
 
     # Always generate a UUID-based SCS filename so that different clients (or
     # different sessions) never collide even when opening the same source file.
@@ -760,8 +1773,7 @@ def create_CAD_viewer(cad_file_path: pathlib.Path, session_id: Optional[str] = N
     png_path = pathlib.Path(png_path) if png_path else None
 
     png_filename = png_path.name if png_path and png_path.exists() else None
-    if session_viewers is not None:
-        session_viewers[file_key] = {"scs_filename": scs_path.name, "png_filename": png_filename}
+    session_viewers[file_key] = {"scs_filename": scs_path.name, "png_filename": png_filename}
 
     png_url = f"/out/{png_filename}" if png_filename else None
     return {"viewer_url": f"/CAD/viewer/show?scs={scs_path.name}", "image_url": png_url, "_scs_filename": scs_path.name}
@@ -769,17 +1781,31 @@ def create_CAD_viewer(cad_file_path: pathlib.Path, session_id: Optional[str] = N
 
 def terminate_CAD_viewer(session_id: Optional[str] = None, terminate_all: bool = False) -> dict[str, Any]:
     session_viewers = CAD_viewers.get(session_id or "", {})
-    if not session_viewers:
-        raise RuntimeError("No active CAD viewer.")
+
+    def _delete_viewer_files(info: dict) -> None:
+        for key in ("scs_filename", "png_filename"):
+            fname = info.get(key)
+            if fname:
+                fpath = CAD_VIEWER_OUTPUT_DIR / fname
+                fpath.unlink(missing_ok=True)
+        scs = info.get("scs_filename")
+        if scs:
+            CAD_face_colors.pop(scs, None)
 
     if terminate_all:
         count = len(session_viewers)
+        for info in session_viewers.values():
+            _delete_viewer_files(info)
         session_viewers.clear()
         return {"terminated": count}
-    else:
-        file_key = next(reversed(session_viewers))
-        del session_viewers[file_key]
-        return {"terminated": 1}
+
+    if not session_viewers:
+        raise RuntimeError("No active CAD viewer.")
+
+    file_key = next(reversed(session_viewers))
+    _delete_viewer_files(session_viewers[file_key])
+    del session_viewers[file_key]
+    return {"terminated": 1}
 
 
 def build_brep_adjacency_graph(cad_file_path: pathlib.Path) -> dict[str, Any]:

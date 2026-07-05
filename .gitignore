@@ -7,3 +7,5 @@ out/
 demo/
 static/hoops-web-viewer-monolith.mjs
 notebooks/
+embeddings_cache/
+indexes/
