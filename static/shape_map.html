@@ -24,7 +24,7 @@
     #panel input[type="range"] { flex: 1; }
     #panel hr { border: none; border-top: 1px solid #eee; margin: 8px 0; }
     #stress { font-size: 12px; color: #555; margin-top: 6px; }
-    #scaleValue { min-width: 42px; text-align: right; font-variant-numeric: tabular-nums; }
+    #scaleValue, #partScaleValue { min-width: 42px; text-align: right; font-variant-numeric: tabular-nums; }
     .toggle-wrap { display: flex; align-items: center; gap: 8px; font-size: 13px; }
     .toggle { position: relative; display: inline-block; width: 34px; height: 18px; flex-shrink: 0; }
     .toggle input { opacity: 0; width: 0; height: 0; }
@@ -64,14 +64,19 @@
   <div id="panel">
     <h1>Shape Space Map</h1>
     <div class="row">
-      <label for="scale">Scale</label>
+      <label for="scale">Spacing</label>
       <input id="scale" type="range" min="0" max="100" value="0" step="1">
       <span id="scaleValue">1.0x</span>
     </div>
     <div class="row">
       <label for="maxMult">Max x</label>
-      <input id="maxMult" type="number" min="2" max="10000" value="100" step="1"
+      <input id="maxMult" type="number" min="2" max="10000" value="200" step="1"
              style="width:70px;padding:2px 4px;font-size:13px;border:1px solid #ccc;border-radius:4px;">
+    </div>
+    <div class="row">
+      <label for="partScale">Part</label>
+      <input id="partScale" type="range" min="0.05" max="2" value="1" step="0.05">
+      <span id="partScaleValue">1.00x</span>
     </div>
     <hr>
     <div class="row toggle-wrap">
@@ -86,10 +91,10 @@
       <label class="toggle"><input id="toggleCluster" type="checkbox" checked><span class="toggle-slider"></span></label>
       <span>Cluster colors</span>
     </div>
-    <div class="row" id="threshRow" style="padding-left:42px;">
-      <label for="edgeThresh" style="font-size:12px;color:#555;">Min sim</label>
-      <input id="edgeThresh" type="range" min="0.5" max="1" value="0.5" step="0.01" style="flex:1;">
-      <span id="edgeThreshValue" style="min-width:32px;text-align:right;font-size:12px;font-variant-numeric:tabular-nums;">0.50</span>
+    <div class="row" id="threshRow">
+      <label for="edgeThresh" style="font-size:12px;color:#555;white-space:nowrap;">Min sim</label>
+      <input id="edgeThresh" type="range" min="0.75" max="1" value="0.75" step="0.01" style="flex:1;">
+      <span id="edgeThreshValue" style="min-width:36px;text-align:right;font-size:12px;font-variant-numeric:tabular-nums;">0.75</span>
     </div>
     <div id="stress">Layout accuracy: -</div>
   </div>
@@ -110,6 +115,8 @@
     const edgeSvg         = document.getElementById('edgeSvg');
     const scaleSlider     = document.getElementById('scale');
     const scaleValueEl    = document.getElementById('scaleValue');
+    const partScaleSlider = document.getElementById('partScale');
+    const partScaleValueEl = document.getElementById('partScaleValue');
     const stressEl        = document.getElementById('stress');
     const maxMultInput    = document.getElementById('maxMult');
     const toggleLabels    = document.getElementById('toggleLabels');
@@ -142,6 +149,7 @@
     const partState = [];
     let baseScale = 1;
     let currentScale = 1;
+    let currentPartScale = 1.0;
     let showLabels  = false;
     let showEdges   = true;
     let showCluster = true;
@@ -213,9 +221,18 @@
       for (const st of partState) {
         if (st.nodeId == null) continue;
         const p = st.position, c = st.center;
+        const s = currentPartScale;
+        // transform(x) = s*(x - c) + p*spacing  →  translate = p*spacing - s*c
+        const tx = p[0]*currentScale - s*c[0];
+        const ty = p[1]*currentScale - s*c[1];
+        const tz = p[2]*currentScale - s*c[2];
         try {
           const m = new Matrix();
-          m.setTranslationComponent(p[0]*currentScale - c[0], p[1]*currentScale - c[1], p[2]*currentScale - c[2]);
+          // Set uniform scale on diagonal (HOOPS Matrix: row-major flat array .m[16])
+          if (m.m && m.m.length === 16) {
+            m.m[0] = s; m.m[5] = s; m.m[10] = s;
+          }
+          m.setTranslationComponent(tx, ty, tz);
           hwv.model.setNodeMatrix(st.nodeId, m, true);
         } catch(e) {}
       }
@@ -304,13 +321,25 @@
       scaleSlider.min = 0; scaleSlider.max = 100; scaleSlider.value = 0;
       updateScaleLabel();
       function applySlider() {
-        const mult = Math.max(2, parseInt(maxMultInput.value) || 100);
+        const mult = Math.max(2, parseInt(maxMultInput.value) || 200);
         currentScale = baseScale * (1 + parseFloat(scaleSlider.value)/100 * (mult-1));
         updateScaleLabel();
         applyPositions();
       }
       scaleSlider.addEventListener('input', applySlider);
       maxMultInput.addEventListener('change', applySlider);
+
+      partScaleSlider.value = 1;
+      updatePartScaleLabel();
+      partScaleSlider.addEventListener('input', () => {
+        currentPartScale = parseFloat(partScaleSlider.value);
+        updatePartScaleLabel();
+        applyPositions();
+      });
+    }
+
+    function updatePartScaleLabel() {
+      partScaleValueEl.textContent = currentPartScale.toFixed(2) + 'x';
     }
 
     function updateScaleLabel() {
