@@ -629,8 +629,166 @@ def similarity_map_query(
 
 
 # ===========================================================================
-# Named index management endpoints
+# Shape map cluster tagging endpoints
 # ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Response schemas – cluster tagging
+# ---------------------------------------------------------------------------
+
+
+class ClusterTagsRequest(BaseModel):
+    tags: dict[str, str]  # {file_id: cluster_tag}
+
+
+class ClusterTagsResponse(BaseModel):
+    map_id: str
+    tagged: int
+
+
+class MapAddToIndexResponse(BaseModel):
+    name: str
+    added: int
+    updated: int
+    index_count: int
+    index_created: bool = False
+    errors: list[dict]
+
+
+class TagListHit(BaseModel):
+    id: str
+    score: float
+    metadata: Optional[dict] = None
+
+
+class TagListResponse(BaseModel):
+    tag: str
+    hits: list[TagListHit]
+    count: int
+    image_url: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# POST /similarity/map/{map_id}/cluster-tags
+# ---------------------------------------------------------------------------
+
+
+@router.post("/map/{map_id}/cluster-tags", response_model=ClusterTagsResponse)
+def save_map_cluster_tags(
+    map_id: str,
+    body: ClusterTagsRequest,
+):
+    """Save cluster tag labels for parts in an existing shape-space map.
+
+    *tags* is a ``{file_id: cluster_tag}`` mapping built by the Shape Space Map
+    viewer when the user names a cluster.  The tags are written into the map
+    JSON so they are preserved when the map is later registered to an index.
+
+    Returns the number of parts whose ``cluster_tag`` field was updated.
+    """
+    try:
+        result = core.save_map_cluster_tags(map_id, body.tags)
+        return ClusterTagsResponse(**result)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to save cluster tags: {exc}") from exc
+
+
+# ---------------------------------------------------------------------------
+# POST /similarity/map/{map_id}/add-to-index
+# ---------------------------------------------------------------------------
+
+
+@router.post("/map/{map_id}/add-to-index", response_model=MapAddToIndexResponse)
+def add_map_parts_to_index(
+    map_id: str,
+    index_name: str = Query(..., description="Name of the target index."),
+):
+    """Register all parts from a shape-space map into a named similarity index.
+
+    Reads ``cluster_tag`` fields previously saved via
+    ``POST /similarity/map/{map_id}/cluster-tags`` and stores them in each
+    part's FAISS metadata (``cluster_tag`` key) and in the per-index
+    ``tags.json`` sidecar so they are retrievable via the list-by-tag endpoint.
+
+    If the named index does not yet exist it is **created automatically**.
+    The response includes ``index_created: true`` when a new index was made.
+
+    * Returns **404** when the map does not exist.
+    * Per-part embedding failures are collected in ``errors`` and do not abort
+      the entire operation.
+    """
+    try:
+        _validate_name_or_raise(index_name)
+    except HTTPException:
+        raise
+
+    try:
+        index_existed = core._index_faiss_path(index_name).exists()
+        result = core.add_map_parts_to_index(map_id, index_name)
+        return MapAddToIndexResponse(
+            **result,
+            index_created=not index_existed,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (core.EnvConfigError, core.PathConfigError):
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to register map parts: {exc}"
+        ) from exc
+
+
+# ---------------------------------------------------------------------------
+# GET /similarity/index/{name}/list-by-tag
+# ---------------------------------------------------------------------------
+
+
+@router.get("/index/{name}/list-by-tag", response_model=TagListResponse)
+def list_parts_by_tag(
+    name: str,
+    request: Request,
+    tag: str = Query(..., description="Cluster tag to filter by (e.g. 'bush', 'flange')."),
+):
+    """List all parts registered in a named index that carry the given cluster tag.
+
+    Uses the per-index ``tags.json`` sidecar for fast lookup — no vector search
+    is performed.  When matches are found a grid-image PNG is generated and its
+    absolute URL is returned as ``image_url``.
+
+    Typical LLM use-case: *"ブッシュの一覧を見せて"* →
+    ``GET /similarity/index/parts/list-by-tag?tag=bush``
+
+    Returns **404** when the index does not exist.
+    """
+    try:
+        _validate_name_or_raise(name)
+    except HTTPException:
+        raise
+
+    try:
+        result = core.list_parts_by_tag(name, tag)
+        image_url = result.get("image_url")
+        if image_url:
+            image_filename = image_url.lstrip("/out/")
+            image_url = str(request.url_for("out", path=image_filename))
+        return TagListResponse(
+            tag=result["tag"],
+            hits=[TagListHit(**h) for h in result["hits"]],
+            count=result["count"],
+            image_url=image_url,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (core.EnvConfigError, core.PathConfigError):
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"List-by-tag failed: {exc}") from exc
+
+
+
 
 # ---------------------------------------------------------------------------
 # Response schemas – index management
@@ -684,9 +842,6 @@ class IndexDeleteResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # POST /similarity/index/create
 # ---------------------------------------------------------------------------
-
-
-@router.post("/index/create", response_model=IndexCreateResponse, status_code=201)
 def create_index(
     name: str = Query(..., description="Name of the new index (^[a-z0-9_-]{1,64}$)."),
 ):

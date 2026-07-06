@@ -245,12 +245,20 @@ def list_indexes() -> list[dict[str, Any]]:
     return result
 
 
-def add_to_index(name: str, file_ids: list[str]) -> dict[str, Any]:
+def add_to_index(
+    name: str,
+    file_ids: list[str],
+    tag_map: Optional[dict[str, str]] = None,
+) -> dict[str, Any]:
     """Compute embeddings for *file_ids* and upsert them into the named index.
 
     Re-uses the ``compute_embedding()`` disk cache.  Re-inserting the same
     file_id overwrites the existing entry (delete-then-upsert to avoid FAISS
     duplicate entries).
+
+    Optional *tag_map* is a ``{file_id: cluster_tag}`` mapping — when provided,
+    ``cluster_tag`` is stored in the FAISS record metadata and in the per-index
+    ``tags.json`` sidecar for fast tag-based retrieval.
 
     Returns ``added``, ``updated``, ``index_count``, and per-file ``errors``.
     """
@@ -271,13 +279,15 @@ def add_to_index(name: str, file_ids: list[str]) -> dict[str, Any]:
                 emb_result = compute_embedding(fid)
                 v = emb_result["vector"]
                 emb_obj = Embedding(values=v, model=emb_result["model_name"], dim=emb_result["dim"])
-                meta = {
+                meta: dict[str, Any] = {
                     "file_id": fid,
                     "filename": emb_result["filename"],
                     "registered_at": datetime.datetime.now(datetime.timezone.utc).strftime(
                         "%Y-%m-%dT%H:%M:%SZ"
                     ),
                 }
+                if tag_map and tag_map.get(fid):
+                    meta["cluster_tag"] = tag_map[fid]
                 rec = VectorRecord(id=fid, embedding=emb_obj, metadata=meta)
 
                 if fid in existing_ids:
@@ -301,11 +311,181 @@ def add_to_index(name: str, file_ids: list[str]) -> dict[str, Any]:
             "errors": errors,
         }
 
+    # Update tags sidecar outside the lock (non-fatal)
+    if tag_map:
+        try:
+            existing_tags = _load_index_tags(name)
+            existing_tags.update({k: v for k, v in tag_map.items() if v})
+            _save_index_tags(name, existing_tags)
+        except Exception:
+            pass
+
     # Generate thumbnails outside the lock (non-fatal, can be slow)
     for fid in [f for f in file_ids if f not in [e["file_id"] for e in errors]]:
         _generate_part_thumbnail(fid, name)
 
     return result
+
+
+def save_map_cluster_tags(map_id: str, tags: dict[str, str]) -> dict[str, Any]:
+    """Write ``cluster_tag`` fields into a shape map JSON.
+
+    *tags* is a ``{file_id: tag_name}`` mapping.  Only parts whose ``file_id``
+    appears in *tags* are updated; other parts are left unchanged.
+
+    Returns ``{"map_id": ..., "tagged": <count of parts updated>}``.
+    Raises ``KeyError`` when the map does not exist.
+    """
+    import json
+
+    map_path = CAD_VIEWER_OUTPUT_DIR / f"shape_map_{map_id}.json"
+    if not map_path.exists():
+        raise KeyError(f"Map '{map_id}' not found.")
+
+    with open(map_path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+
+    applied = 0
+    for part in data.get("parts", []):
+        fid = part.get("file_id", "")
+        if fid in tags:
+            part["cluster_tag"] = tags[fid]
+            applied += 1
+
+    with open(map_path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, ensure_ascii=False)
+
+    return {"map_id": map_id, "tagged": applied}
+
+
+def add_map_parts_to_index(map_id: str, index_name: str) -> dict[str, Any]:
+    """Register all parts from a shape map into a named index.
+
+    Reads the map JSON for ``file_id`` and ``cluster_tag`` fields on each part,
+    then calls ``add_to_index`` so that cluster tags are preserved in the FAISS
+    metadata and the per-index ``tags.json`` sidecar.
+
+    If the named index does not yet exist it is created automatically.
+
+    Raises ``KeyError`` only for an unknown *map_id*.
+    """
+    import json
+
+    map_path = CAD_VIEWER_OUTPUT_DIR / f"shape_map_{map_id}.json"
+    if not map_path.exists():
+        raise KeyError(f"Map '{map_id}' not found.")
+
+    with open(map_path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+
+    parts = [p for p in data.get("parts", []) if p.get("file_id")]
+    file_ids = [p["file_id"] for p in parts]
+    tag_map = {p["file_id"]: p["cluster_tag"] for p in parts if p.get("cluster_tag")}
+
+    # Auto-create the index if it doesn't exist yet
+    if not _index_faiss_path(index_name).exists():
+        create_index(index_name)
+
+    return add_to_index(index_name, file_ids, tag_map=tag_map or None)
+
+
+def list_parts_by_tag(name: str, tag: str) -> dict[str, Any]:
+    """Return all parts in a named index whose ``cluster_tag`` matches *tag*.
+
+    Uses the fast per-index ``tags.json`` sidecar for tag lookup.
+    Generates a grid-image PNG saved to ``out/`` and returns its relative URL.
+
+    Returns ``{"tag": tag, "hits": [...], "count": int, "image_url": str|None}``.
+    """
+    _validate_index_name(name)
+    tags = _load_index_tags(name)
+    matching_ids = [fid for fid, t in tags.items() if t == tag]
+
+    if not matching_ids:
+        return {"tag": tag, "hits": [], "count": 0, "image_url": None}
+
+    hits = []
+    for fid in matching_ids:
+        cached = _embedding_memory_cache.get(f"hoops_embeddings_model__{fid}")
+        filename = cached.get("filename", fid[:12]) if cached else fid[:12]
+        hits.append(
+            {
+                "id": fid,
+                "score": 1.0,
+                "metadata": {"file_id": fid, "filename": filename, "cluster_tag": tag},
+            }
+        )
+
+    image_url = _build_tag_grid_image(hits, name, tag) if hits else None
+    return {"tag": tag, "hits": hits, "count": len(hits), "image_url": image_url}
+
+
+def _build_tag_grid_image(
+    hits: list[dict[str, Any]],
+    index_name: str,
+    tag: str,
+) -> Optional[str]:
+    """Generate a grid PNG of all parts matching a cluster tag and save to out/.
+
+    Returns a ``/out/{uuid}.png`` relative URL, or None on failure.
+    """
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.image as mpimg
+        import matplotlib.pyplot as plt
+        import numpy as np
+
+        thumb_dir = _index_thumbnails_dir(index_name)
+        n_total = len(hits)
+        if n_total == 0:
+            return None
+
+        cols = min(4, n_total)
+        rows = (n_total + cols - 1) // cols
+
+        fig, raw_axes = plt.subplots(rows, cols, figsize=(cols * 3, rows * 3 + 0.5))
+        axes: list = list(np.array(raw_axes).flatten()) if n_total > 1 else [raw_axes]
+
+        for i, hit in enumerate(hits):
+            if i >= len(axes):
+                break
+            ax = axes[i]
+            thumb = thumb_dir / f"{hit['id']}.png"
+            meta = hit.get("metadata") or {}
+            name_str = pathlib.Path(meta.get("filename", hit["id"][:12])).name
+            if thumb.exists():
+                try:
+                    img = mpimg.imread(str(thumb))
+                    ax.imshow(img)
+                except Exception:
+                    ax.set_facecolor("#e8e8e8")
+            else:
+                ax.set_facecolor("#e8e8e8")
+                ax.text(
+                    0.5, 0.5, name_str, ha="center", va="center",
+                    transform=ax.transAxes, fontsize=7, wrap=True,
+                )
+            ax.set_title(name_str[:30], fontsize=7, pad=2)
+            ax.set_xticks([])
+            ax.set_yticks([])
+
+        for i in range(n_total, len(axes)):
+            axes[i].axis("off")
+
+        fig.suptitle(f"Cluster: {tag}  ({n_total} parts)", fontsize=10, y=1.01)
+        plt.tight_layout(pad=0.5)
+
+        image_filename = f"{uuid.uuid4()}.png"
+        image_path = CAD_VIEWER_OUTPUT_DIR / image_filename
+        CAD_VIEWER_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        fig.savefig(str(image_path), format="png", bbox_inches="tight", dpi=100)
+        plt.close(fig)
+
+        return f"/out/{image_filename}"
+    except Exception:
+        return None
 
 
 def remove_from_index(name: str, part_ids: list[str]) -> dict[str, Any]:
@@ -379,6 +559,38 @@ def delete_index(name: str) -> dict[str, Any]:
 def _index_thumbnails_dir(name: str) -> pathlib.Path:
     """Return the per-index thumbnail image directory path."""
     return INDEXES_DIR / name / "thumbnails"
+
+
+def _index_tags_path(name: str) -> pathlib.Path:
+    """Return the per-index cluster tags sidecar JSON path."""
+    return INDEXES_DIR / name / "tags.json"
+
+
+def _load_index_tags(name: str) -> dict[str, str]:
+    """Load the cluster tags sidecar, returning {file_id: cluster_tag}.
+
+    Returns empty dict if the file does not exist or cannot be parsed.
+    """
+    import json
+
+    tags_path = _index_tags_path(name)
+    if not tags_path.exists():
+        return {}
+    try:
+        with open(tags_path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def _save_index_tags(name: str, tags: dict[str, str]) -> None:
+    """Persist the cluster tags sidecar for the named index."""
+    import json
+
+    tags_path = _index_tags_path(name)
+    tags_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(tags_path, "w", encoding="utf-8") as fh:
+        json.dump(tags, fh, ensure_ascii=False, indent=2)
 
 
 def _generate_part_thumbnail(file_id: str, index_name: str) -> Optional[pathlib.Path]:
