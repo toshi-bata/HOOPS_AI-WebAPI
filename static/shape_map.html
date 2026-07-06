@@ -117,8 +117,9 @@
     </div>
     <div class="row" id="threshRow">
       <label for="edgeThresh" style="font-size:12px;color:#555;white-space:nowrap;">Min sim</label>
-      <input id="edgeThresh" type="range" min="0.75" max="1" value="0.75" step="0.01" style="flex:1;">
-      <span id="edgeThreshValue" style="min-width:36px;text-align:right;font-size:12px;font-variant-numeric:tabular-nums;">0.75</span>
+      <input id="edgeThresh" type="range" min="0.05" max="1" value="0.5" step="0.01" style="flex:1;">
+      <input id="edgeThreshValue" type="number" min="0.05" max="1" value="0.5" step="0.01"
+             style="width:52px;padding:2px 4px;font-size:12px;border:1px solid #ccc;border-radius:4px;text-align:right;font-variant-numeric:tabular-nums;">
     </div>
     <hr>
     <div class="row toggle-wrap">
@@ -407,10 +408,20 @@
     });
     toggleCluster.addEventListener('change', () => { showCluster = toggleCluster.checked; applyClusterColors(); });
     edgeThresh.addEventListener('input', () => {
-      edgeThreshValue.textContent = parseFloat(edgeThresh.value).toFixed(2);
+      edgeThreshValue.value = parseFloat(edgeThresh.value).toFixed(2);
       updateEdges();
       applyClusterColors();  // re-cluster on threshold change
       updateClusterTagLabels();  // reflect any tag changes after re-clustering
+    });
+    edgeThreshValue.addEventListener('change', () => {
+      let v = parseFloat(edgeThreshValue.value);
+      if (isNaN(v)) v = 0.5;
+      v = Math.min(1, Math.max(0.05, v));
+      edgeThreshValue.value = v.toFixed(2);
+      edgeThresh.value = v;
+      updateEdges();
+      applyClusterColors();
+      updateClusterTagLabels();
     });
 
     // ── Positioning ─────────────────────────────────────────────────────────
@@ -473,12 +484,11 @@
           if (!a.visible || !b.visible) continue;
           const hue = Math.round(sim * 120);
           const opacity = 0.2 + sim * 0.7;
-          const width = 0.5 + sim * 3;
           const line = document.createElementNS('http://www.w3.org/2000/svg','line');
           line.setAttribute('x1',a.x); line.setAttribute('y1',a.y);
           line.setAttribute('x2',b.x); line.setAttribute('y2',b.y);
           line.setAttribute('stroke',`hsl(${hue},80%,45%)`);
-          line.setAttribute('stroke-width', width);
+          line.setAttribute('stroke-width', 1);
           line.setAttribute('stroke-opacity', opacity);
           edgeSvg.appendChild(line);
           const text = document.createElementNS('http://www.w3.org/2000/svg','text');
@@ -516,11 +526,13 @@
     function setupSlider() {
       baseScale = computeInitialScale();
       currentScale = baseScale;
-      scaleSlider.min = 0; scaleSlider.max = 100; scaleSlider.value = 0;
+      const _initMult = Math.max(2, parseInt(maxMultInput.value) || 200);
+      scaleSlider.min = 0; scaleSlider.max = 100;
+      scaleSlider.value = parseFloat((100 / _initMult).toFixed(1));
       updateScaleLabel();
       function applySlider() {
         const mult = Math.max(2, parseInt(maxMultInput.value) || 200);
-        currentScale = baseScale * (1 + parseFloat(scaleSlider.value)/100 * (mult-1));
+        currentScale = baseScale * parseFloat(scaleSlider.value) / 100 * mult;
         updateScaleLabel();
         applyPositions();
       }

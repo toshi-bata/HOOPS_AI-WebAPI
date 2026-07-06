@@ -355,7 +355,7 @@ class QueryShapeMapCoreTests(unittest.TestCase):
                     "cached": False,
                 }
 
-                def fake_compute(fid):
+                def fake_compute(fid, **kwargs):
                     return {**fake_emb, "file_id": fid}
 
                 with (
@@ -417,7 +417,7 @@ class QueryShapeMapCoreTests(unittest.TestCase):
                     "cached": False,
                 }
 
-                def fake_compute(fid):
+                def fake_compute(fid, **kwargs):
                     return {**fake_emb, "file_id": fid}
 
                 with (
@@ -455,7 +455,7 @@ class QueryShapeMapCoreTests(unittest.TestCase):
                     "cached": False,
                 }
 
-                def fake_compute(fid):
+                def fake_compute(fid, **kwargs):
                     return {**fake_emb, "file_id": fid}
 
                 with (
@@ -495,7 +495,7 @@ class QueryShapeMapCoreTests(unittest.TestCase):
                     "filename": "x.step", "cached": False,
                 }
 
-                def fake_compute(fid):
+                def fake_compute(fid, **kwargs):
                     vec = part_vecs.get(fid, query_vec)
                     return {**dummy, "file_id": fid, "vector": vec}
 

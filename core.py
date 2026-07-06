@@ -432,11 +432,14 @@ def add_map_parts_to_index(map_id: str, index_name: str) -> dict[str, Any]:
     file_ids = [p["file_id"] for p in parts]
     tag_map = {p["file_id"]: p["cluster_tag"] for p in parts if p.get("cluster_tag")}
 
+    # Use the model recorded in the map JSON so the index matches the map's embeddings.
+    map_model: str = data.get("model", _EMBEDDER_MODEL_DEFAULT)
+
     # Auto-create the index if it doesn't exist yet
     if not _index_faiss_path(index_name).exists():
-        create_index(index_name)
+        create_index(index_name, model=map_model)
 
-    return add_to_index(index_name, file_ids, tag_map=tag_map or None)
+    return add_to_index(index_name, file_ids, tag_map=tag_map or None, model=map_model)
 
 
 def list_parts_by_tag(name: str, tag: str) -> dict[str, Any]:
