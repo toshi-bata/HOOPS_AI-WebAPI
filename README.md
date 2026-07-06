@@ -96,6 +96,7 @@ cp .env.example .env
 | `HOOPS_AI_MFR_FLOW_NAME` | optional | MFR flow name (dataset files are resolved relative to this) |
 | `HOOPS_AI_MFR_MODEL_NAME` | optional | MFR trained model checkpoint filename (e.g. `ts3d_162k_mfr.ckpt`) |
 | `HOOPS_AI_EMBEDDINGS_MODEL_NAME` | optional | Embeddings trained model checkpoint filename (e.g. `ts3d_1M_hoops_embeddings.ckpt`) |
+| `HOOPS_AI_EMBEDDINGS_MODEL_NAME_SIGNAL` | optional | SIGNAL architecture embeddings model checkpoint (e.g. `ts3d_2M_hoops_embeddings_SIGNAL-preview.ckpt`). This is the **default active model** used by `/compare`, `/map`, and `/index/create`. Change the active model at runtime via `PUT /similarity/settings`. |
 | `HOOPS_AI_FAISS_INDEX_PATH` | optional | FAISS index file for shape similarity search (e.g. `fabwave_embeddings_store.faiss`) |
 | `HOOPS_AI_PART_CLASS_MODEL_NAME` | optional | Filename of the trained GraphClassification checkpoint under `packages/trained_ml_models/` (e.g. `ts3d_graphclassification_5k_10epochs.ckpt`) |
 | `HOOPS_AI_PART_CLASS_FLOW_NAME` | optional | Part Classification flow name (required for `/part-classification/dataset/*` endpoints). The server automatically prefers `<HOOPS_AI_NOTEBOOK_DIR>/out/flows/<name>` (notebook output, includes thumbnails) and falls back to `../packages/flows/<name>` (pre-packaged). |
@@ -111,6 +112,7 @@ HOOPS_AI_NOTEBOOK_DIR=C:\hoops_ai\notebooks
 HOOPS_AI_MFR_FLOW_NAME=ETL_CADSYNTH_training_b2
 HOOPS_AI_MFR_MODEL_NAME=ts3d_162k_mfr.ckpt
 HOOPS_AI_EMBEDDINGS_MODEL_NAME=ts3d_1M_hoops_embeddings.ckpt
+HOOPS_AI_EMBEDDINGS_MODEL_NAME_SIGNAL=ts3d_2M_hoops_embeddings_SIGNAL-preview.ckpt
 HOOPS_AI_FAISS_INDEX_PATH=fabwave_embeddings_store.faiss
 HOOPS_AI_PART_CLASS_MODEL_NAME=ts3d_graphclassification_5k_10epochs.ckpt
 HOOPS_AI_PART_CLASS_FLOW_NAME=ETL_Fabwave_training_b2
@@ -508,6 +510,43 @@ curl "http://127.0.0.1:8000/similarity/part-image?filename=part_042.stp" -o part
 
 ---
 
+#### Embedding model settings
+
+Read or change the server-wide active embedding model used by `/compare`, `/map`, and `/index/create`.
+The default is `'signal'` (HOOPS AI SIGNAL model).
+
+```
+GET  /similarity/settings
+PUT  /similarity/settings?model=<model>
+```
+
+| Parameter | Values | Description |
+|---|---|---|
+| `model` | `signal` *(default)*, `default` | Embeddings model: `'signal'` = SIGNAL model (`HOOPS_AI_EMBEDDINGS_MODEL_NAME_SIGNAL`); `'default'` = 1M model (`HOOPS_AI_EMBEDDINGS_MODEL_NAME`) |
+
+**Windows (PowerShell) — read current setting:**
+```powershell
+curl.exe "http://127.0.0.1:8000/similarity/settings"
+```
+
+**Windows (PowerShell) — switch to 1M model:**
+```powershell
+curl.exe -X PUT "http://127.0.0.1:8000/similarity/settings?model=default"
+```
+
+**Linux:**
+```bash
+curl "http://127.0.0.1:8000/similarity/settings"
+curl -X PUT "http://127.0.0.1:8000/similarity/settings?model=signal"
+```
+
+**Response:**
+```json
+{ "model": "signal" }
+```
+
+---
+
 #### Similarity search index info
 
 Return metadata about the FAISS similarity-search index currently loaded on
@@ -637,6 +676,9 @@ POST /similarity/compare
 | CAD file uploads | `files` multipart field (one or more) |
 | ZIP archive | `zip_file` multipart field (auto-extracted, Zip Slip protected) |
 
+The embeddings model is taken from the server-wide setting (`PUT /similarity/settings`).
+Default is `'signal'` (HOOPS AI SIGNAL model).
+
 At least **two** valid parts are required.  Per-file failures are collected in `errors`
 and do not abort the request (unless fewer than two parts succeed).
 
@@ -655,7 +697,7 @@ curl -X POST "http://127.0.0.1:8000/similarity/compare" -F "files=@/path/to/brac
 curl -X POST "http://127.0.0.1:8000/similarity/compare?file_ids=a3f8c2...,cd34ef..."
 ```
 
-**Linux  Ecompare files inside a ZIP archive:**
+**Linux — compare files inside a ZIP archive:**
 ```bash
 curl -X POST "http://127.0.0.1:8000/similarity/compare" -F "zip_file=@/path/to/parts.zip"
 ```
@@ -719,10 +761,11 @@ GET  /similarity/map/show?map=<map_id>
 | ZIP archive | `zip_file` multipart field (auto-extracted, Zip Slip protected) |
 
 At least **two** valid parts are required.  Accepts the same three input sources as
-`POST /similarity/compare`.  The response includes a 3D `position` for each part, the
-similarity `matrix`, a Kruskal `stress` value (layout accuracy: `0.0` is exact), and an
-absolute `viewer_url` that opens the interactive map.  The viewer page fetches its layout
-data from `/out/shape_map_<map_id>.json`.
+`POST /similarity/compare`.  The embeddings model is taken from the server-wide setting
+(`PUT /similarity/settings`; default `'signal'`).  The response includes a 3D `position`
+for each part, the similarity `matrix`, a Kruskal `stress` value (layout accuracy:
+`0.0` is exact), and an absolute `viewer_url` that opens the interactive map.
+The viewer page fetches its layout data from `/out/shape_map_<map_id>.json`.
 
 **Linux  Egenerate a shape map from uploaded files:**
 ```bash
@@ -842,18 +885,26 @@ server restarts.  Use `persist=true` to permanently add the query part to the so
 Manage user-created similarity indexes that grow over time.  Unlike the built-in
 read-only ``default`` index (backed by ``HOOPS_AI_FAISS_INDEX_PATH``), named indexes
 are fully writable: create an empty index, register new parts whenever they arrive,
-and query immediately  Eall via Web API with no notebook re-runs.
+and query immediately — all via Web API with no notebook re-runs.
 
-Indexes are stored under ``APP_ROOT/indexes/<name>.faiss`` (+ ``.meta``).
+Each named index is bound to the embeddings model used when it was created (stored in
+a `model.json` sidecar).  The model for new indexes is taken from the server-wide
+setting (`PUT /similarity/settings`; default `'signal'`).  Indexes with different
+models can coexist; the correct embedder is applied automatically at search and add time.
+
+Indexes are stored under ``APP_ROOT/indexes/<name>/`` (FAISS files + model sidecar).
 Index names must match ``^[a-z0-9_-]{1,64}$``; ``default`` is reserved.
 
 #### Incremental workflow example
 
 ```
-# 1. Create an empty index
+# 0. (Optional) Switch active model — default is already 'signal'
+PUT /similarity/settings?model=signal
+
+# 1. Create an empty index — uses the active model (signal by default)
 POST /similarity/index/create?name=my-parts
 
-# 2. Register parts (repeat as new parts arrive)
+# 2. Register parts (repeat as new parts arrive) — model taken from index's model.json
 POST /similarity/index/add?name=my-parts
      + files=@bracket_v1.step
 
@@ -868,7 +919,7 @@ POST /similarity/index/add?name=my-parts
 # 5. Remove a part
 DELETE /similarity/index/my-parts/parts?part_ids=<file_id>
 
-# 6. Delete the whole index (destructive  Erequires confirm=true)
+# 6. Delete the whole index (destructive — requires confirm=true)
 DELETE /similarity/index/my-parts?confirm=true
 ```
 
@@ -879,6 +930,11 @@ POST /similarity/index/create?name=<name>
 ```
 
 Returns **201** on success, **409** if the name already exists, **422** for invalid/reserved names.
+The embeddings model is taken from the server-wide setting (`PUT /similarity/settings`).
+
+| Parameter | Values | Description |
+|---|---|---|
+| `name` | `^[a-z0-9_-]{1,64}$` | Index name (required) |
 
 **Windows (PowerShell):**
 ```powershell
@@ -892,7 +948,7 @@ curl -X POST "http://127.0.0.1:8000/similarity/index/create?name=my-parts"
 
 **Response:**
 ```json
-{ "name": "my-parts", "count": 0, "dim": 512 }
+{ "name": "my-parts", "count": 0, "dim": 512, "model": "signal" }
 ```
 
 ---
@@ -918,8 +974,9 @@ curl "http://127.0.0.1:8000/similarity/index/list"
 **Response:**
 ```json
 [
-  { "name": "default",  "count": 5000, "last_modified": "2025-06-01T12:00:00Z", "is_readonly": true  },
-  { "name": "my-parts", "count": 3,    "last_modified": "2026-07-01T08:30:00Z", "is_readonly": false }
+  { "name": "default",          "count": 5000, "last_modified": "2025-06-01T12:00:00Z", "is_readonly": true,  "model": null      },
+  { "name": "my-parts",         "count": 3,    "last_modified": "2026-07-01T08:30:00Z", "is_readonly": false, "model": "default" },
+  { "name": "my-parts-signal",  "count": 3,    "last_modified": "2026-07-06T10:00:00Z", "is_readonly": false, "model": "signal"  }
 ]
 ```
 
@@ -940,7 +997,9 @@ Accepts the same three input sources as ``POST /similarity/compare``:
 | ZIP archive | `zip_file` multipart field |
 
 Re-registering a part ID overwrites the existing entry (``updated`` counter).
-Embedding results are cached on disk  Ere-adding the same file is fast.
+Embedding results are cached on disk — re-adding the same file is fast.
+
+The embedder is always the one recorded in the index's `model.json` sidecar (set at creation time).
 
 **Windows (PowerShell):**
 ```powershell
