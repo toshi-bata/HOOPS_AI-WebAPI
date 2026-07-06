@@ -40,7 +40,36 @@ shape_index = None
 PART_CLASS_inference_model = None
 PART_CLASS_dataset_explorer = None
 _embedder = None
+_embedder_signal = None
 _embedding_memory_cache: dict[str, dict] = {}  # cache_key -> embedding entry
+
+# Model key constants
+_EMBEDDER_MODEL_DEFAULT = "default"
+_EMBEDDER_MODEL_SIGNAL = "signal"
+_EMBEDDER_MODELS = frozenset({_EMBEDDER_MODEL_DEFAULT, _EMBEDDER_MODEL_SIGNAL})
+
+# Server-wide active embedding model (default: SIGNAL).
+# Use get_active_embedding_model() / set_active_embedding_model() to read/write.
+_active_embedding_model: str = _EMBEDDER_MODEL_SIGNAL
+
+
+def get_active_embedding_model() -> str:
+    """Return the server-wide active embedding model key ('default' or 'signal')."""
+    return _active_embedding_model
+
+
+def set_active_embedding_model(model: str) -> None:
+    """Set the server-wide active embedding model.
+
+    Raises ``ValueError`` if *model* is not a recognised key.
+    """
+    global _active_embedding_model
+    if model not in _EMBEDDER_MODELS:
+        raise ValueError(
+            f"Invalid model '{model}'. Must be one of: {sorted(_EMBEDDER_MODELS)}."
+        )
+    _active_embedding_model = model
+
 
 # ---------------------------------------------------------------------------
 # Named index registry (incremental index management)
@@ -99,9 +128,9 @@ def _index_faiss_path(name: str) -> pathlib.Path:
     return INDEXES_DIR / name / "index.faiss"
 
 
-def _get_embedder_dim() -> int:
+def _get_embedder_dim(model: str = _EMBEDDER_MODEL_DEFAULT) -> int:
     """Return the embedding dimension from the lazy-loaded HOOPSEmbeddings model."""
-    embedder = get_embedder()
+    embedder = get_embedder(model)
     dim = getattr(embedder, "embedding_dim", None)
     if dim is not None:
         return int(dim)
@@ -159,12 +188,20 @@ def _save_named_index_atomic(name: str, vs: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
-def create_index(name: str) -> dict[str, Any]:
+def create_index(name: str, model: str = _EMBEDDER_MODEL_DEFAULT) -> dict[str, Any]:
     """Create a new empty named index.
 
-    Raises ValueError for invalid names, PermissionError for reserved names,
+    *model* selects which embeddings model is used for this index: ``'default'``
+    (the 1M model set by ``HOOPS_AI_EMBEDDINGS_MODEL_NAME``) or ``'signal'``
+    (the SIGNAL model set by ``HOOPS_AI_EMBEDDINGS_MODEL_NAME_SIGNAL``).
+
+    Raises ValueError for invalid names/models, PermissionError for reserved names,
     and FileExistsError if an index with that name already exists.
     """
+    if model not in _EMBEDDER_MODELS:
+        raise ValueError(
+            f"Invalid model '{model}'. Must be one of: {sorted(_EMBEDDER_MODELS)}."
+        )
     _validate_index_name(name)
     lock = _get_index_lock(name)
     with lock:
@@ -173,11 +210,12 @@ def create_index(name: str) -> dict[str, Any]:
 
         from hoops_ai.ml.embeddings import FaissVectorStore
 
-        dim = _get_embedder_dim()
+        dim = _get_embedder_dim(model)
         vs = FaissVectorStore(dim)
         _save_named_index_atomic(name, vs)
+        _save_index_model(name, model)
         _named_indexes[name] = vs
-        return {"name": name, "count": 0, "dim": dim}
+        return {"name": name, "count": 0, "dim": dim, "model": model}
 
 
 def list_indexes() -> list[dict[str, Any]]:
@@ -239,6 +277,7 @@ def list_indexes() -> list[dict[str, Any]]:
                     "count": idx_count,
                     "last_modified": last_modified_idx,
                     "is_readonly": False,
+                    "model": _load_index_model(idx_name),
                 }
             )
 
@@ -249,12 +288,17 @@ def add_to_index(
     name: str,
     file_ids: list[str],
     tag_map: Optional[dict[str, str]] = None,
+    model: Optional[str] = None,
 ) -> dict[str, Any]:
     """Compute embeddings for *file_ids* and upsert them into the named index.
 
     Re-uses the ``compute_embedding()`` disk cache.  Re-inserting the same
     file_id overwrites the existing entry (delete-then-upsert to avoid FAISS
     duplicate entries).
+
+    *model* overrides the embedder used for this batch.  When ``None`` (default)
+    the model recorded in the index's ``model.json`` sidecar is used so that all
+    entries in an index always use the same model.
 
     Optional *tag_map* is a ``{file_id: cluster_tag}`` mapping — when provided,
     ``cluster_tag`` is stored in the FAISS record metadata and in the per-index
@@ -263,6 +307,12 @@ def add_to_index(
     Returns ``added``, ``updated``, ``index_count``, and per-file ``errors``.
     """
     _validate_index_name(name)
+    # Resolve model: explicit param > sidecar > default
+    effective_model = model if model is not None else _load_index_model(name)
+    if effective_model not in _EMBEDDER_MODELS:
+        raise ValueError(
+            f"Invalid model '{effective_model}'. Must be one of: {sorted(_EMBEDDER_MODELS)}."
+        )
     lock = _get_index_lock(name)
     with lock:
         vs = _load_named_index(name)
@@ -276,7 +326,7 @@ def add_to_index(
 
         for fid in file_ids:
             try:
-                emb_result = compute_embedding(fid)
+                emb_result = compute_embedding(fid, model=effective_model)
                 v = emb_result["vector"]
                 emb_obj = Embedding(values=v, model=emb_result["model_name"], dim=emb_result["dim"])
                 meta: dict[str, Any] = {
@@ -509,10 +559,14 @@ def remove_from_index(name: str, part_ids: list[str]) -> dict[str, Any]:
 def search_index(name: str, file_id: str, top_k: int) -> dict[str, Any]:
     """Search the named index for the top-k most similar parts to *file_id*.
 
+    The query embedding is computed using the same model that was selected when
+    the index was created (recorded in ``model.json``).
+
     Returns an empty hits list (and no image_url) when the index has no entries.
     Generates a result-grid PNG in out/ and returns its relative URL as ``image_url``.
     """
     _validate_index_name(name)
+    index_model = _load_index_model(name)
     lock = _get_index_lock(name)
 
     # Phase 1: vector store operations (locked)
@@ -520,7 +574,7 @@ def search_index(name: str, file_id: str, top_k: int) -> dict[str, Any]:
         vs = _load_named_index(name)
         if len(vs.get_ids()) == 0:
             return {"hits": [], "count": 0, "image_url": None}
-        emb_result = compute_embedding(file_id)
+        emb_result = compute_embedding(file_id, model=index_model)
         raw_hits = vs.query(emb_result["vector"], top_k=top_k)
 
     hit_dicts = [
@@ -591,6 +645,39 @@ def _save_index_tags(name: str, tags: dict[str, str]) -> None:
     tags_path.parent.mkdir(parents=True, exist_ok=True)
     with open(tags_path, "w", encoding="utf-8") as fh:
         json.dump(tags, fh, ensure_ascii=False, indent=2)
+
+
+def _index_model_sidecar_path(name: str) -> pathlib.Path:
+    """Return the per-index model sidecar JSON path (indexes/{name}/model.json)."""
+    return INDEXES_DIR / name / "model.json"
+
+
+def _load_index_model(name: str) -> str:
+    """Return the model key ('default' or 'signal') recorded for the named index.
+
+    Falls back to 'default' for indexes created before model selection was added.
+    """
+    import json
+
+    path = _index_model_sidecar_path(name)
+    if not path.exists():
+        return _EMBEDDER_MODEL_DEFAULT
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data.get("model", _EMBEDDER_MODEL_DEFAULT)
+    except Exception:
+        return _EMBEDDER_MODEL_DEFAULT
+
+
+def _save_index_model(name: str, model: str) -> None:
+    """Persist the model key for the named index."""
+    import json
+
+    path = _index_model_sidecar_path(name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({"model": model}, fh)
 
 
 def _generate_part_thumbnail(file_id: str, index_name: str) -> Optional[pathlib.Path]:
@@ -1214,13 +1301,51 @@ def get_similar_search_index_info() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def get_embedder():
+def get_embedder(model: str = _EMBEDDER_MODEL_DEFAULT):
     """Lazy-initialise HOOPSEmbeddings without loading a FAISS index.
+
+    *model* selects which checkpoint to load:
+
+    * ``'default'`` — ``HOOPS_AI_EMBEDDINGS_MODEL_NAME`` (1M model), registered
+      as ``"hoops_embeddings_model"``.
+    * ``'signal'`` — ``HOOPS_AI_EMBEDDINGS_MODEL_NAME_SIGNAL`` (SIGNAL model),
+      registered as ``"hoops_embeddings_signal"``.
 
     Safe to call alongside (or after) ``create_cad_searcher()`` — the model
     registration is guarded so it is never performed twice.
     """
-    global _embedder
+    global _embedder, _embedder_signal
+
+    if model == _EMBEDDER_MODEL_SIGNAL:
+        if _embedder_signal is not None:
+            return _embedder_signal
+
+        from hoops_ai.ml.embeddings import HOOPSEmbeddings
+
+        load_env_file()
+
+        notebooks_dir = require_path(
+            pathlib.Path(get_required_env("HOOPS_AI_NOTEBOOK_DIR")),
+            env_name="HOOPS_AI_NOTEBOOK_DIR",
+        )
+        ckpt_name = get_required_env("HOOPS_AI_EMBEDDINGS_MODEL_NAME_SIGNAL")
+        trained_model = require_path(
+            notebooks_dir.parent.joinpath("packages", "trained_ml_models", ckpt_name),
+            env_name="HOOPS_AI_EMBEDDINGS_MODEL_NAME_SIGNAL",
+        )
+
+        try:
+            HOOPSEmbeddings.register_model(
+                model_name="hoops_embeddings_signal",
+                checkpoint_path=str(trained_model),
+            )
+        except Exception:
+            pass  # already registered
+
+        _embedder_signal = HOOPSEmbeddings(model="hoops_embeddings_signal")
+        return _embedder_signal
+
+    # Default model
     if _embedder is not None:
         return _embedder
 
@@ -1260,8 +1385,12 @@ def _l2_normalize(v):
     return (v / norm).astype(np.float32)
 
 
-def compute_embedding(file_id: str) -> dict[str, Any]:
+def compute_embedding(file_id: str, model: str = _EMBEDDER_MODEL_DEFAULT) -> dict[str, Any]:
     """Compute (or retrieve from cache) the shape embedding for a CAD file.
+
+    *model* selects the embedder: ``'default'`` (1M model) or ``'signal'``
+    (SIGNAL model).  The cache key includes the model so that embeddings from
+    different models are stored and retrieved independently.
 
     The result vector is a single L2-normalised float32 array representing the
     whole part.  For multi-body models the per-body vectors are individually
@@ -1273,7 +1402,7 @@ def compute_embedding(file_id: str) -> dict[str, Any]:
     """
     import numpy as np
 
-    embedder = get_embedder()
+    embedder = get_embedder(model)
     model_name = (
         getattr(embedder, "model_name", None)
         or getattr(embedder, "model", None)
@@ -1358,11 +1487,14 @@ def compute_embedding(file_id: str) -> dict[str, Any]:
     return {**entry, "cached": False}
 
 
-def compare_embeddings(file_ids: list[str]) -> dict[str, Any]:
+def compare_embeddings(file_ids: list[str], model: str = _EMBEDDER_MODEL_DEFAULT) -> dict[str, Any]:
     """Compute an N×N cosine similarity matrix for the given file_ids.
 
     All embedding vectors are L2-normalised, so cosine similarity equals their
     dot product.  Diagonal entries are forced to exactly ``1.0``.
+
+    *model* selects the embedder: ``'default'`` (1M model) or ``'signal'``
+    (SIGNAL model).
 
     Returns a dict with keys:
       ``count``, ``model_name``, ``files``, ``matrix`` (N×N list of lists),
@@ -1370,7 +1502,7 @@ def compare_embeddings(file_ids: list[str]) -> dict[str, Any]:
     """
     import numpy as np
 
-    embeddings = [compute_embedding(fid) for fid in file_ids]
+    embeddings = [compute_embedding(fid, model=model) for fid in file_ids]
     vectors = np.stack([e["vector"] for e in embeddings], axis=0)  # (N, D)
 
     # Cosine similarity via dot product (vectors are already L2-normalised)
@@ -1493,7 +1625,9 @@ def export_scs_for_part(file_id: str) -> str:
     return pathlib.Path(scs_path).name
 
 
-def compute_shape_map_data(file_ids: list[str]) -> dict[str, Any]:
+def compute_shape_map_data(
+    file_ids: list[str], model: str = _EMBEDDER_MODEL_DEFAULT
+) -> dict[str, Any]:
     """Compute a 3D "Shape Space Map" layout for a set of CAD parts.
 
     Steps:
@@ -1503,12 +1637,16 @@ def compute_shape_map_data(file_ids: list[str]) -> dict[str, Any]:
       3. Lay the parts out in 3D with classical MDS so that similar parts sit
          closer together (distance ``d_ij = 1 - similarity_ij``).
       4. Persist the result to ``out/shape_map_{map_id}.json`` and return it.
+
+    *model* selects the embedder: ``'default'`` (1M model) or ``'signal'``
+    (SIGNAL model).  The model identifier is stored in the map JSON so that
+    subsequent overlay queries can use the same model automatically.
     """
     import json
 
     import numpy as np
 
-    compare = compare_embeddings(file_ids)
+    compare = compare_embeddings(file_ids, model=model)
     matrix = compare["matrix"]
     files = compare["files"]
     n = compare["count"]
@@ -1554,6 +1692,7 @@ def compute_shape_map_data(file_ids: list[str]) -> dict[str, Any]:
         "matrix": matrix,
         "stress": float(stress),
         "errors": errors,
+        "model": model,
     }
 
     CAD_VIEWER_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -1647,16 +1786,17 @@ def query_shape_map(map_id: str, query_file_id: str, persist: bool = False) -> d
     existing_parts: list[dict] = map_data["parts"]
     existing_matrix: list[list[float]] = map_data["matrix"]
     n = len(existing_parts)
+    model: str = map_data.get("model", _EMBEDDER_MODEL_DEFAULT)
 
     # Compute query embedding (raises on failure — let caller handle)
-    query_emb = compute_embedding(query_file_id)
+    query_emb = compute_embedding(query_file_id, model=model)
     query_vec = query_emb["vector"]
     query_filename = query_emb["filename"]
 
     # Cosine similarities: query vs. each existing part (vectors are L2-normalised)
     query_sims: list[float] = []
     for part in existing_parts:
-        part_emb = compute_embedding(part["file_id"])
+        part_emb = compute_embedding(part["file_id"], model=model)
         sim = float(np.dot(query_vec, part_emb["vector"]))
         query_sims.append(round(sim, 6))
 

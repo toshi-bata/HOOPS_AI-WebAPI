@@ -37,6 +37,42 @@ class SimilarSearchIndexInfo(BaseModel):
     metadata: Optional[dict[str, Any]] = None
 
 
+# ---------------------------------------------------------------------------
+# GET/PUT /similarity/settings
+# ---------------------------------------------------------------------------
+
+
+class EmbeddingSettings(BaseModel):
+    model: str
+
+
+@router.get("/settings", response_model=EmbeddingSettings)
+def get_settings():
+    """Return the server-wide active embedding model.
+
+    * ``'signal'`` – HOOPS AI SIGNAL model (default)
+    * ``'default'`` – 1M model set by ``HOOPS_AI_EMBEDDINGS_MODEL_NAME``
+    """
+    return EmbeddingSettings(model=core.get_active_embedding_model())
+
+
+@router.put("/settings", response_model=EmbeddingSettings)
+def put_settings(model: str = Query(..., description="Embedding model key: 'signal' or 'default'.")):
+    """Set the server-wide active embedding model.
+
+    All subsequent ``/compare``, ``/map``, and ``/index/create`` calls will use
+    this model.  Existing indexes are unaffected — they always use the model
+    recorded at creation time.
+
+    Returns **422** if the model key is unknown.
+    """
+    try:
+        core.set_active_embedding_model(model)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return EmbeddingSettings(model=core.get_active_embedding_model())
+
+
 @router.post("/search")
 def similarity_search(
     request: Request,
@@ -261,8 +297,12 @@ def similarity_compare(
     to recognised CAD extensions only.  Uncompressed size is capped at 500 MB
     and file count at 50.
 
+    The embeddings model is taken from the server-wide setting (``PUT /similarity/settings``).
+    Default is ``'signal'`` (HOOPS AI SIGNAL model).
+
     This endpoint does **not** require a FAISS index.
     """
+    model = core.get_active_embedding_model()
     errors: list[dict] = []
     # (file_id, display_filename) tuples collected from all input sources
     resolved: list[tuple[str, str]] = []
@@ -314,7 +354,7 @@ def similarity_compare(
     valid_ids: list[str] = []
     for fid, display in resolved:
         try:
-            core.compute_embedding(fid)
+            core.compute_embedding(fid, model=model)
             valid_ids.append(fid)
         except Exception as exc:
             errors.append({"filename": display, "detail": str(exc)})
@@ -328,7 +368,7 @@ def similarity_compare(
 
     # ── 5. Compare ────────────────────────────────────────────────────────────
     try:
-        result = core.compare_embeddings(valid_ids)
+        result = core.compare_embeddings(valid_ids, model=model)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Comparison failed: {exc}") from exc
 
@@ -395,7 +435,12 @@ def similarity_map(
     cosine similarity and laid out in 3D with classical MDS (multidimensional
     scaling).  Each part is also converted to an SCS stream cache so the returned
     ``viewer_url`` can render them together in the HOOPS Web Viewer.
+
+    The embeddings model is taken from the server-wide setting (``PUT /similarity/settings``).
+    Default is ``'signal'`` (HOOPS AI SIGNAL model).
+    The chosen model is stored in the map and used automatically for subsequent overlay queries.
     """
+    model = core.get_active_embedding_model()
     errors: list[dict] = []
     # (file_id, display_filename) tuples collected from all input sources
     resolved: list[tuple[str, str]] = []
@@ -447,7 +492,7 @@ def similarity_map(
     valid_ids: list[str] = []
     for fid, display in resolved:
         try:
-            core.compute_embedding(fid)
+            core.compute_embedding(fid, model=model)
             valid_ids.append(fid)
         except Exception as exc:
             errors.append({"filename": display, "detail": str(exc)})
@@ -461,7 +506,7 @@ def similarity_map(
 
     # ── 5. Compute shape map ──────────────────────────────────────────────────
     try:
-        result = core.compute_shape_map_data(valid_ids)
+        result = core.compute_shape_map_data(valid_ids, model=model)
     except HTTPException:
         raise
     except (core.EnvConfigError, core.PathConfigError):
@@ -800,12 +845,14 @@ class IndexInfo(BaseModel):
     count: Optional[int] = None
     last_modified: Optional[str] = None
     is_readonly: bool = False
+    model: Optional[str] = None
 
 
 class IndexCreateResponse(BaseModel):
     name: str
     count: int
     dim: int
+    model: str
 
 
 class IndexAddResponse(BaseModel):
@@ -842,6 +889,7 @@ class IndexDeleteResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # POST /similarity/index/create
 # ---------------------------------------------------------------------------
+@router.post("/index/create", response_model=IndexCreateResponse)
 def create_index(
     name: str = Query(..., description="Name of the new index (^[a-z0-9_-]{1,64}$)."),
 ):
@@ -849,11 +897,14 @@ def create_index(
 
     * ``name`` must match ``^[a-z0-9_-]{1,64}$``.
     * ``default`` is reserved for the read-only env-configured index and cannot be created.
+    * The embeddings model is taken from the server-wide setting (``PUT /similarity/settings``).
+      Default is ``'signal'`` (HOOPS AI SIGNAL model).
     * Returns **409** if an index with that name already exists.
     * Returns **422** if the name is invalid or reserved.
     """
+    model = core.get_active_embedding_model()
     try:
-        result = core.create_index(name)
+        result = core.create_index(name, model=model)
         return IndexCreateResponse(**result)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -911,6 +962,10 @@ def add_to_index(
 
     Re-registering an existing part ID overwrites the old entry (no duplicates).
     ``added`` counts new parts; ``updated`` counts overwritten parts.
+
+    The embeddings model is always the one recorded in the index at creation time
+    (stored in ``model.json``).  Use ``PUT /similarity/settings`` to change the model
+    before creating a new index.
     """
     try:
         _validate_name_or_raise(name)
@@ -960,7 +1015,7 @@ def add_to_index(
     all_file_ids = [fid for fid, _ in resolved]
 
     try:
-        result = core.add_to_index(name, all_file_ids)
+        result = core.add_to_index(name, all_file_ids, model=None)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except (core.EnvConfigError, core.PathConfigError):
