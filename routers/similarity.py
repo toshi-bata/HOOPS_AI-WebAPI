@@ -1,8 +1,10 @@
 import io
 import os
 import pathlib
+import threading
+import uuid
 import zipfile
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 import core
 from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
@@ -10,6 +12,13 @@ from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 
 router = APIRouter(prefix="/similarity", tags=["CAD Similarity Search"])
+
+# ---------------------------------------------------------------------------
+# In-memory job store for long-running /map jobs
+# ---------------------------------------------------------------------------
+
+_map_jobs: Dict[str, Dict[str, Any]] = {}
+_map_jobs_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -450,12 +459,21 @@ class ShapeMapResponse(BaseModel):
     errors: list[CompareError]
 
 
+class MapJobStatus(BaseModel):
+    """Status of an async shape-space map job."""
+
+    job_id: str
+    status: str  # "processing" | "done" | "failed"
+    error: Optional[str] = None
+    result: Optional[ShapeMapResponse] = None
+
+
 # ---------------------------------------------------------------------------
 # POST /similarity/map
 # ---------------------------------------------------------------------------
 
 
-@router.post("/map", response_model=ShapeMapResponse)
+@router.post("/map", response_model=MapJobStatus, status_code=202)
 def similarity_map(
     request: Request,
     file_ids: Optional[str] = Query(
@@ -465,7 +483,11 @@ def similarity_map(
     files: Optional[List[UploadFile]] = File(None),
     zip_file: Optional[UploadFile] = File(None),
 ):
-    """Compute a Shape Space Map: arrange CAD parts in 3D so similar parts are closer together.
+    """Start a Shape Space Map computation job (async).
+
+    Returns immediately with a ``job_id`` and ``status: "processing"``.
+    Poll ``GET /similarity/map/job/{job_id}`` to check progress and retrieve
+    the result once ``status`` becomes ``"done"`` or ``"failed"``.
 
     Input sources can be combined freely:
 
@@ -473,18 +495,10 @@ def similarity_map(
     * ``files`` – one or more multipart CAD file uploads
     * ``zip_file`` – a single ZIP archive containing CAD files (auto-extracted)
 
-    At least **two** valid parts are required.  Parts are embedded, compared by
-    cosine similarity and laid out in 3D with classical MDS (multidimensional
-    scaling).  Each part is also converted to an SCS stream cache so the returned
-    ``viewer_url`` can render them together in the HOOPS Web Viewer.
-
-    The embeddings model is taken from the server-wide setting (``PUT /similarity/settings``).
-    Default is ``'signal'`` (HOOPS AI SIGNAL model).
-    The chosen model is stored in the map and used automatically for subsequent overlay queries.
+    At least **two** valid parts are required.
     """
     model = core.get_active_embedding_model()
     errors: list[dict] = []
-    # (file_id, display_filename) tuples collected from all input sources
     resolved: list[tuple[str, str]] = []
 
     # ── 1. file_ids from query parameter ─────────────────────────────────────
@@ -498,7 +512,7 @@ def similarity_map(
             except RuntimeError as exc:
                 errors.append({"filename": fid, "detail": str(exc)})
 
-    # ── 2. Direct file uploads ────────────────────────────────────────────────
+    # ── 2. Direct file uploads (read bytes eagerly before handing off) ────────
     if files:
         for upload in files:
             if not (upload and upload.filename):
@@ -530,59 +544,102 @@ def similarity_map(
         )
         raise HTTPException(status_code=422, detail=msg)
 
-    # ── 4. Compute embeddings (collect per-file errors) ───────────────────────
-    valid_ids: list[str] = []
-    for fid, display in resolved:
+    base_url = str(request.base_url).rstrip("/")
+    job_id = uuid.uuid4().hex[:12]
+
+    with _map_jobs_lock:
+        _map_jobs[job_id] = {"status": "processing"}
+
+    def _run_job() -> None:
+        pre_errors = list(errors)
         try:
-            core.compute_embedding(fid, model=model)
-            valid_ids.append(fid)
-        except Exception as exc:
-            errors.append({"filename": display, "detail": str(exc)})
+            # ── 4. Compute embeddings ─────────────────────────────────────────
+            valid_ids: list[str] = []
+            embed_errors: list[dict] = []
+            for fid, display in resolved:
+                try:
+                    core.compute_embedding(fid, model=model)
+                    valid_ids.append(fid)
+                except Exception as exc:
+                    embed_errors.append({"filename": display, "detail": str(exc)})
 
-    if len(valid_ids) < 2:
-        raise HTTPException(
-            status_code=422,
-            detail=f"At least 2 successful embeddings are required. "
-            f"{len(errors)} file(s) failed to embed.",
-        )
+            all_pre_errors = pre_errors + embed_errors
+            if len(valid_ids) < 2:
+                with _map_jobs_lock:
+                    _map_jobs[job_id] = {
+                        "status": "failed",
+                        "error": (
+                            f"At least 2 successful embeddings are required. "
+                            f"{len(all_pre_errors)} file(s) failed to embed."
+                        ),
+                    }
+                return
 
-    # ── 5. Compute shape map ──────────────────────────────────────────────────
-    try:
-        result = core.compute_shape_map_data(valid_ids, model=model)
-    except HTTPException:
-        raise
-    except (core.EnvConfigError, core.PathConfigError):
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Shape map failed: {exc}") from exc
+            # ── 5. Compute shape map ──────────────────────────────────────────
+            result = core.compute_shape_map_data(valid_ids, model=model)
 
-    # Merge any embed/upload errors with SCS-conversion errors from the pipeline.
-    all_errors = errors + list(result.get("errors", []))
+            all_errors = all_pre_errors + list(result.get("errors", []))
 
-    base = str(request.base_url).rstrip("/")
+            parts_out: list[MapPartInfo] = []
+            for p in result["parts"]:
+                scs_url = p.get("scs_url")
+                abs_scs = f"{base_url}{scs_url}" if scs_url else ""
+                parts_out.append(
+                    MapPartInfo(
+                        index=p["index"],
+                        file_id=p["file_id"],
+                        filename=p["filename"],
+                        scs_url=abs_scs,
+                        position=p["position"],
+                    )
+                )
 
-    parts_out: list[MapPartInfo] = []
-    for p in result["parts"]:
-        scs_url = p.get("scs_url")
-        abs_scs = f"{base}{scs_url}" if scs_url else ""
-        parts_out.append(
-            MapPartInfo(
-                index=p["index"],
-                file_id=p["file_id"],
-                filename=p["filename"],
-                scs_url=abs_scs,
-                position=p["position"],
+            shape_map = ShapeMapResponse(
+                map_id=result["map_id"],
+                viewer_url=f"{base_url}{result['viewer_url']}",
+                count=result["count"],
+                parts=parts_out,
+                matrix=result["matrix"],
+                stress=result["stress"],
+                errors=[CompareError(**e) for e in all_errors],
             )
-        )
 
-    return ShapeMapResponse(
-        map_id=result["map_id"],
-        viewer_url=f"{base}{result['viewer_url']}",
-        count=result["count"],
-        parts=parts_out,
-        matrix=result["matrix"],
-        stress=result["stress"],
-        errors=[CompareError(**e) for e in all_errors],
+            with _map_jobs_lock:
+                _map_jobs[job_id] = {"status": "done", "result": shape_map}
+
+        except Exception as exc:
+            with _map_jobs_lock:
+                _map_jobs[job_id] = {"status": "failed", "error": str(exc)}
+
+    threading.Thread(target=_run_job, daemon=True).start()
+    return MapJobStatus(job_id=job_id, status="processing")
+
+
+# ---------------------------------------------------------------------------
+# GET /similarity/map/job/{job_id}
+# ---------------------------------------------------------------------------
+
+
+@router.get("/map/job/{job_id}", response_model=MapJobStatus)
+def similarity_map_job_status(job_id: str):
+    """Poll the status of a shape-space map job started by ``POST /similarity/map``.
+
+    Returns:
+
+    * ``status: "processing"`` – computation is still running; poll again.
+    * ``status: "done"`` – computation finished; ``result`` contains the full
+      :class:`ShapeMapResponse`.
+    * ``status: "failed"`` – computation failed; ``error`` contains a description.
+    """
+    with _map_jobs_lock:
+        job = _map_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+    return MapJobStatus(
+        job_id=job_id,
+        status=job["status"],
+        error=job.get("error"),
+        result=job.get("result"),
     )
 
 
@@ -1179,5 +1236,4 @@ def _process_zip(
                     resolved.append((fid, display_name))
                 except Exception as exc:
                     errors.append({"filename": display_name, "detail": str(exc)})
-
 

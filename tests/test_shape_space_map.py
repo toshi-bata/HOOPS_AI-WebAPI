@@ -203,7 +203,8 @@ class ShapeMapEndpointValidationTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 422)
 
     def test_two_files_calls_compute(self):
-        """POST /similarity/map with 2 valid file_ids returns 200 and calls core."""
+        """POST /similarity/map with 2 valid file_ids returns 202 (async job) and job result is correct."""
+        import time
         import core
         import pathlib
 
@@ -224,20 +225,34 @@ class ShapeMapEndpointValidationTests(unittest.TestCase):
             "errors": [],
         }
 
+        # Patches must stay active for the duration of the background thread.
         with (
             patch.object(core, "find_persistent_CAD_file", side_effect=lambda fid: pathlib.Path(f"/fake/{fid}.step")),
             patch.object(core, "compute_embedding", return_value={"file_id": "x"}),
             patch.object(core, "compute_shape_map_data", return_value=fake_result),
         ):
             resp = client.post("/similarity/map?file_ids=a,b")
+            self.assertEqual(resp.status_code, 202)
+            job_id = resp.json()["job_id"]
+            self.assertIsNotNone(job_id)
 
-        self.assertEqual(resp.status_code, 200)
-        body = resp.json()
-        self.assertEqual(body["map_id"], "abcd1234")
-        self.assertEqual(body["count"], 2)
-        self.assertTrue(body["viewer_url"].endswith("/similarity/map/show?map=abcd1234"))
-        self.assertTrue(body["parts"][0]["scs_url"].endswith("/out/a.scs"))
-        self.assertTrue(body["parts"][0]["scs_url"].startswith("http"))
+            # Poll until done (max ~5 s).
+            body = None
+            for _ in range(50):
+                poll = client.get(f"/similarity/map/job/{job_id}")
+                self.assertEqual(poll.status_code, 200)
+                body = poll.json()
+                if body["status"] != "processing":
+                    break
+                time.sleep(0.1)
+
+        self.assertEqual(body["status"], "done")
+        result = body["result"]
+        self.assertEqual(result["map_id"], "abcd1234")
+        self.assertEqual(result["count"], 2)
+        self.assertTrue(result["viewer_url"].endswith("/similarity/map/show?map=abcd1234"))
+        self.assertTrue(result["parts"][0]["scs_url"].endswith("/out/a.scs"))
+        self.assertTrue(result["parts"][0]["scs_url"].startswith("http"))
 
 
 class ProjectOosMdsTests(unittest.TestCase):
