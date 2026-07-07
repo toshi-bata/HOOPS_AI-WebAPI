@@ -46,22 +46,6 @@
     .panel-btn:disabled { opacity: 0.5; cursor: default; }
     .panel-btn.primary { background: #4a90d9; color: white; border-color: #3a7bc8; }
     .panel-btn.primary:hover { background: #3a7bc8; }
-    #tagModeHint { font-size: 11px; color: #888; }
-    #tagDialog {
-      display: none; position: fixed; inset: 0; z-index: 50;
-      background: rgba(0,0,0,0.35); align-items: center; justify-content: center;
-    }
-    #tagDialogBox {
-      background: white; border-radius: 8px; padding: 20px 24px; min-width: 320px;
-      box-shadow: 0 4px 24px rgba(0,0,0,0.2);
-    }
-    #tagDialogBox h3 { margin: 0 0 8px; font-size: 15px; }
-    #tagDialogInfo { font-size: 11px; color: #666; margin: 0 0 10px; max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    #tagInput { width: 100%; box-sizing: border-box; padding: 6px 8px; font-size: 13px; border: 1px solid #ccc; border-radius: 4px; }
-    .tag-badge {
-      display: inline-block; font-size: 10px; padding: 1px 5px; border-radius: 3px;
-      background: rgba(255,180,0,0.85); color: #333; margin-right: 2px; font-weight: bold;
-    }
     #spinner {
       position: fixed; top: 50%; left: 50%; transform: translate(-50%,-50%); z-index: 20;
       background: #1e1e2e; color: #f8f8f2; padding: 1.4em 2em; border-radius: 10px;
@@ -122,18 +106,6 @@
              style="width:52px;padding:2px 4px;font-size:12px;border:1px solid #ccc;border-radius:4px;text-align:right;font-variant-numeric:tabular-nums;">
     </div>
     <hr>
-    <div class="row toggle-wrap">
-      <label class="toggle"><input id="toggleTagMode" type="checkbox"><span class="toggle-slider"></span></label>
-      <span>Tag Cluster</span>
-    </div>
-    <div id="tagModeHint" class="row" style="display:none;">
-      <span id="tagModeHintText" style="font-size:11px;color:#888;">Click a part to name its cluster</span>
-    </div>
-    <div id="saveTagsRow" class="row" style="display:none; gap:6px; flex-wrap:wrap;">
-      <button class="panel-btn primary" id="saveTagsBtn">Save Tags</button>
-      <span id="saveTagsStatus" style="font-size:11px;color:#555;"></span>
-    </div>
-    <hr>
     <div class="row" style="font-size:12px;color:#555;font-weight:600;">Register to Index</div>
     <div class="row" style="gap:6px;">
       <label style="font-size:12px;white-space:nowrap;">Index</label>
@@ -145,19 +117,6 @@
       <span id="addToIndexStatus" style="font-size:11px;color:#555;"></span>
     </div>
     <div id="stress">Layout accuracy: -</div>
-  </div>
-
-  <!-- Cluster tag dialog -->
-  <div id="tagDialog">
-    <div id="tagDialogBox">
-      <h3>Name this cluster</h3>
-      <div id="tagDialogInfo"></div>
-      <input id="tagInput" type="text" placeholder="e.g. bush, flange, bracket">
-      <div style="display:flex; gap:8px; margin-top:12px; justify-content:flex-end;">
-        <button class="panel-btn" id="tagCancelBtn">Cancel</button>
-        <button class="panel-btn primary" id="tagOkBtn">OK</button>
-      </div>
-    </div>
   </div>
 
   <div id="spinner">Loading<span class="dot"></span></div>
@@ -215,119 +174,9 @@
     let showEdges   = true;
     let showCluster = true;
 
-    // ── Cluster tagging state ────────────────────────────────────────────────
-    const clusterTags = {};          // clusterIndex → tagName
-    let tagModeActive = false;
-    let pendingClusterIndex = null;
-    let pendingPartIndices  = [];
-
-    const toggleTagMode    = document.getElementById('toggleTagMode');
-    const tagModeHint      = document.getElementById('tagModeHint');
-    const saveTagsRow      = document.getElementById('saveTagsRow');
-    const saveTagsBtn      = document.getElementById('saveTagsBtn');
-    const saveTagsStatus   = document.getElementById('saveTagsStatus');
-    const tagDialog        = document.getElementById('tagDialog');
-    const tagDialogInfo    = document.getElementById('tagDialogInfo');
-    const tagInput         = document.getElementById('tagInput');
-    const tagOkBtn         = document.getElementById('tagOkBtn');
-    const tagCancelBtn     = document.getElementById('tagCancelBtn');
     const indexNameInput   = document.getElementById('indexNameInput');
     const addToIndexBtn    = document.getElementById('addToIndexBtn');
     const addToIndexStatus = document.getElementById('addToIndexStatus');
-
-    toggleTagMode.addEventListener('change', () => {
-      tagModeActive = toggleTagMode.checked;
-      tagModeHint.style.display = tagModeActive ? '' : 'none';
-      if (!tagModeActive) tagDialog.style.display = 'none';
-    });
-
-    // ── Show tag dialog for a cluster ────────────────────────────────────────
-    function openTagDialog(clusterIdx, partIndices) {
-      pendingClusterIndex = clusterIdx;
-      pendingPartIndices  = partIndices;
-      const existing = clusterTags[clusterIdx] || '';
-      tagInput.value = existing;
-      const names = partIndices.slice(0,4).map(i => mapData.parts[i]?.filename || '').filter(Boolean);
-      const extra = partIndices.length > 4 ? ` …+${partIndices.length - 4} more` : '';
-      tagDialogInfo.textContent = `${partIndices.length} part(s): ${names.join(', ')}${extra}`;
-      tagDialog.style.display = 'flex';
-      tagInput.focus();
-      tagInput.select();
-    }
-
-    tagOkBtn.addEventListener('click', () => {
-      const tag = tagInput.value.trim();
-      if (tag && pendingClusterIndex !== null) {
-        clusterTags[pendingClusterIndex] = tag;
-        updateClusterTagLabels();
-        saveTagsRow.style.display = '';
-      }
-      tagDialog.style.display = 'none';
-      pendingClusterIndex = null;
-    });
-
-    tagCancelBtn.addEventListener('click', () => {
-      tagDialog.style.display = 'none';
-      pendingClusterIndex = null;
-    });
-
-    tagInput.addEventListener('keydown', e => {
-      if (e.key === 'Enter') tagOkBtn.click();
-      if (e.key === 'Escape') tagCancelBtn.click();
-    });
-
-    // ── Update label text to include cluster tag badge ───────────────────────
-    function updateClusterTagLabels() {
-      if (!mapData) return;
-      const thresh   = parseFloat(edgeThresh.value) || 0;
-      const clusters = computeClusters(mapData.matrix, thresh);
-      partState.forEach((st, i) => {
-        if (!st.label) return;
-        const tag      = clusterTags[clusters[i]];
-        const filename = mapData.parts[i]?.filename || '';
-        st.label.innerHTML = tag
-          ? `<span class="tag-badge">${tag}</span>${filename}`
-          : filename;
-      });
-    }
-
-    // ── HOOPS node → partState index (walks up tree) ─────────────────────────
-    function findPartIndexByNode(nodeId) {
-      if (!hwv) return -1;
-      const nodeIds = new Set(partState.map(st => st.nodeId));
-      let current = nodeId;
-      for (let depth = 0; depth < 20 && current != null; depth++) {
-        if (nodeIds.has(current)) return partState.findIndex(st => st.nodeId === current);
-        try { current = hwv.model.getNodeParent(current); }
-        catch(e) { break; }
-      }
-      return -1;
-    }
-
-    // ── Save tags to backend ─────────────────────────────────────────────────
-    saveTagsBtn.addEventListener('click', async () => {
-      if (!mapData || !Object.keys(clusterTags).length) return;
-      const thresh   = parseFloat(edgeThresh.value) || 0;
-      const clusters = computeClusters(mapData.matrix, thresh);
-      const tags = {};
-      partState.forEach((st, i) => {
-        const tag = clusterTags[clusters[i]];
-        if (tag && mapData.parts[i]?.file_id) tags[mapData.parts[i].file_id] = tag;
-      });
-      if (!Object.keys(tags).length) return;
-      saveTagsStatus.textContent = 'Saving…';
-      try {
-        const resp = await fetch(`/similarity/map/${mapData.map_id}/cluster-tags`, {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({tags}),
-        });
-        if (!resp.ok) { const e = await resp.json().catch(()=>({})); throw new Error(e.detail || `HTTP ${resp.status}`); }
-        const r = await resp.json();
-        saveTagsStatus.textContent = `✓ ${r.tagged} part(s) tagged`;
-        setTimeout(() => saveTagsStatus.textContent = '', 3000);
-      } catch(e) { saveTagsStatus.textContent = `Error: ${e.message}`; }
-    });
 
     // ── Register to index ────────────────────────────────────────────────────
     addToIndexBtn.addEventListener('click', async () => {
@@ -411,7 +260,6 @@
       edgeThreshValue.value = parseFloat(edgeThresh.value).toFixed(2);
       updateEdges();
       applyClusterColors();  // re-cluster on threshold change
-      updateClusterTagLabels();  // reflect any tag changes after re-clustering
     });
     edgeThreshValue.addEventListener('change', () => {
       let v = parseFloat(edgeThreshValue.value);
@@ -421,7 +269,6 @@
       edgeThresh.value = v;
       updateEdges();
       applyClusterColors();
-      updateClusterTagLabels();
     });
 
     // ── Positioning ─────────────────────────────────────────────────────────
@@ -587,23 +434,6 @@
           if (hwv.view.getNavCube)   hwv.view.getNavCube().enable();
         },
         camera: function() { updateOverlays(); },
-        // Handle part selection for cluster tagging
-        selectionArray: function(events) {
-          if (!tagModeActive || !mapData) return;
-          for (const evt of events) {
-            let nodeId = null;
-            try { nodeId = evt.getSelection().getNodeId(); } catch(e) { continue; }
-            if (nodeId == null) continue;
-            const idx = findPartIndexByNode(nodeId);
-            if (idx < 0) continue;
-            const thresh   = parseFloat(edgeThresh.value) || 0;
-            const clusters = computeClusters(mapData.matrix, thresh);
-            const clusterIdx = clusters[idx];
-            const clusterPartIndices = clusters.reduce((a, c, i) => { if (c === clusterIdx) a.push(i); return a; }, []);
-            openTagDialog(clusterIdx, clusterPartIndices);
-            break;
-          }
-        },
         modelStructureReady: async function() {
           try {
             const rootNode = hwv.model.getAbsoluteRootNode();
@@ -637,18 +467,6 @@
             setupSlider();
             applyPositions();
             applyClusterColors();
-
-            // Restore any cluster_tag already saved in the map JSON
-            if (mapData.parts.some(p => p.cluster_tag)) {
-              const thresh   = parseFloat(edgeThresh.value) || 0;
-              const clusters = computeClusters(mapData.matrix, thresh);
-              partState.forEach((st, i) => {
-                const tag = mapData.parts[i]?.cluster_tag;
-                if (tag) clusterTags[clusters[i]] = tag;
-              });
-              updateClusterTagLabels();
-              saveTagsRow.style.display = '';
-            }
 
             if (hwv.view.fitWorld) hwv.view.fitWorld();
             spinner.style.display = 'none';
