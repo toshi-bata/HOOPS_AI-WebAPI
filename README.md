@@ -659,6 +659,7 @@ GET  /similarity/map/show?map=<map_id>
 | Existing file IDs | `?file_ids=<id1>,<id2>,...` query parameter |
 | CAD file uploads | `files` multipart field (one or more) |
 | ZIP archive | `zip_file` multipart field (auto-extracted, Zip Slip protected) |
+| Sync mode | `?sync=true` — block until done and return full result (HTTP 200). Optional `?timeout=<seconds>` (default 300). Recommended for MCP/scripted clients that cannot poll. |
 
 At least **two** valid parts are required.  Accepts the same three input sources as
 `POST /similarity/compare`.  The embeddings model is taken from the server-wide setting
@@ -673,15 +674,18 @@ The viewer page fetches its layout data from `/out/shape_map_<map_id>.json`.
 curl -s -X POST http://localhost:8000/files/upload -F "file=@part_a.step"
 curl -s -X POST http://localhost:8000/files/upload -F "file=@part_b.step"
 
-# Generate shape map
+# Generate shape map (async — returns job_id immediately)
 curl -s -X POST "http://localhost:8000/similarity/map?file_ids=<id_a>,<id_b>" | python -m json.tool
+
+# Generate shape map (sync — blocks until done, returns full result)
+curl -s -X POST "http://localhost:8000/similarity/map?file_ids=<id_a>,<id_b>&sync=true" | python -m json.tool
 
 # Open the viewer_url from the response in a browser
 ```
 
-**Windows (PowerShell)  Eupload parts directly:**
+**Windows (PowerShell)  Eupload parts directly (sync mode):**
 ```powershell
-curl.exe -X POST "http://127.0.0.1:8000/similarity/map" -F "files=@C:\path\to\bracket_a.step" -F "files=@C:\path\to\bracket_b.step"
+curl.exe -X POST "http://127.0.0.1:8000/similarity/map?sync=true" -F "files=@C:\path\to\bracket_a.step" -F "files=@C:\path\to\bracket_b.step"
 ```
 
 **Response (abridged):**

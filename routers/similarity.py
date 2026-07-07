@@ -7,7 +7,7 @@ import zipfile
 from typing import Any, Dict, List, Optional
 
 import core
-from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, File, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 
@@ -476,18 +476,39 @@ class MapJobStatus(BaseModel):
 @router.post("/map", response_model=MapJobStatus, status_code=202)
 def similarity_map(
     request: Request,
+    response: Response,
     file_ids: Optional[str] = Query(
         None,
         description="Comma-separated file_ids of already-uploaded CAD files.",
     ),
     files: Optional[List[UploadFile]] = File(None),
     zip_file: Optional[UploadFile] = File(None),
+    sync: bool = Query(
+        False,
+        description=(
+            "If true, block until the job completes and return the full result "
+            "directly (status 200). Useful for MCP / scripted clients that cannot "
+            "poll. Use ``timeout`` to cap the wait time."
+        ),
+    ),
+    timeout: float = Query(
+        300.0,
+        ge=1.0,
+        description="Maximum seconds to wait when sync=true. Defaults to 300 s.",
+    ),
 ):
-    """Start a Shape Space Map computation job (async).
+    """Start a Shape Space Map computation job.
 
-    Returns immediately with a ``job_id`` and ``status: "processing"``.
+    **Async mode (default, ``sync=false``):** Returns immediately with HTTP 202,
+    a ``job_id`` and ``status: "processing"``.
     Poll ``GET /similarity/map/job/{job_id}`` to check progress and retrieve
     the result once ``status`` becomes ``"done"`` or ``"failed"``.
+
+    **Sync mode (``sync=true``):** Blocks until the computation finishes (or
+    ``timeout`` seconds elapse) and returns the full result in a single HTTP 200
+    response.  If the timeout expires before completion the response is HTTP 202
+    with ``status: "processing"`` and you can continue polling via the job
+    endpoint.  Recommended for MCP or scripted clients that cannot poll.
 
     Input sources can be combined freely:
 
@@ -546,6 +567,7 @@ def similarity_map(
 
     base_url = str(request.base_url).rstrip("/")
     job_id = uuid.uuid4().hex[:12]
+    done_event = threading.Event()
 
     with _map_jobs_lock:
         _map_jobs[job_id] = {"status": "processing"}
@@ -607,11 +629,34 @@ def similarity_map(
             with _map_jobs_lock:
                 _map_jobs[job_id] = {"status": "done", "result": shape_map}
 
+            print(f"[Shape Map] Done  job_id={job_id}  viewer_url={shape_map.viewer_url}", flush=True)
+
         except Exception as exc:
             with _map_jobs_lock:
                 _map_jobs[job_id] = {"status": "failed", "error": str(exc)}
+            print(f"[Shape Map] Failed  job_id={job_id}  error={exc}", flush=True)
+        finally:
+            done_event.set()
 
     threading.Thread(target=_run_job, daemon=True).start()
+
+    if sync:
+        done_event.wait(timeout=timeout)
+        with _map_jobs_lock:
+            job = _map_jobs[job_id]
+        if job["status"] == "processing":
+            # Timed out — client can continue polling
+            response.status_code = 202
+        else:
+            response.status_code = 200
+        return MapJobStatus(
+            job_id=job_id,
+            status=job["status"],
+            error=job.get("error"),
+            result=job.get("result"),
+        )
+
+    response.status_code = 202
     return MapJobStatus(job_id=job_id, status="processing")
 
 
