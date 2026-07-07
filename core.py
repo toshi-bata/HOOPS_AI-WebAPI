@@ -35,26 +35,28 @@ MFR_dataset_explorer = None
 MFR_inference_model = None
 CAD_viewers: dict[str, dict[str, Any]] = {}  # session_id -> {file_key -> viewer_info}
 CAD_face_colors: dict[str, list] = {}  # scs_filename -> [[r,g,b], ...] indexed by face_id
-cad_searcher = None
-shape_index = None
 PART_CLASS_inference_model = None
 PART_CLASS_dataset_explorer = None
 _embedder = None
 _embedder_signal = None
 _embedding_memory_cache: dict[str, dict] = {}  # cache_key -> embedding entry
 
-# Model key constants
-_EMBEDDER_MODEL_DEFAULT = "default"
+# ---------------------------------------------------------------------------
+# Embedding model key constants
+# "legacy" = 1M model (HOOPS_AI_EMBEDDINGS_MODEL_NAME)
+# "signal" = SIGNAL model (HOOPS_AI_EMBEDDINGS_MODEL_NAME_SIGNAL)
+# ---------------------------------------------------------------------------
+_EMBEDDER_MODEL_LEGACY = "legacy"
 _EMBEDDER_MODEL_SIGNAL = "signal"
-_EMBEDDER_MODELS = frozenset({_EMBEDDER_MODEL_DEFAULT, _EMBEDDER_MODEL_SIGNAL})
+_EMBEDDER_MODELS = frozenset({_EMBEDDER_MODEL_LEGACY, _EMBEDDER_MODEL_SIGNAL})
 
-# Server-wide active embedding model (default: SIGNAL).
+# Server-wide active embedding model (used by /compare, /map, /index/create).
 # Use get_active_embedding_model() / set_active_embedding_model() to read/write.
 _active_embedding_model: str = _EMBEDDER_MODEL_SIGNAL
 
 
 def get_active_embedding_model() -> str:
-    """Return the server-wide active embedding model key ('default' or 'signal')."""
+    """Return the server-wide active embedding model key ('legacy' or 'signal')."""
     return _active_embedding_model
 
 
@@ -69,6 +71,40 @@ def set_active_embedding_model(model: str) -> None:
             f"Invalid model '{model}'. Must be one of: {sorted(_EMBEDDER_MODELS)}."
         )
     _active_embedding_model = model
+
+
+# ---------------------------------------------------------------------------
+# Default index preset management
+# "signal" = TMCAD_SIGNAL.faiss (SIGNAL model)  Edefault
+# "legacy" = HOOPS_AI_FAISS_INDEX_PATH (1M model)
+# ---------------------------------------------------------------------------
+
+# Per-preset caches: keyed by preset name ("legacy" / "signal")
+_default_index_searchers: dict[str, Any] = {}
+_default_index_shapes: dict[str, Any] = {}
+
+# Active preset for /similarity/search, /similarity/part-image, /similarity/index-info
+_active_default_index: str = _EMBEDDER_MODEL_SIGNAL  # "signal"
+
+_DEFAULT_INDEX_PRESETS = frozenset({_EMBEDDER_MODEL_LEGACY, _EMBEDDER_MODEL_SIGNAL})
+
+
+def get_active_default_index() -> str:
+    """Return the active default-index preset key ('legacy' or 'signal')."""
+    return _active_default_index
+
+
+def set_active_default_index(preset: str) -> None:
+    """Set the active default-index preset.
+
+    Raises ``ValueError`` if *preset* is not a recognised key.
+    """
+    global _active_default_index
+    if preset not in _DEFAULT_INDEX_PRESETS:
+        raise ValueError(
+            f"Invalid index preset '{preset}'. Must be one of: {sorted(_DEFAULT_INDEX_PRESETS)}."
+        )
+    _active_default_index = preset
 
 
 # ---------------------------------------------------------------------------
@@ -128,7 +164,7 @@ def _index_faiss_path(name: str) -> pathlib.Path:
     return INDEXES_DIR / name / "index.faiss"
 
 
-def _get_embedder_dim(model: str = _EMBEDDER_MODEL_DEFAULT) -> int:
+def _get_embedder_dim(model: str = _EMBEDDER_MODEL_LEGACY) -> int:
     """Return the embedding dimension from the lazy-loaded HOOPSEmbeddings model."""
     embedder = get_embedder(model)
     dim = getattr(embedder, "embedding_dim", None)
@@ -188,7 +224,7 @@ def _save_named_index_atomic(name: str, vs: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
-def create_index(name: str, model: str = _EMBEDDER_MODEL_DEFAULT) -> dict[str, Any]:
+def create_index(name: str, model: str = _EMBEDDER_MODEL_LEGACY) -> dict[str, Any]:
     """Create a new empty named index.
 
     *model* selects which embeddings model is used for this index: ``'default'``
@@ -222,7 +258,7 @@ def list_indexes() -> list[dict[str, Any]]:
     """Return metadata for all known indexes, including the read-only ``default`` index."""
     result: list[dict[str, Any]] = []
 
-    # "default" index – read-only, backed by the env-configured FAISS file
+    # "default" index  Eread-only, backed by the env-configured FAISS file
     load_env_file()
     faiss_name = os.environ.get("HOOPS_AI_FAISS_INDEX_PATH")
     if faiss_name:
@@ -237,8 +273,9 @@ def list_indexes() -> list[dict[str, Any]]:
                     .strftime("%Y-%m-%dT%H:%M:%SZ")
                 )
             default_count: Optional[int] = None
-            if shape_index is not None:
-                ids = getattr(shape_index, "ids", None)
+            _legacy_idx = _default_index_shapes.get(_EMBEDDER_MODEL_LEGACY)
+            if _legacy_idx is not None:
+                ids = getattr(_legacy_idx, "ids", None)
                 if ids is not None:
                     try:
                         default_count = int(len(ids))
@@ -253,7 +290,7 @@ def list_indexes() -> list[dict[str, Any]]:
                 }
             )
 
-    # Named indexes from INDEXES_DIR — each lives in its own subdirectory
+    # Named indexes from INDEXES_DIR  Eeach lives in its own subdirectory
     if INDEXES_DIR.exists():
         for faiss_file in sorted(INDEXES_DIR.glob("*/index.faiss")):
             idx_name = faiss_file.parent.name
@@ -300,7 +337,7 @@ def add_to_index(
     the model recorded in the index's ``model.json`` sidecar is used so that all
     entries in an index always use the same model.
 
-    Optional *tag_map* is a ``{file_id: cluster_tag}`` mapping — when provided,
+    Optional *tag_map* is a ``{file_id: cluster_tag}`` mapping  Ewhen provided,
     ``cluster_tag`` is stored in the FAISS record metadata and in the per-index
     ``tags.json`` sidecar for fast tag-based retrieval.
 
@@ -433,7 +470,7 @@ def add_map_parts_to_index(map_id: str, index_name: str) -> dict[str, Any]:
     tag_map = {p["file_id"]: p["cluster_tag"] for p in parts if p.get("cluster_tag")}
 
     # Use the model recorded in the map JSON so the index matches the map's embeddings.
-    map_model: str = data.get("model", _EMBEDDER_MODEL_DEFAULT)
+    map_model: str = data.get("model", _EMBEDDER_MODEL_LEGACY)
 
     # Auto-create the index if it doesn't exist yet
     if not _index_faiss_path(index_name).exists():
@@ -664,13 +701,13 @@ def _load_index_model(name: str) -> str:
 
     path = _index_model_sidecar_path(name)
     if not path.exists():
-        return _EMBEDDER_MODEL_DEFAULT
+        return _EMBEDDER_MODEL_LEGACY
     try:
         with open(path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
-        return data.get("model", _EMBEDDER_MODEL_DEFAULT)
+        return data.get("model", _EMBEDDER_MODEL_LEGACY)
     except Exception:
-        return _EMBEDDER_MODEL_DEFAULT
+        return _EMBEDDER_MODEL_LEGACY
 
 
 def _save_index_model(name: str, model: str) -> None:
@@ -719,7 +756,7 @@ def _generate_part_thumbnail(file_id: str, index_name: str) -> Optional[pathlib.
         if png_file and png_file.exists():
             png_file.replace(dest_png)
 
-        # Remove the SCS file — we only need the PNG for thumbnails
+        # Remove the SCS file  Ewe only need the PNG for thumbnails
         for p_str in (scs_result, str(tmp_scs)):
             if p_str:
                 p = pathlib.Path(p_str)
@@ -778,7 +815,7 @@ def _build_search_grid_image(
             ax.set_xticks([])
             ax.set_yticks([])
 
-        # Query cell — look up embedding cache for filename
+        # Query cell  Elook up embedding cache for filename
         query_name = "query"
         cached = _embedding_memory_cache.get(f"hoops_embeddings_model__{query_file_id}")
         if cached:
@@ -826,18 +863,28 @@ def get_MFR_inference_model():
     return MFR_inference_model
 
 
+def get_cad_searcher_for(preset: str):
+    """Return (lazy-init) the CADSearch searcher for the given preset."""
+    if preset not in _default_index_searchers:
+        _default_index_searchers[preset] = create_cad_searcher_for(preset)
+    return _default_index_searchers[preset]
+
+
+def get_shape_index_for(preset: str):
+    """Return (lazy-init) the loaded FAISS index for the given preset."""
+    if preset not in _default_index_shapes:
+        _default_index_shapes[preset] = load_shape_index_for(preset)
+    return _default_index_shapes[preset]
+
+
 def get_cad_searcher():
-    global cad_searcher
-    if cad_searcher is None:
-        cad_searcher = create_cad_searcher()
-    return cad_searcher
+    """Return the CADSearch searcher for the currently active default-index preset."""
+    return get_cad_searcher_for(get_active_default_index())
 
 
 def get_shape_index():
-    global shape_index
-    if shape_index is None:
-        shape_index = load_shape_index()
-    return shape_index
+    """Return the FAISS index for the currently active default-index preset."""
+    return get_shape_index_for(get_active_default_index())
 
 
 def get_part_class_inference_model():
@@ -1118,50 +1165,58 @@ def create_MFR_inference_model():
     return inference_model
 
 
-def create_cad_searcher():
-    from hoops_ai.ml import CADSearch
-    from hoops_ai.ml.embeddings import HOOPSEmbeddings
+def _resolve_default_index_paths(preset: str) -> dict:
+    """Return the resolved paths for the given default-index preset.
 
+    Returns a dict with keys:
+      ``faiss_path`` (Path), ``images_dir`` (Path), ``model_key`` (str)
+    """
     load_env_file()
-
     notebooks_dir = require_path(
         pathlib.Path(get_required_env("HOOPS_AI_NOTEBOOK_DIR")),
         env_name="HOOPS_AI_NOTEBOOK_DIR",
     )
-    ckpt_name = get_required_env("HOOPS_AI_EMBEDDINGS_MODEL_NAME")
-    trained_model = require_path(
-        notebooks_dir.parent.joinpath("packages", "trained_ml_models", ckpt_name),
-        env_name="HOOPS_AI_EMBEDDINGS_MODEL_NAME",
-    )
+    if preset == _EMBEDDER_MODEL_LEGACY:
+        faiss_file_name = get_required_env("HOOPS_AI_FAISS_INDEX_PATH")
+        faiss_path = require_path(
+            notebooks_dir.joinpath(faiss_file_name),
+            env_name="HOOPS_AI_FAISS_INDEX_PATH",
+        )
+        images_dir = pathlib.Path(
+            os.environ.get("HOOPS_AI_EMBEDDINGS_IMAGES_DIR")
+            or notebooks_dir / "out" / "images"
+        )
+        model_key = _EMBEDDER_MODEL_LEGACY
+    elif preset == _EMBEDDER_MODEL_SIGNAL:
+        faiss_path = require_path(
+            notebooks_dir.parent / "packages" / "vectorstores" / "tmcad" / "TMCAD_SIGNAL.faiss",
+            env_name="packages/vectorstores/tmcad/TMCAD_SIGNAL.faiss",
+        )
+        images_dir = notebooks_dir.parent / "packages" / "vectorstores" / "tmcad" / "images_tmcad"
+        model_key = _EMBEDDER_MODEL_SIGNAL
+    else:
+        raise ValueError(f"Unknown default-index preset: '{preset}'")
+    return {"faiss_path": faiss_path, "images_dir": images_dir, "model_key": model_key}
 
-    HOOPSEmbeddings.register_model(
-        model_name="hoops_embeddings_model",
-        checkpoint_path=str(trained_model),
-    )
-    embedder = HOOPSEmbeddings(model="hoops_embeddings_model")
+
+def create_cad_searcher_for(preset: str):
+    """Create a CADSearch instance loaded with the embedder for *preset*."""
+    from hoops_ai.ml import CADSearch
+
+    embedder = get_embedder(_resolve_default_index_paths(preset)["model_key"])
     return CADSearch(shape_model=embedder)
 
 
-def load_shape_index():
-    load_env_file()
-
-    notebooks_dir = require_path(
-        pathlib.Path(get_required_env("HOOPS_AI_NOTEBOOK_DIR")),
-        env_name="HOOPS_AI_NOTEBOOK_DIR",
-    )
-    faiss_file_name = get_required_env("HOOPS_AI_FAISS_INDEX_PATH")
-    faiss_index_path = require_path(
-        notebooks_dir.joinpath(faiss_file_name),
-        env_name="HOOPS_AI_FAISS_INDEX_PATH",
-    )
-    searcher = get_cad_searcher()
-    # The FAISS index may have been pickled on Windows and contain WindowsPath objects.
+def load_shape_index_for(preset: str):
+    """Load the FAISS index for *preset* into its CADSearch searcher."""
+    paths = _resolve_default_index_paths(preset)
+    faiss_index_path = paths["faiss_path"]
+    searcher = get_cad_searcher_for(preset)
+    # Cross-OS pickle compatibility: Windows-pickled files contain WindowsPath objects.
     if not hasattr(pathlib, "WindowsPath") or not issubclass(pathlib.WindowsPath, pathlib.Path):
-        # Linux/Mac: patch WindowsPath → PurePosixPath so Windows-pickled data can be unpickled.
         pathlib.WindowsPath = pathlib.PurePosixPath  # type: ignore[attr-defined]
         return searcher.load_shape_index(path=str(faiss_index_path))
     else:
-        # Windows: patch PosixPath → WindowsPath so Linux-pickled data can be unpickled.
         _orig = pathlib.PosixPath
         try:
             pathlib.PosixPath = pathlib.WindowsPath  # type: ignore[misc]
@@ -1174,20 +1229,17 @@ def search_by_shape(cad_file_path: pathlib.Path, top_k: int = 10) -> dict[str, A
     import matplotlib.pyplot as plt
     from hoops_ai.insights import DatasetViewer
 
-    get_shape_index()  # ensure FAISS index is loaded into the searcher
-    searcher = get_cad_searcher()
+    preset = get_active_default_index()
+    get_shape_index_for(preset)  # ensure FAISS index is loaded into the searcher
+    searcher = get_cad_searcher_for(preset)
     hits = searcher.search_by_shape(str(cad_file_path), top_k=top_k)
     results = [
         {"id": _json_safe(hit.id), "score": _json_safe(hit.score)}
         for hit in hits[0]
     ]
 
-    notebooks_dir = pathlib.Path(get_required_env("HOOPS_AI_NOTEBOOK_DIR"))
-    embeddings_images_dir = pathlib.Path(
-        os.environ.get("HOOPS_AI_EMBEDDINGS_IMAGES_DIR")
-        or notebooks_dir / "out" / "images"
-    )
-    ds_viewer = DatasetViewer([], [], [], reference_dir=embeddings_images_dir)
+    images_dir = _resolve_default_index_paths(preset)["images_dir"]
+    ds_viewer = DatasetViewer([], [], [], reference_dir=images_dir)
     fig = ds_viewer.show_search_results(hits, query_file=str(cad_file_path), grid_cols=3)
     if fig is None:
         fig = plt.gcf()
@@ -1203,43 +1255,45 @@ def search_by_shape(cad_file_path: pathlib.Path, top_k: int = 10) -> dict[str, A
 def get_similar_search_index_info() -> dict[str, Any]:
     """Return metadata about the currently loaded FAISS similarity search index.
 
-    Always succeeds — returns ``status: "not_loaded"`` when neither the searcher
+    Always succeeds  Ereturns ``status: "not_loaded"`` when neither the searcher
     nor the index has been initialised yet, so callers never need to treat an
     unloaded state as an error.
     """
     import datetime
 
     load_env_file()
+    preset = get_active_default_index()
 
-    # Resolve the index file path from env (best-effort, no error if missing).
+    # Resolve index file path for the active preset (best-effort, no error if missing).
     index_path: Optional[str] = None
     index_last_modified: Optional[str] = None
-    faiss_file_name = os.environ.get("HOOPS_AI_FAISS_INDEX_PATH")
-    if faiss_file_name:
-        notebooks_dir_str = os.environ.get("HOOPS_AI_NOTEBOOK_DIR")
-        if notebooks_dir_str:
-            faiss_index_path = pathlib.Path(notebooks_dir_str) / faiss_file_name
-            index_path = str(faiss_index_path)
-            if faiss_index_path.exists():
-                mtime = faiss_index_path.stat().st_mtime
-                index_last_modified = (
-                    datetime.datetime.fromtimestamp(mtime, tz=datetime.timezone.utc)
-                    .strftime("%Y-%m-%dT%H:%M:%SZ")
-                )
-        else:
-            index_path = faiss_file_name
+    try:
+        paths = _resolve_default_index_paths(preset)
+        faiss_index_path = paths["faiss_path"]
+        index_path = str(faiss_index_path)
+        if faiss_index_path.exists():
+            mtime = faiss_index_path.stat().st_mtime
+            index_last_modified = (
+                datetime.datetime.fromtimestamp(mtime, tz=datetime.timezone.utc)
+                .strftime("%Y-%m-%dT%H:%M:%SZ")
+            )
+    except Exception:
+        pass
 
-    # Trigger lazy loading of the searcher + FAISS index if not yet initialised.
-    # This mirrors what search_by_shape() does on first use.  If loading fails
-    # (missing env var, file not found, etc.) we fall through to not_loaded.
-    if cad_searcher is None or shape_index is None:
+    # Trigger lazy loading if not yet initialised.
+    searcher = _default_index_searchers.get(preset)
+    idx = _default_index_shapes.get(preset)
+    if searcher is None or idx is None:
         try:
-            get_shape_index()  # populates both cad_searcher and shape_index globals
+            get_shape_index_for(preset)
+            searcher = _default_index_searchers.get(preset)
+            idx = _default_index_shapes.get(preset)
         except Exception:
-            pass  # genuine not_loaded situation — reported below
+            pass
 
-    if cad_searcher is None and shape_index is None:
+    if searcher is None and idx is None:
         return {
+            "preset": preset,
             "status": "not_loaded",
             "index_path": index_path,
             "index_last_modified": index_last_modified,
@@ -1250,6 +1304,7 @@ def get_similar_search_index_info() -> dict[str, Any]:
         }
 
     info: dict[str, Any] = {
+        "preset": preset,
         "status": "loaded",
         "index_path": index_path,
         "index_last_modified": index_last_modified,
@@ -1260,12 +1315,10 @@ def get_similar_search_index_info() -> dict[str, Any]:
     }
 
     # Extract embedder attributes from the CADSearch object.
-    # HOOPSEmbeddings does not expose public attributes via dir(), so we try
-    # both the public and private attribute names used by CADSearch internals.
-    if cad_searcher is not None:
+    if searcher is not None:
         embedder = (
-            getattr(cad_searcher, "_shape_model", None)
-            or getattr(cad_searcher, "shape_model", None)
+            getattr(searcher, "_shape_model", None)
+            or getattr(searcher, "shape_model", None)
         )
         if embedder is not None:
             info["model_name"] = (
@@ -1274,25 +1327,22 @@ def get_similar_search_index_info() -> dict[str, Any]:
             )
 
     # Extract counts, dim, and metadata from the loaded EmbeddingBatch object.
-    # EmbeddingBatch exposes: ids, dim, model, metadata, values, get.
-    if shape_index is not None:
-        ids = getattr(shape_index, "ids", None)
+    if idx is not None:
+        ids = getattr(idx, "ids", None)
         if ids is not None:
             try:
                 info["index_count"] = int(len(ids))
             except (TypeError, ValueError):
                 pass
-        # embedding_dim lives on the batch as .dim
-        dim = getattr(shape_index, "dim", None)
+        dim = getattr(idx, "dim", None)
         if dim is not None:
             try:
                 info["embedding_dim"] = int(dim)
             except (TypeError, ValueError):
                 info["embedding_dim"] = _json_safe(dim)
-        # Fall back to model name from the batch if not obtained from the embedder.
         if info["model_name"] is None:
-            info["model_name"] = getattr(shape_index, "model", None)
-        metadata = getattr(shape_index, "metadata", None)
+            info["model_name"] = getattr(idx, "model", None)
+        metadata = getattr(idx, "metadata", None)
         if metadata is not None:
             info["metadata"] = _json_safe(dict(metadata) if hasattr(metadata, "items") else metadata)
 
@@ -1304,17 +1354,17 @@ def get_similar_search_index_info() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def get_embedder(model: str = _EMBEDDER_MODEL_DEFAULT):
+def get_embedder(model: str = _EMBEDDER_MODEL_LEGACY):
     """Lazy-initialise HOOPSEmbeddings without loading a FAISS index.
 
     *model* selects which checkpoint to load:
 
-    * ``'default'`` — ``HOOPS_AI_EMBEDDINGS_MODEL_NAME`` (1M model), registered
+    * ``'legacy'``  E``HOOPS_AI_EMBEDDINGS_MODEL_NAME`` (1M model), registered
       as ``"hoops_embeddings_model"``.
-    * ``'signal'`` — ``HOOPS_AI_EMBEDDINGS_MODEL_NAME_SIGNAL`` (SIGNAL model),
+    * ``'signal'``  E``HOOPS_AI_EMBEDDINGS_MODEL_NAME_SIGNAL`` (SIGNAL model),
       registered as ``"hoops_embeddings_signal"``.
 
-    Safe to call alongside (or after) ``create_cad_searcher()`` — the model
+    Safe to call alongside (or after) ``create_cad_searcher_for()``  Ethe model
     registration is guarded so it is never performed twice.
     """
     global _embedder, _embedder_signal
@@ -1388,10 +1438,10 @@ def _l2_normalize(v):
     return (v / norm).astype(np.float32)
 
 
-def compute_embedding(file_id: str, model: str = _EMBEDDER_MODEL_DEFAULT) -> dict[str, Any]:
+def compute_embedding(file_id: str, model: str = _EMBEDDER_MODEL_LEGACY) -> dict[str, Any]:
     """Compute (or retrieve from cache) the shape embedding for a CAD file.
 
-    *model* selects the embedder: ``'default'`` (1M model) or ``'signal'``
+    *model* selects the embedder: ``'legacy'`` (1M model) or ``'signal'``
     (SIGNAL model).  The cache key includes the model so that embeddings from
     different models are stored and retrieved independently.
 
@@ -1441,7 +1491,7 @@ def compute_embedding(file_id: str, model: str = _EMBEDDER_MODEL_DEFAULT) -> dic
             _embedding_memory_cache[cache_key] = entry
             return {**entry, "cached": True}
         except Exception:
-            pass  # corrupted cache — fall through to recompute
+            pass  # corrupted cache  Efall through to recompute
 
     # 3. Compute via HOOPS embedder
     cad_path = find_persistent_CAD_file(file_id)
@@ -1490,13 +1540,13 @@ def compute_embedding(file_id: str, model: str = _EMBEDDER_MODEL_DEFAULT) -> dic
     return {**entry, "cached": False}
 
 
-def compare_embeddings(file_ids: list[str], model: str = _EMBEDDER_MODEL_DEFAULT) -> dict[str, Any]:
+def compare_embeddings(file_ids: list[str], model: str = _EMBEDDER_MODEL_LEGACY) -> dict[str, Any]:
     """Compute an N×N cosine similarity matrix for the given file_ids.
 
     All embedding vectors are L2-normalised, so cosine similarity equals their
     dot product.  Diagonal entries are forced to exactly ``1.0``.
 
-    *model* selects the embedder: ``'default'`` (1M model) or ``'signal'``
+    *model* selects the embedder: ``'legacy'`` (1M model) or ``'signal'``
     (SIGNAL model).
 
     Returns a dict with keys:
@@ -1566,7 +1616,7 @@ def _classical_mds(dist_matrix: "Any") -> tuple:
     D_squared = D ** 2
     B = -0.5 * H @ D_squared @ H
 
-    # eigh returns eigenvalues in ascending order → take the largest 3
+    # eigh returns eigenvalues in ascending order ↁEtake the largest 3
     eigenvalues, eigenvectors = np.linalg.eigh(B)
     eigenvalues = np.maximum(eigenvalues, 0.0)  # clamp negatives to 0
 
@@ -1602,7 +1652,7 @@ def _classical_mds(dist_matrix: "Any") -> tuple:
 def export_scs_for_part(file_id: str) -> str:
     """Convert a persistent CAD file to an SCS stream cache and return its filename.
 
-    A thin wrapper around the conversion logic in ``create_CAD_viewer`` — it does
+    A thin wrapper around the conversion logic in ``create_CAD_viewer``  Eit does
     NOT touch the per-session viewer cache.  Returns just the SCS filename (served
     under ``/out/``), not a full path or URL.
     """
@@ -1629,7 +1679,7 @@ def export_scs_for_part(file_id: str) -> str:
 
 
 def compute_shape_map_data(
-    file_ids: list[str], model: str = _EMBEDDER_MODEL_DEFAULT
+    file_ids: list[str], model: str = _EMBEDDER_MODEL_LEGACY
 ) -> dict[str, Any]:
     """Compute a 3D "Shape Space Map" layout for a set of CAD parts.
 
@@ -1714,7 +1764,7 @@ def _project_oos_mds(
     """Project a new point into an existing classical-MDS coordinate space.
 
     Uses the out-of-sample extension formula (Bengio et al., 2004).  Given the
-    ``N×3`` coordinate matrix ``coords`` (mean-centred) and the ``N×N`` distance
+    ``NÁE`` coordinate matrix ``coords`` (mean-centred) and the ``N×N`` distance
     matrix ``dist_matrix`` used to produce it, place the new point whose
     distances to the N existing points are ``query_dist`` (length-N array) into
     the same space.
@@ -1736,14 +1786,14 @@ def _project_oos_mds(
     d_q_sq = query_dist ** 2
 
     # Row/column means of D² (symmetric, so equal)
-    row_means = d_sq.mean(axis=0)      # (N,) — (1/N) Σ_i D²_ij for each j
+    row_means = d_sq.mean(axis=0)      # (N,)  E(1/N) Σ_i D²_ij for each j
     grand_mean = float(d_sq.mean())
     q_mean = float(d_q_sq.mean())
 
     # Out-of-sample centering: b_j = <x_query, x_j> approximation
     b = -0.5 * (d_q_sq - q_mean - row_means + grand_mean)  # (N,)
 
-    # Solve coords @ x_query ≈ b  (least-squares, handles rank-deficiency)
+    # Solve coords @ x_query ≁Eb  (least-squares, handles rank-deficiency)
     x_q, _, _, _ = np.linalg.lstsq(coords, b, rcond=None)
 
     # Ensure output is exactly length 3
@@ -1772,8 +1822,8 @@ def query_shape_map(map_id: str, query_file_id: str, persist: bool = False) -> d
     ``query_part``, ``nearest_parts`` (top-5), ``persisted``, ``errors``.
 
     Raises:
-      ``KeyError``    – map *map_id* does not exist.
-      ``RuntimeError``– embedding computation fails for the query part.
+      ``KeyError``     Emap *map_id* does not exist.
+      ``RuntimeError`` Eembedding computation fails for the query part.
     """
     import json
 
@@ -1789,9 +1839,9 @@ def query_shape_map(map_id: str, query_file_id: str, persist: bool = False) -> d
     existing_parts: list[dict] = map_data["parts"]
     existing_matrix: list[list[float]] = map_data["matrix"]
     n = len(existing_parts)
-    model: str = map_data.get("model", _EMBEDDER_MODEL_DEFAULT)
+    model: str = map_data.get("model", _EMBEDDER_MODEL_LEGACY)
 
-    # Compute query embedding (raises on failure — let caller handle)
+    # Compute query embedding (raises on failure  Elet caller handle)
     query_emb = compute_embedding(query_file_id, model=model)
     query_vec = query_emb["vector"]
     query_filename = query_emb["filename"]
@@ -1829,7 +1879,7 @@ def query_shape_map(map_id: str, query_file_id: str, persist: bool = False) -> d
         "is_query": True,
     }
 
-    # Build (N+1)×(N+1) extended similarity matrix
+    # Build (N+1)ÁEN+1) extended similarity matrix
     ext_matrix = [row + [query_sims[i]] for i, row in enumerate(existing_matrix)]
     ext_matrix.append(query_sims + [1.0])
 
@@ -2262,8 +2312,8 @@ def _get_part_class_flow_root_dir() -> pathlib.Path:
     """Resolve the flow root directory for the part classification dataset.
 
     Priority (same convention as MFR):
-    1. <HOOPS_AI_NOTEBOOK_DIR>/out/flows/<FLOW_NAME>  — notebook-generated output (has stream_cache)
-    2. <HOOPS_AI_NOTEBOOK_DIR>/../packages/flows/<FLOW_NAME>  — pre-packaged dataset
+    1. <HOOPS_AI_NOTEBOOK_DIR>/out/flows/<FLOW_NAME>   Enotebook-generated output (has stream_cache)
+    2. <HOOPS_AI_NOTEBOOK_DIR>/../packages/flows/<FLOW_NAME>   Epre-packaged dataset
     """
     notebooks_dir = require_path(
         pathlib.Path(get_required_env("HOOPS_AI_NOTEBOOK_DIR")),

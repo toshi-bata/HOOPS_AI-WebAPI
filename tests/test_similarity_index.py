@@ -50,7 +50,7 @@ def _fake_vs(ids: list[str] | None = None):
     return vs
 
 
-def _fake_embedding(file_id: str, dim: int = 4, model: str = "default"):
+def _fake_embedding(file_id: str, dim: int = 4, model: str = "legacy"):
     import numpy as np
 
     v = np.array([1.0, 0.0, 0.0, 0.0][:dim], dtype=np.float32)

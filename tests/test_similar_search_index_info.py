@@ -21,6 +21,22 @@ class FakeEmbeddingBatch:
         self.dim = dim
 
 
+# Helpers to populate the preset dicts for a given preset key
+def _patch_preset(searcher, batch, preset="signal"):
+    """Return context managers that populate the preset caches."""
+    import core
+    searchers = dict(core._default_index_searchers)
+    shapes = dict(core._default_index_shapes)
+    if searcher is not None:
+        searchers[preset] = searcher
+    if batch is not None:
+        shapes[preset] = batch
+    return (
+        patch.object(core, "_default_index_searchers", searchers),
+        patch.object(core, "_default_index_shapes", shapes),
+    )
+
+
 class SimilarSearchIndexInfoTests(unittest.TestCase):
 
     # ------------------------------------------------------------------
@@ -28,13 +44,14 @@ class SimilarSearchIndexInfoTests(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_returns_not_loaded_when_neither_searcher_nor_index_is_loaded(self):
-        """When cad_searcher and shape_index are both None → status not_loaded."""
+        """When caches are empty and get_shape_index_for raises → status not_loaded."""
         import core
 
         with (
-            patch.object(core, "cad_searcher", None),
-            patch.object(core, "shape_index", None),
-            patch.object(core, "get_shape_index", side_effect=RuntimeError("no index")),
+            patch.object(core, "_default_index_searchers", {}),
+            patch.object(core, "_default_index_shapes", {}),
+            patch.object(core, "get_shape_index_for", side_effect=RuntimeError("no index")),
+            patch.object(core, "_resolve_default_index_paths", side_effect=RuntimeError("no env")),
             patch.dict("os.environ", {}, clear=True),
         ):
             result = core.get_similar_search_index_info()
@@ -46,18 +63,19 @@ class SimilarSearchIndexInfoTests(unittest.TestCase):
         self.assertIsNone(result["metadata"])
 
     def test_not_loaded_includes_index_path_from_env(self):
-        """Even when not loaded, index_path is populated from env vars (internal use)."""
+        """Even when not loaded, index_path is populated from _resolve_default_index_paths."""
+        import pathlib
         import core
 
-        env = {
-            "HOOPS_AI_NOTEBOOK_DIR": "/fake/notebooks",
-            "HOOPS_AI_FAISS_INDEX_PATH": "my_index.faiss",
-        }
+        fake_path = pathlib.Path("/fake/notebooks/my_index.faiss")
+
         with (
-            patch.object(core, "cad_searcher", None),
-            patch.object(core, "shape_index", None),
-            patch.object(core, "get_shape_index", side_effect=RuntimeError("no index")),
-            patch.dict("os.environ", env, clear=True),
+            patch.object(core, "_default_index_searchers", {}),
+            patch.object(core, "_default_index_shapes", {}),
+            patch.object(core, "get_shape_index_for", side_effect=RuntimeError("no index")),
+            patch.object(core, "_resolve_default_index_paths",
+                         return_value={"faiss_path": fake_path, "images_dir": pathlib.Path("/fake/images"), "model_key": "legacy"}),
+            patch.dict("os.environ", {}, clear=True),
         ):
             result = core.get_similar_search_index_info()
 
@@ -69,15 +87,20 @@ class SimilarSearchIndexInfoTests(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_returns_loaded_with_model_name_and_dim_from_embedder(self):
-        """model_name and embedding_dim come from cad_searcher.shape_model."""
+        """model_name and embedding_dim come from the preset's CADSearch and EmbeddingBatch."""
+        import pathlib
         import core
 
+        preset = core.get_active_default_index()
         searcher = FakeCADSearch()
         batch = FakeEmbeddingBatch(ids=list(range(100)))
+        fake_path = pathlib.Path("/fake/index.faiss")
 
+        cm1, cm2 = _patch_preset(searcher, batch, preset)
         with (
-            patch.object(core, "cad_searcher", searcher),
-            patch.object(core, "shape_index", batch),
+            cm1, cm2,
+            patch.object(core, "_resolve_default_index_paths",
+                         return_value={"faiss_path": fake_path, "images_dir": pathlib.Path("/fake/images"), "model_key": preset}),
             patch.dict("os.environ", {}, clear=True),
         ):
             result = core.get_similar_search_index_info()
@@ -88,14 +111,19 @@ class SimilarSearchIndexInfoTests(unittest.TestCase):
         self.assertEqual(result["index_count"], 100)
 
     def test_returns_loaded_when_only_searcher_is_set(self):
-        """Works even when shape_index is None but cad_searcher is present."""
+        """Works even when shape_index cache is absent but searcher is present."""
+        import pathlib
         import core
 
+        preset = core.get_active_default_index()
         searcher = FakeCADSearch()
+        fake_path = pathlib.Path("/fake/index.faiss")
 
+        cm1, cm2 = _patch_preset(searcher, None, preset)
         with (
-            patch.object(core, "cad_searcher", searcher),
-            patch.object(core, "shape_index", None),
+            cm1, cm2,
+            patch.object(core, "_resolve_default_index_paths",
+                         return_value={"faiss_path": fake_path, "images_dir": pathlib.Path("/fake/images"), "model_key": preset}),
             patch.dict("os.environ", {}, clear=True),
         ):
             result = core.get_similar_search_index_info()
@@ -109,15 +137,20 @@ class SimilarSearchIndexInfoTests(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_index_count_reflects_number_of_ids_in_batch(self):
+        import pathlib
         import core
 
+        preset = core.get_active_default_index()
         ids = [f"part_{i}" for i in range(42)]
         batch = FakeEmbeddingBatch(ids=ids)
         searcher = FakeCADSearch()
+        fake_path = pathlib.Path("/fake/index.faiss")
 
+        cm1, cm2 = _patch_preset(searcher, batch, preset)
         with (
-            patch.object(core, "cad_searcher", searcher),
-            patch.object(core, "shape_index", batch),
+            cm1, cm2,
+            patch.object(core, "_resolve_default_index_paths",
+                         return_value={"faiss_path": fake_path, "images_dir": pathlib.Path("/fake/images"), "model_key": preset}),
             patch.dict("os.environ", {}, clear=True),
         ):
             result = core.get_similar_search_index_info()
@@ -125,14 +158,19 @@ class SimilarSearchIndexInfoTests(unittest.TestCase):
         self.assertEqual(result["index_count"], 42)
 
     def test_metadata_is_returned_when_present(self):
+        import pathlib
         import core
 
+        preset = core.get_active_default_index()
         batch = FakeEmbeddingBatch(metadata={"failed_count": 3, "source": "fabwave"})
         searcher = FakeCADSearch()
+        fake_path = pathlib.Path("/fake/index.faiss")
 
+        cm1, cm2 = _patch_preset(searcher, batch, preset)
         with (
-            patch.object(core, "cad_searcher", searcher),
-            patch.object(core, "shape_index", batch),
+            cm1, cm2,
+            patch.object(core, "_resolve_default_index_paths",
+                         return_value={"faiss_path": fake_path, "images_dir": pathlib.Path("/fake/images"), "model_key": preset}),
             patch.dict("os.environ", {}, clear=True),
         ):
             result = core.get_similar_search_index_info()
@@ -142,14 +180,19 @@ class SimilarSearchIndexInfoTests(unittest.TestCase):
         self.assertEqual(result["metadata"]["source"], "fabwave")
 
     def test_metadata_is_none_when_absent(self):
+        import pathlib
         import core
 
+        preset = core.get_active_default_index()
         batch = FakeEmbeddingBatch(metadata=None)
         searcher = FakeCADSearch()
+        fake_path = pathlib.Path("/fake/index.faiss")
 
+        cm1, cm2 = _patch_preset(searcher, batch, preset)
         with (
-            patch.object(core, "cad_searcher", searcher),
-            patch.object(core, "shape_index", batch),
+            cm1, cm2,
+            patch.object(core, "_resolve_default_index_paths",
+                         return_value={"faiss_path": fake_path, "images_dir": pathlib.Path("/fake/images"), "model_key": preset}),
             patch.dict("os.environ", {}, clear=True),
         ):
             result = core.get_similar_search_index_info()
@@ -158,17 +201,22 @@ class SimilarSearchIndexInfoTests(unittest.TestCase):
 
     def test_model_name_falls_back_to_embedding_batch_model(self):
         """When embedder has no model_name, fall back to shape_index.model."""
+        import pathlib
         import core
 
         class EmbedderNoName:
             model_name = None
 
+        preset = core.get_active_default_index()
         searcher = FakeCADSearch(embedder=EmbedderNoName())
         batch = FakeEmbeddingBatch(model="fallback_model_v2")
+        fake_path = pathlib.Path("/fake/index.faiss")
 
+        cm1, cm2 = _patch_preset(searcher, batch, preset)
         with (
-            patch.object(core, "cad_searcher", searcher),
-            patch.object(core, "shape_index", batch),
+            cm1, cm2,
+            patch.object(core, "_resolve_default_index_paths",
+                         return_value={"faiss_path": fake_path, "images_dir": pathlib.Path("/fake/images"), "model_key": preset}),
             patch.dict("os.environ", {}, clear=True),
         ):
             result = core.get_similar_search_index_info()
@@ -196,6 +244,7 @@ class SimilarSearchIndexInfoTests(unittest.TestCase):
         client = TestClient(app)
 
         not_loaded_info = {
+            "preset": "signal",
             "status": "not_loaded",
             "index_path": None,
             "index_last_modified": None,
@@ -229,6 +278,7 @@ class SimilarSearchIndexInfoTests(unittest.TestCase):
         client = TestClient(app)
 
         loaded_info = {
+            "preset": "signal",
             "status": "loaded",
             "index_path": "/fake/notebooks/fabwave_embeddings_store.faiss",
             "index_last_modified": "2025-06-01T12:00:00Z",

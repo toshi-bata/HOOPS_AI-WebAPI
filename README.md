@@ -20,16 +20,22 @@ A FastAPI-based REST API that exposes [HOOPS AI](https://www.techsoft3d.com/deve
   ├── notebooks/
   └── packages/
       ├── flows/
-      └── trained_ml_models/
+      ├── trained_ml_models/
+      └── vectorstores/
+          └── tmcad/
+              ├── TMCAD_SIGNAL.faiss
+              ├── TMCAD_SIGNAL.meta
+              └── images_tmcad/
   ```
 
-  **Pre-run requirements**  Esome endpoints require notebook output to be generated in advance:
+  **Pre-run requirements**  Esome endpoints require notebook output or downloaded files to be present in advance:
 
-  | Endpoint | Notebook to run | Generated files |
+  | Endpoint | What to do | Required files |
   |---|---|---|
-  | MFR endpoints | `3b_workflow_for_MFR_cadsynth.ipynb` | `notebooks/out/flows/ETL_CADSYNTH_training_b2/`<br>`.dataset` / `.infoset` / `.attribset` <br>`stream_cache/*.png` |
-  | `/similarity/search` | `5b_cad_search_using_HOOPS_embeddings.ipynb`<br>(up to **Saving an Index**) | `notebooks/fabwave_embeddings_store.faiss` / `.meta` |
-  | `/part-classification/dataset/*` | `3c_workflow_for_Part_classification_fabwave.ipynb`<br>(up to **Pipeline execution**) | `notebooks/out/flows/ETL_Fabwave_training_b2/` <br> `.dataset` / `.infoset` / `.attribset`<br>`stream_cache/*.png` |
+  | MFR endpoints | Run `3b_workflow_for_MFR_cadsynth.ipynb` | `notebooks/out/flows/ETL_CADSYNTH_training_b2/`<br>`.dataset` / `.infoset` / `.attribset` <br>`stream_cache/*.png` |
+  | `/similarity/search` (`signal` preset, **default**) | Download `TMCAD_SIGNAL.faiss` bundle from Tech Soft 3D File Transfer and place under `packages/vectorstores/tmcad/`  E**no notebook run needed** | `packages/vectorstores/tmcad/TMCAD_SIGNAL.faiss` / `.meta`<br>`packages/vectorstores/tmcad/images_tmcad/` |
+  | `/similarity/search` (`legacy` preset) | Run `5b_cad_search_using_HOOPS_embeddings.ipynb` (up to **Saving an Index**) | `notebooks/fabwave_embeddings_store.faiss` / `.meta` |
+  | `/part-classification/dataset/*` | Run `3c_workflow_for_Part_classification_fabwave.ipynb`<br>(up to **Pipeline execution**) | `notebooks/out/flows/ETL_Fabwave_training_b2/` <br> `.dataset` / `.infoset` / `.attribset`<br>`stream_cache/*.png` |
 
   > **Tip:** Pre-generated dataset files are also available for download from the Tech Soft 3D File Transfer service  Eno need to run the notebooks yourself:  
   > URL: https://transfer.techsoft3d.com/link/mb9c3d8eTHhVHFpnI0FFaD  
@@ -95,9 +101,9 @@ cp .env.example .env
 | `HOOPS_AI_NOTEBOOK_DIR` | ✁E| Absolute path to your HOOPS AI notebooks directory |
 | `HOOPS_AI_MFR_FLOW_NAME` | optional | MFR flow name (dataset files are resolved relative to this) |
 | `HOOPS_AI_MFR_MODEL_NAME` | optional | MFR trained model checkpoint filename (e.g. `ts3d_162k_mfr.ckpt`) |
-| `HOOPS_AI_EMBEDDINGS_MODEL_NAME` | optional | Embeddings trained model checkpoint filename (e.g. `ts3d_1M_hoops_embeddings.ckpt`) |
-| `HOOPS_AI_EMBEDDINGS_MODEL_NAME_SIGNAL` | optional | SIGNAL architecture embeddings model checkpoint (e.g. `ts3d_2M_hoops_embeddings_SIGNAL-preview.ckpt`). This is the **default active model** used by `/compare`, `/map`, and `/index/create`. Change the active model at runtime via `PUT /similarity/settings`. |
-| `HOOPS_AI_FAISS_INDEX_PATH` | optional | FAISS index file for shape similarity search (e.g. `fabwave_embeddings_store.faiss`) |
+| `HOOPS_AI_EMBEDDINGS_MODEL_NAME` | optional | Embeddings trained model checkpoint filename (e.g. `ts3d_1M_hoops_embeddings.ckpt`). Used by the **`legacy` default-index preset** and when `PUT /similarity/default-model/setting?model=legacy`. |
+| `HOOPS_AI_EMBEDDINGS_MODEL_NAME_SIGNAL` | optional | SIGNAL architecture embeddings model checkpoint (e.g. `ts3d_2M_hoops_embeddings_SIGNAL-preview.ckpt`). Used as the **default active model** for `/compare`, `/map`, and `/index/create`, and also by the **`signal` default-index preset** (`TMCAD_SIGNAL.faiss`). Change the active model at runtime via `PUT /similarity/default-model/setting`. |
+| `HOOPS_AI_FAISS_INDEX_PATH` | optional | FAISS index file for the **`legacy` preset** of similarity search (e.g. `fabwave_embeddings_store.faiss`), located directly under `HOOPS_AI_NOTEBOOK_DIR`. Not used when the active default-index is `signal`. |
 | `HOOPS_AI_PART_CLASS_MODEL_NAME` | optional | Filename of the trained GraphClassification checkpoint under `packages/trained_ml_models/` (e.g. `ts3d_graphclassification_5k_10epochs.ckpt`) |
 | `HOOPS_AI_PART_CLASS_FLOW_NAME` | optional | Part Classification flow name (required for `/part-classification/dataset/*` endpoints). The server automatically prefers `<HOOPS_AI_NOTEBOOK_DIR>/out/flows/<name>` (notebook output, includes thumbnails) and falls back to `../packages/flows/<name>` (pre-packaged). |
 | `HOOPS_AI_PART_CLASS_LABEL_KEY` | optional | Label array key for dataset queries (default: `part_label`; use `task_A` for custom ETL) |
@@ -455,89 +461,45 @@ curl -X POST "http://127.0.0.1:8000/MFR/inference" -F "file=@/path/to/model.SLDP
 
 ### Shape Similarity Search
 
-Upload a CAD file and retrieve the most similar parts from the indexed database using HOOPS Embeddings and a FAISS index.
+Shape similarity endpoints fall into two groups:
 
-```
-POST /similarity/search?top_k=<n>
-```
-
-**Windows (PowerShell):**
-```powershell
-curl.exe -X POST "http://127.0.0.1:8000/similarity/search?top_k=10" -F "file=@C:\path\to\model.step"
-```
-
-**Linux:**
-```bash
-curl -X POST "http://127.0.0.1:8000/similarity/search?top_k=10" -F "file=@/path/to/model.step"
-```
-
-**Response:**
-
-```json
-{
-  "results": [
-    {"id": "part_042", "score": 0.997},
-    {"id": "part_018", "score": 0.991}
-  ],
-  "image_url": "http://127.0.0.1:8000/out/<uuid>.png"
-}
-```
-
-- `results`  Etop-k matches sorted by similarity score (higher = more similar)
-- `image_url`  EURL to a PNG grid image of the search results
-
-#### Part thumbnail image
-
-Return the pre-generated PNG thumbnail for a trained part by filename.
-
-> **Note:** Requires thumbnail images pre-generated by the embeddings notebook (`5b_cad_search_using_HOOPS_embeddings.ipynb`). Images are expected at `notebooks/out/images/STEP/<stem>.png` (or `<stem>_white.png`). Returns 404 if the images have not been generated.
-
-```
-GET /similarity/part-image?filename=<name>
-```
-
-**Windows (PowerShell):**
-```powershell
-curl.exe "http://127.0.0.1:8000/similarity/part-image?filename=part_042.stp" -o part_042.png
-```
-
-**Linux:**
-```bash
-curl "http://127.0.0.1:8000/similarity/part-image?filename=part_042.stp" -o part_042.png
-```
-
-**Response:** PNG image (`image/png`)
+- **Embedding model (index-free)**  E`default-model/setting`, `embed`, `compare`, `map`  Euse the embedding model only; no FAISS index is needed.
+- **Index-based search**  E`default-index/setting`, `search`, `index-info`, and all `index/*` endpoints  Equery a FAISS index (built-in presets or a user-created named index).
 
 ---
 
-#### Embedding model settings
+#### Embedding model (index-free)
 
-Read or change the server-wide active embedding model used by `/compare`, `/map`, and `/index/create`.
+These endpoints use the embedding model only and do **not** require a FAISS index.
+
+##### Default embedding model setting
+
+Read or change the server-wide active embedding model used by `/embed`, `/compare`, `/map`, and `/index/create`.
 The default is `'signal'` (HOOPS AI SIGNAL model).
 
 ```
-GET  /similarity/settings
-PUT  /similarity/settings?model=<model>
+GET  /similarity/default-model/setting
+PUT  /similarity/default-model/setting?model=<model>
 ```
 
 | Parameter | Values | Description |
 |---|---|---|
-| `model` | `signal` *(default)*, `default` | Embeddings model: `'signal'` = SIGNAL model (`HOOPS_AI_EMBEDDINGS_MODEL_NAME_SIGNAL`); `'default'` = 1M model (`HOOPS_AI_EMBEDDINGS_MODEL_NAME`) |
+| `model` | `signal` *(default)*, `legacy` | Embeddings model: `'signal'` = SIGNAL model (`HOOPS_AI_EMBEDDINGS_MODEL_NAME_SIGNAL`); `'legacy'` = 1M model (`HOOPS_AI_EMBEDDINGS_MODEL_NAME`) |
 
-**Windows (PowerShell) — read current setting:**
+**Windows (PowerShell)  Eread current setting:**
 ```powershell
-curl.exe "http://127.0.0.1:8000/similarity/settings"
+curl.exe "http://127.0.0.1:8000/similarity/default-model/setting"
 ```
 
-**Windows (PowerShell) — switch to 1M model:**
+**Windows (PowerShell)  Eswitch to 1M (legacy) model:**
 ```powershell
-curl.exe -X PUT "http://127.0.0.1:8000/similarity/settings?model=default"
+curl.exe -X PUT "http://127.0.0.1:8000/similarity/default-model/setting?model=legacy"
 ```
 
 **Linux:**
 ```bash
-curl "http://127.0.0.1:8000/similarity/settings"
-curl -X PUT "http://127.0.0.1:8000/similarity/settings?model=signal"
+curl "http://127.0.0.1:8000/similarity/default-model/setting"
+curl -X PUT "http://127.0.0.1:8000/similarity/default-model/setting?model=signal"
 ```
 
 **Response:**
@@ -547,71 +509,10 @@ curl -X PUT "http://127.0.0.1:8000/similarity/settings?model=signal"
 
 ---
 
-#### Similarity search index info
-
-Return metadata about the FAISS similarity-search index currently loaded on
-the server.  This endpoint is read-only and never triggers index construction
-or model training.  When the index has not been loaded yet, a
-``"not_loaded"`` status is returned instead of an error.
-
-```
-GET /similarity/index-info
-```
-
-**Windows (PowerShell):**
-```powershell
-curl.exe "http://127.0.0.1:8000/similarity/index-info"
-```
-
-**Linux:**
-```bash
-curl "http://127.0.0.1:8000/similarity/index-info"
-```
-
-**Response (index loaded):**
-
-```json
-{
-  "status": "loaded",
-  "index_path": "/path/to/notebooks/fabwave_embeddings_store.faiss",
-  "index_last_modified": "2025-06-01T12:00:00Z",
-  "index_count": 5000,
-  "model_name": "hoops_embeddings_model",
-  "embedding_dim": 512,
-  "metadata": {"failed_count": 0}
-}
-```
-
-**Response (index not yet loaded):**
-
-```json
-{
-  "status": "not_loaded",
-  "index_path": "/path/to/notebooks/fabwave_embeddings_store.faiss",
-  "index_last_modified": "2025-06-01T12:00:00Z",
-  "index_count": null,
-  "model_name": null,
-  "embedding_dim": null,
-  "metadata": null
-}
-```
-
-| Field | Description |
-|---|---|
-| `status` | `"loaded"` or `"not_loaded"` |
-| `index_path` | Absolute path to the FAISS index file (from env) |
-| `index_last_modified` | UTC last-modified timestamp of the index file (`null` if file not found) |
-| `index_count` | Number of embeddings stored in the index |
-| `model_name` | Name of the embedding model used to build the index |
-| `embedding_dim` | Dimension of each embedding vector |
-| `metadata` | Auxiliary metadata stored in the index (e.g. `failed_count`) |
-
----
-
-#### Compute shape embedding (index-free)
+##### Compute shape embedding (index-free)
 
 Compute (or retrieve from cache) the shape embedding vector for a single CAD part.
-This endpoint does **not** require a FAISS index  Ethe embedding model alone is sufficient.
+This endpoint does **not** require a FAISS index  Ethe embedding model alone is sufficient.
 
 ```
 POST /similarity/embed
@@ -660,7 +561,7 @@ Add `?include_vector=true` to include the raw float array in the response (omitt
 
 ---
 
-#### Compare parts by shape similarity (index-free)
+##### Compare parts by shape similarity (index-free)
 
 Compare multiple CAD parts and return a pairwise cosine similarity matrix.
 Input sources can be combined freely.
@@ -676,28 +577,28 @@ POST /similarity/compare
 | CAD file uploads | `files` multipart field (one or more) |
 | ZIP archive | `zip_file` multipart field (auto-extracted, Zip Slip protected) |
 
-The embeddings model is taken from the server-wide setting (`PUT /similarity/settings`).
+The embeddings model is taken from the server-wide setting (`PUT /similarity/default-model/setting`).
 Default is `'signal'` (HOOPS AI SIGNAL model).
 
 At least **two** valid parts are required.  Per-file failures are collected in `errors`
 and do not abort the request (unless fewer than two parts succeed).
 
-**Windows (PowerShell)  Eupload two files directly:**
+**Windows (PowerShell)  Eupload two files directly:**
 ```powershell
 curl.exe -X POST "http://127.0.0.1:8000/similarity/compare" -F "files=@C:\path\to\bracket_a.step" -F "files=@C:\path\to\bracket_b.step"
 ```
 
-**Linux  Eupload two files directly:**
+**Linux  Eupload two files directly:**
 ```bash
 curl -X POST "http://127.0.0.1:8000/similarity/compare" -F "files=@/path/to/bracket_a.step" -F "files=@/path/to/bracket_b.step"
 ```
 
-**Linux  Ecompare using already-uploaded file_ids:**
+**Linux  Ecompare using already-uploaded file_ids:**
 ```bash
 curl -X POST "http://127.0.0.1:8000/similarity/compare?file_ids=a3f8c2...,cd34ef..."
 ```
 
-**Linux — compare files inside a ZIP archive:**
+**Linux  Ecompare files inside a ZIP archive:**
 ```bash
 curl -X POST "http://127.0.0.1:8000/similarity/compare" -F "zip_file=@/path/to/parts.zip"
 ```
@@ -742,12 +643,11 @@ Uncompressed size is capped at 500 MB and file count at 50 (HTTP 413 if exceeded
 
 ---
 
-## Shape Space Map
+##### Shape space map (index-free)
 
 Arrange a set of CAD parts in an interactive 3D scene so that shape-similar parts are
 placed closer together.  Embeddings are compared by cosine similarity and laid out with
 classical MDS (multidimensional scaling), then rendered together in the HOOPS Web Viewer.
-
 
 ```
 POST /similarity/map
@@ -762,12 +662,12 @@ GET  /similarity/map/show?map=<map_id>
 
 At least **two** valid parts are required.  Accepts the same three input sources as
 `POST /similarity/compare`.  The embeddings model is taken from the server-wide setting
-(`PUT /similarity/settings`; default `'signal'`).  The response includes a 3D `position`
+(`PUT /similarity/default-model/setting`; default `'signal'`).  The response includes a 3D `position`
 for each part, the similarity `matrix`, a Kruskal `stress` value (layout accuracy:
 `0.0` is exact), and an absolute `viewer_url` that opens the interactive map.
 The viewer page fetches its layout data from `/out/shape_map_<map_id>.json`.
 
-**Linux  Egenerate a shape map from uploaded files:**
+**Linux  Egenerate a shape map from uploaded files:**
 ```bash
 # Upload parts
 curl -s -X POST http://localhost:8000/files/upload -F "file=@part_a.step"
@@ -779,7 +679,7 @@ curl -s -X POST "http://localhost:8000/similarity/map?file_ids=<id_a>,<id_b>" | 
 # Open the viewer_url from the response in a browser
 ```
 
-**Windows (PowerShell)  Eupload parts directly:**
+**Windows (PowerShell)  Eupload parts directly:**
 ```powershell
 curl.exe -X POST "http://127.0.0.1:8000/similarity/map" -F "files=@C:\path\to\bracket_a.step" -F "files=@C:\path\to\bracket_b.step"
 ```
@@ -818,7 +718,7 @@ accuracy indicator, and per-part filename labels that track the camera.
 
 ---
 
-### Shape Space Map  EQuery Overlay
+##### Shape space map  Equery overlay (index-free)
 
 Highlight a single query CAD part inside an **existing** shape-space map.  The query
 part is embedded with the same pipeline used to build the map and projected into the
@@ -834,16 +734,16 @@ POST /similarity/map/{map_id}/query
 | `map_id` | path | `map_id` returned by `POST /similarity/map` |
 | `file_id` | query | `file_id` of an already-uploaded part |
 | `file` | multipart | CAD file upload (alternative to `file_id`) |
-| `persist` | query | `false` (default)  Eoverlay only; `true`  Eadd to original map permanently |
+| `persist` | query | `false` (default)  Eoverlay only; `true`  Eadd to original map permanently |
 
 Supply **either** `file_id` **or** a `file` upload.
 
-**Windows (PowerShell)  Edirect upload:**
+**Windows (PowerShell)  Edirect upload:**
 ```powershell
 curl.exe -X POST "http://localhost:8000/similarity/map/d2a7f205/query" -F "file=@C:\temp\Sprocket.step"
 ```
 
-**Linux – use an already-uploaded file:**
+**Linux  Euse an already-uploaded file:**
 ```bash
 curl -s -X POST "http://localhost:8000/similarity/map/d2a7f205/query?file_id=<id>" | python -m json.tool
 ```
@@ -870,41 +770,202 @@ curl -s -X POST "http://localhost:8000/similarity/map/d2a7f205/query?file_id=<id
 | Field | Description |
 |---|---|
 | `overlay_map_id` | New temporary map that includes the query part |
-| `viewer_url` | Absolute URL  Eopen in browser to see the query highlighted in magenta |
+| `viewer_url` | Absolute URL  Eopen in browser to see the query highlighted in magenta |
 | `query_part` | Query part metadata, position, and `is_query: true` flag |
 | `nearest_parts` | Top-5 most similar existing parts sorted by cosine similarity |
 | `persisted` | `true` when `persist=true` was used and the query was added to the original map |
 
-The overlay map is independent of the original  Eby default it exists only until the
+The overlay map is independent of the original  Eby default it exists only until the
 server restarts.  Use `persist=true` to permanently add the query part to the source map.
 
 ---
 
+#### Index-based search
 
+These endpoints query the active default FAISS index to find similar parts.  The active preset can be switched between `signal` (TMCAD, default) and `legacy` (fabwave) via `PUT /similarity/default-index/setting`.
+
+##### Default index setting
+
+Read or switch the active default-index preset used by `/search`, `/part-image`, and `/index-info`.
+
+```
+GET  /similarity/default-index/setting
+PUT  /similarity/default-index/setting?index=<preset>
+```
+
+| Parameter | Values | Description |
+|---|---|---|
+| `index` | `signal` *(default)*, `legacy` | `'signal'` = TMCAD_SIGNAL.faiss (39 k parts, SIGNAL model); `'legacy'` = `HOOPS_AI_FAISS_INDEX_PATH` (1M model, notebook-generated) |
+
+**Windows (PowerShell)  Eread current setting:**
+```powershell
+curl.exe "http://127.0.0.1:8000/similarity/default-index/setting"
+```
+
+**Windows (PowerShell)  Eswitch to legacy (fabwave) index:**
+```powershell
+curl.exe -X PUT "http://127.0.0.1:8000/similarity/default-index/setting?index=legacy"
+```
+
+**Linux:**
+```bash
+curl "http://127.0.0.1:8000/similarity/default-index/setting"
+curl -X PUT "http://127.0.0.1:8000/similarity/default-index/setting?index=signal"
+```
+
+**Response:**
+```json
+{ "index": "signal" }
+```
+
+---
+
+##### Default index info
+
+Return metadata about the currently active FAISS similarity-search index.
+This endpoint is read-only and never triggers index construction
+or model training.  When the index has not been loaded yet, a
+``"not_loaded"`` status is returned instead of an error.
+
+```
+GET /similarity/index-info
+```
+
+**Windows (PowerShell):**
+```powershell
+curl.exe "http://127.0.0.1:8000/similarity/index-info"
+```
+
+**Linux:**
+```bash
+curl "http://127.0.0.1:8000/similarity/index-info"
+```
+
+**Response (index loaded):**
+
+```json
+{
+  "preset": "signal",
+  "status": "loaded",
+  "index_last_modified": "2025-06-01T12:00:00Z",
+  "index_count": 39736,
+  "model_name": "CUSTOM:hoops_embeddings_signal",
+  "embedding_dim": 2048,
+  "metadata": null
+}
+```
+
+**Response (index not yet loaded):**
+
+```json
+{
+  "preset": "signal",
+  "status": "not_loaded",
+  "index_last_modified": null,
+  "index_count": null,
+  "model_name": null,
+  "embedding_dim": null,
+  "metadata": null
+}
+```
+
+| Field | Description |
+|---|---|
+| `preset` | Active preset: `"signal"` or `"legacy"` |
+| `status` | `"loaded"` or `"not_loaded"` |
+| `index_last_modified` | UTC last-modified timestamp of the index file (`null` if file not found) |
+| `index_count` | Number of embeddings stored in the index |
+| `model_name` | Name of the embedding model used to build the index |
+| `embedding_dim` | Dimension of each embedding vector |
+| `metadata` | Auxiliary metadata stored in the index (e.g. `failed_count`) |
+
+---
+
+##### Search default index
+
+Upload a CAD file and retrieve the most similar parts from the active FAISS index.
+The active index is controlled by `PUT /similarity/default-index/setting` (default: `signal` = TMCAD_SIGNAL.faiss).
+
+```
+POST /similarity/search?top_k=<n>
+```
+
+**Windows (PowerShell):**
+```powershell
+curl.exe -X POST "http://127.0.0.1:8000/similarity/search?top_k=10" -F "file=@C:\path\to\model.step"
+```
+
+**Linux:**
+```bash
+curl -X POST "http://127.0.0.1:8000/similarity/search?top_k=10" -F "file=@/path/to/model.step"
+```
+
+**Response:**
+
+```json
+{
+  "results": [
+    {"id": "part_042", "score": 0.997},
+    {"id": "part_018", "score": 0.991}
+  ],
+  "image_url": "http://127.0.0.1:8000/out/<uuid>.png"
+}
+```
+
+- `results`  Etop-k matches sorted by similarity score (higher = more similar)
+- `image_url`  EURL to a PNG grid image of the search results
+
+---
+
+##### Part thumbnail image
+
+Return the pre-generated PNG thumbnail for a trained part by filename.
+
+> **Note:** Requires thumbnail images pre-generated by the embeddings notebook (`5b_cad_search_using_HOOPS_embeddings.ipynb`). Images are expected at `notebooks/out/images/STEP/<stem>.png` (or `<stem>_white.png`). Returns 404 if the images have not been generated.
+
+```
+GET /similarity/part-image?filename=<name>
+```
+
+**Windows (PowerShell):**
+```powershell
+curl.exe "http://127.0.0.1:8000/similarity/part-image?filename=part_042.stp" -o part_042.png
+```
+
+**Linux:**
+```bash
+curl "http://127.0.0.1:8000/similarity/part-image?filename=part_042.stp" -o part_042.png
+```
+
+**Response:** PNG image (`image/png`)
+
+---
+
+#### Named index management
 
 Manage user-created similarity indexes that grow over time.  Unlike the built-in
 read-only ``default`` index (backed by ``HOOPS_AI_FAISS_INDEX_PATH``), named indexes
 are fully writable: create an empty index, register new parts whenever they arrive,
-and query immediately — all via Web API with no notebook re-runs.
+and query immediately  Eall via Web API with no notebook re-runs.
 
 Each named index is bound to the embeddings model used when it was created (stored in
 a `model.json` sidecar).  The model for new indexes is taken from the server-wide
-setting (`PUT /similarity/settings`; default `'signal'`).  Indexes with different
+setting (`PUT /similarity/default-model/setting`; default `'signal'`).  Indexes with different
 models can coexist; the correct embedder is applied automatically at search and add time.
 
 Indexes are stored under ``APP_ROOT/indexes/<name>/`` (FAISS files + model sidecar).
 Index names must match ``^[a-z0-9_-]{1,64}$``; ``default`` is reserved.
 
-#### Incremental workflow example
+##### Incremental workflow example
 
 ```
-# 0. (Optional) Switch active model — default is already 'signal'
-PUT /similarity/settings?model=signal
+# 0. (Optional) Switch active embedding model  Edefault is already 'signal'
+PUT /similarity/default-model/setting?model=signal
 
-# 1. Create an empty index — uses the active model (signal by default)
+# 1. Create an empty index  Euses the active model (signal by default)
 POST /similarity/index/create?name=my-parts
 
-# 2. Register parts (repeat as new parts arrive) — model taken from index's model.json
+# 2. Register parts (repeat as new parts arrive)  Emodel taken from index's model.json
 POST /similarity/index/add?name=my-parts
      + files=@bracket_v1.step
 
@@ -919,18 +980,18 @@ POST /similarity/index/add?name=my-parts
 # 5. Remove a part
 DELETE /similarity/index/my-parts/parts?part_ids=<file_id>
 
-# 6. Delete the whole index (destructive — requires confirm=true)
+# 6. Delete the whole index (destructive  Erequires confirm=true)
 DELETE /similarity/index/my-parts?confirm=true
 ```
 
-#### Create a named index
+##### Create a named index
 
 ```
 POST /similarity/index/create?name=<name>
 ```
 
 Returns **201** on success, **409** if the name already exists, **422** for invalid/reserved names.
-The embeddings model is taken from the server-wide setting (`PUT /similarity/settings`).
+The embeddings model is taken from the server-wide setting (`PUT /similarity/default-model/setting`).
 
 | Parameter | Values | Description |
 |---|---|---|
@@ -953,7 +1014,7 @@ curl -X POST "http://127.0.0.1:8000/similarity/index/create?name=my-parts"
 
 ---
 
-#### List all indexes
+##### List all indexes
 
 ```
 GET /similarity/index/list
@@ -982,7 +1043,7 @@ curl "http://127.0.0.1:8000/similarity/index/list"
 
 ---
 
-#### Register parts in a named index
+##### Register parts in a named index
 
 ```
 POST /similarity/index/add?name=<name>
@@ -997,7 +1058,7 @@ Accepts the same three input sources as ``POST /similarity/compare``:
 | ZIP archive | `zip_file` multipart field |
 
 Re-registering a part ID overwrites the existing entry (``updated`` counter).
-Embedding results are cached on disk — re-adding the same file is fast.
+Embedding results are cached on disk  Ere-adding the same file is fast.
 
 The embedder is always the one recorded in the index's `model.json` sidecar (set at creation time).
 
@@ -1022,7 +1083,7 @@ curl -X POST "http://127.0.0.1:8000/similarity/index/add?name=my-parts" -F "file
 
 ---
 
-#### Search a named index
+##### Search a named index
 
 ```
 POST /similarity/index/{name}/search?top_k=<n>
@@ -1053,7 +1114,7 @@ curl -X POST "http://127.0.0.1:8000/similarity/index/my-parts/search?top_k=5" -F
 
 ---
 
-#### Remove parts from a named index
+##### Remove parts from a named index
 
 ```
 DELETE /similarity/index/{name}/parts?part_ids=<id1>,<id2>,...
@@ -1076,7 +1137,7 @@ curl -X DELETE "http://127.0.0.1:8000/similarity/index/my-parts/parts?part_ids=a
 
 ---
 
-#### Delete a named index
+##### Delete a named index
 
 ```
 DELETE /similarity/index/{name}?confirm=true

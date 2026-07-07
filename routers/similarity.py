@@ -29,6 +29,7 @@ class SimilarSearchIndexInfo(BaseModel):
     for internal/maintenance use.
     """
 
+    preset: Optional[str] = None
     status: str
     index_last_modified: Optional[str] = None
     index_count: Optional[int] = None
@@ -38,7 +39,7 @@ class SimilarSearchIndexInfo(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# GET/PUT /similarity/settings
+# GET/PUT /similarity/default-model/setting
 # ---------------------------------------------------------------------------
 
 
@@ -46,18 +47,18 @@ class EmbeddingSettings(BaseModel):
     model: str
 
 
-@router.get("/settings", response_model=EmbeddingSettings)
+@router.get("/default-model/setting", response_model=EmbeddingSettings)
 def get_settings():
-    """Return the server-wide active embedding model.
+    """Return the server-wide active embedding model used by ``/compare``, ``/map``, and ``/index/create``.
 
     * ``'signal'`` – HOOPS AI SIGNAL model (default)
-    * ``'default'`` – 1M model set by ``HOOPS_AI_EMBEDDINGS_MODEL_NAME``
+    * ``'legacy'`` – 1M model set by ``HOOPS_AI_EMBEDDINGS_MODEL_NAME``
     """
     return EmbeddingSettings(model=core.get_active_embedding_model())
 
 
-@router.put("/settings", response_model=EmbeddingSettings)
-def put_settings(model: str = Query(..., description="Embedding model key: 'signal' or 'default'.")):
+@router.put("/default-model/setting", response_model=EmbeddingSettings)
+def put_settings(model: str = Query(..., description="Embedding model key: 'signal' or 'legacy'.")):
     """Set the server-wide active embedding model.
 
     All subsequent ``/compare``, ``/map``, and ``/index/create`` calls will use
@@ -71,6 +72,41 @@ def put_settings(model: str = Query(..., description="Embedding model key: 'sign
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return EmbeddingSettings(model=core.get_active_embedding_model())
+
+
+# ---------------------------------------------------------------------------
+# GET/PUT /similarity/default-index/setting
+# ---------------------------------------------------------------------------
+
+
+class DefaultIndexSettings(BaseModel):
+    index: str
+
+
+@router.get("/default-index/setting", response_model=DefaultIndexSettings)
+def get_default_index_setting():
+    """Return the active default-index preset used by ``/search``, ``/part-image``, and ``/index-info``.
+
+    * ``'signal'`` – TMCAD_SIGNAL.faiss (SIGNAL model, 39 k parts) — **default**
+    * ``'legacy'`` – ``HOOPS_AI_FAISS_INDEX_PATH`` (1M model, notebook-generated)
+    """
+    return DefaultIndexSettings(index=core.get_active_default_index())
+
+
+@router.put("/default-index/setting", response_model=DefaultIndexSettings)
+def put_default_index_setting(index: str = Query(..., description="Index preset key: 'signal' or 'legacy'.")):
+    """Switch the active default-index preset.
+
+    Affects ``POST /similarity/search``, ``GET /similarity/part-image``, and
+    ``GET /similarity/index-info``.
+
+    Returns **422** if the preset key is unknown.
+    """
+    try:
+        core.set_active_default_index(index)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return DefaultIndexSettings(index=core.get_active_default_index())
 
 
 @router.post("/search")
@@ -112,11 +148,17 @@ def get_part_image(
     """Return the pre-generated PNG thumbnail for a trained part as a direct PNG image response."""
     stem = pathlib.Path(filename).stem
 
-    notebooks_dir = pathlib.Path(core.get_required_env("HOOPS_AI_NOTEBOOK_DIR"))
-    images_base_dir = pathlib.Path(
-        os.environ.get("HOOPS_AI_EMBEDDINGS_IMAGES_DIR")
-        or notebooks_dir / "out" / "images"
-    )
+    preset = core.get_active_default_index()
+    try:
+        paths = core._resolve_default_index_paths(preset)
+        images_base_dir = pathlib.Path(paths["images_dir"])
+    except Exception:
+        # Fall back to legacy default if path resolution fails
+        notebooks_dir = pathlib.Path(core.get_required_env("HOOPS_AI_NOTEBOOK_DIR"))
+        images_base_dir = pathlib.Path(
+            os.environ.get("HOOPS_AI_EMBEDDINGS_IMAGES_DIR")
+            or notebooks_dir / "out" / "images"
+        )
 
     # Search order: STEP/_white.png → STEP/.png → base/_white.png → base/.png
     candidates = [

@@ -171,7 +171,7 @@ class TestCompareEmbeddingsLogic(unittest.TestCase):
         import numpy as np
         import core
 
-        def fake_compute(file_id: str):
+        def fake_compute(file_id: str, **kwargs):
             v = np.array(vectors[file_id], dtype=np.float32)
             norm = float(np.linalg.norm(v))
             v = v / norm if norm > 0 else v
@@ -283,7 +283,7 @@ class TestSimilarityCompareRouter(unittest.TestCase):
 
         self.client = TestClient(_make_app())
 
-    def _fake_compute(self, file_id: str, vec=None):
+    def _fake_compute(self, file_id: str, vec=None, **kwargs):
         import numpy as np
 
         if vec is None:
