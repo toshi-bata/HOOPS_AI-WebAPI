@@ -198,6 +198,61 @@ Pass the returned `file_id` to any processing endpoint instead of re-uploading t
 
 ---
 
+#### Upload CAD file or ZIP from server-side path
+
+Register a CAD file or ZIP archive that already exists on the server's filesystem by providing
+its path directly. The server reads the file itself — no binary upload is needed. This is the
+recommended approach for **MCP / scripted clients** when the file path is known (e.g. a path
+the user pasted into the chat).
+
+```
+POST /files/upload-from-path?file_path=<path>
+```
+
+- **Single CAD file** — uploaded and a single `file_id` is returned.
+- **ZIP archive** — every recognised CAD file inside is extracted and uploaded;
+  all resulting `file_id` values are returned together.
+
+Absolute paths (e.g. `C:\temp\parts.zip`) are accepted as-is.
+Relative paths are resolved under `HOOPS_AI_CAD_SHARED_DIR`.
+
+**Windows (PowerShell) — single file:**
+```powershell
+curl.exe -X POST "http://127.0.0.1:8000/files/upload-from-path?file_path=C:\temp\bracket.stp"
+```
+
+**Windows (PowerShell) — ZIP archive:**
+```powershell
+curl.exe -X POST "http://127.0.0.1:8000/files/upload-from-path?file_path=C:\temp\parts.zip"
+```
+
+**Linux:**
+```bash
+curl -X POST "http://127.0.0.1:8000/files/upload-from-path?file_path=/tmp/parts.zip"
+```
+
+**Response:**
+
+```json
+{
+  "files": [
+    { "file_id": "a3f8c2...", "filename": "bracket_a.step" },
+    { "file_id": "cd34ef...", "filename": "bracket_b.step" }
+  ],
+  "errors": []
+}
+```
+
+Pass the returned `file_id` values to `POST /similarity/compare`, `POST /similarity/map`,
+`POST /similarity/index/add`, etc.
+
+ZIP limits: 500 MB total uncompressed size, 50 CAD files per archive (HTTP 413 if exceeded).
+
+> **Note:** Requires the WebAPI server to be able to access the given path.
+> For the typical local setup (MCP and WebAPI on the same machine) this works out of the box.
+
+---
+
 ### 3D CAD Viewer
 
 #### Launch viewer  EUpload file

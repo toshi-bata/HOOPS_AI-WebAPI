@@ -8,8 +8,10 @@ import pathlib
 import re
 import shutil
 import ssl
+import tempfile
 import threading
 import uuid
+import zipfile
 from contextlib import redirect_stdout
 from typing import Any, Optional
 
@@ -790,6 +792,18 @@ class EnvConfigError(Exception):
 
 class PathConfigError(Exception):
     """Raised when a path derived from an environment variable does not exist."""
+
+
+class ZipSlipError(RuntimeError):
+    """Raised when a ZIP archive contains a Zip Slip path traversal attempt."""
+
+
+class ZipSizeLimitError(RuntimeError):
+    """Raised when a ZIP archive's uncompressed size exceeds the configured limit."""
+
+
+class ZipFileLimitError(RuntimeError):
+    """Raised when a ZIP archive contains more files than the configured limit."""
 
 
 def get_required_env(name: str) -> str:
@@ -1967,6 +1981,92 @@ def list_persistent_CAD_files() -> list[dict[str, Any]]:
                 }
             )
     return result
+
+
+# Limits for ZIP extraction (also used by routers)
+ZIP_MAX_TOTAL_BYTES = 500 * 1024 * 1024  # 500 MB uncompressed
+ZIP_MAX_FILES = 50
+
+
+class _BytesUploadFile:
+    """Minimal duck-typed UploadFile used to pass in-memory bytes to core helpers."""
+
+    def __init__(self, data: bytes, filename: str) -> None:
+        self.filename = filename
+        self.file = io.BytesIO(data)
+
+
+def extract_zip_cad_files(
+    zip_data: bytes,
+    max_total_bytes: int = ZIP_MAX_TOTAL_BYTES,
+    max_files: int = ZIP_MAX_FILES,
+) -> tuple[list[tuple[str, str]], list[dict]]:
+    """Extract a ZIP archive and upload each valid CAD file persistently.
+
+    Returns ``(resolved, errors)`` where *resolved* is a list of
+    ``(file_id, display_name)`` tuples for successfully processed files, and
+    *errors* is a list of ``{"filename": ..., "detail": ...}`` dicts for files
+    that could not be processed.
+
+    Raises:
+        ZipSlipError: if any member path resolves outside the extraction directory.
+        ZipSizeLimitError: if the total uncompressed size exceeds *max_total_bytes*.
+        ZipFileLimitError: if the number of CAD files exceeds *max_files*.
+    """
+    resolved: list[tuple[str, str]] = []
+    errors: list[dict] = []
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = pathlib.Path(tmp_dir).resolve()
+
+        with zipfile.ZipFile(io.BytesIO(zip_data)) as zf:
+            total_size = 0
+            file_count = 0
+
+            for member in zf.infolist():
+                if member.is_dir():
+                    continue
+
+                # Zip Slip guard: resolve the destination and verify it stays
+                # inside the temporary directory.
+                member_dest = (tmp_path / member.filename).resolve()
+                try:
+                    member_dest.relative_to(tmp_path)
+                except ValueError:
+                    raise ZipSlipError(
+                        f"Zip Slip detected: '{member.filename}' "
+                        "resolves outside the extraction directory."
+                    )
+
+                suffix = pathlib.Path(member.filename).suffix.lower()
+                if suffix not in CAD_ALLOWED_EXTENSIONS:
+                    continue  # skip non-CAD entries silently
+
+                total_size += member.file_size
+                if total_size > max_total_bytes:
+                    raise ZipSizeLimitError(
+                        f"ZIP archive total uncompressed size exceeds the "
+                        f"{max_total_bytes // (1024 * 1024)} MB limit."
+                    )
+
+                file_count += 1
+                if file_count > max_files:
+                    raise ZipFileLimitError(
+                        f"ZIP archive contains more than {max_files} CAD files."
+                    )
+
+                member_dest.parent.mkdir(parents=True, exist_ok=True)
+                member_dest.write_bytes(zf.read(member.filename))
+
+                display_name = pathlib.Path(member.filename).name
+                try:
+                    fake = _BytesUploadFile(member_dest.read_bytes(), display_name)
+                    fid, _, _ = upload_CAD_file_persistent(fake)
+                    resolved.append((fid, display_name))
+                except Exception as exc:
+                    errors.append({"filename": display_name, "detail": str(exc)})
+
+    return resolved, errors
 
 
 def get_shared_CAD_file(cad_file_path: str) -> pathlib.Path:

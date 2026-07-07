@@ -3,7 +3,6 @@ import os
 import pathlib
 import threading
 import uuid
-import zipfile
 from typing import Any, Dict, List, Optional
 
 import core
@@ -254,8 +253,8 @@ class CompareResponse(BaseModel):
 # Limits for ZIP extraction
 # ---------------------------------------------------------------------------
 
-_ZIP_MAX_TOTAL_BYTES = 500 * 1024 * 1024  # 500 MB uncompressed
-_ZIP_MAX_FILES = 50
+_ZIP_MAX_TOTAL_BYTES = core.ZIP_MAX_TOTAL_BYTES
+_ZIP_MAX_FILES = core.ZIP_MAX_FILES
 
 
 class _BytesUploadFile:
@@ -1223,62 +1222,14 @@ def _process_zip(
     Raises ``HTTPException(400)`` on Zip Slip and ``HTTPException(413)`` when
     the uncompressed size or file count exceeds the configured limits.
     """
-    import tempfile
-
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        tmp_path = pathlib.Path(tmp_dir).resolve()
-
-        with zipfile.ZipFile(io.BytesIO(zip_data)) as zf:
-            total_size = 0
-            file_count = 0
-
-            for member in zf.infolist():
-                if member.is_dir():
-                    continue
-
-                # Zip Slip guard: resolve the destination and verify it stays
-                # inside the temporary directory.
-                member_dest = (tmp_path / member.filename).resolve()
-                try:
-                    member_dest.relative_to(tmp_path)
-                except ValueError:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=(
-                            f"Zip Slip detected: '{member.filename}' "
-                            "resolves outside the extraction directory."
-                        ),
-                    )
-
-                suffix = pathlib.Path(member.filename).suffix.lower()
-                if suffix not in core.CAD_ALLOWED_EXTENSIONS:
-                    continue  # skip non-CAD entries silently
-
-                total_size += member.file_size
-                if total_size > _ZIP_MAX_TOTAL_BYTES:
-                    raise HTTPException(
-                        status_code=413,
-                        detail=(
-                            f"ZIP archive total uncompressed size exceeds the "
-                            f"{_ZIP_MAX_TOTAL_BYTES // (1024 * 1024)} MB limit."
-                        ),
-                    )
-
-                file_count += 1
-                if file_count > _ZIP_MAX_FILES:
-                    raise HTTPException(
-                        status_code=413,
-                        detail=f"ZIP archive contains more than {_ZIP_MAX_FILES} CAD files.",
-                    )
-
-                member_dest.parent.mkdir(parents=True, exist_ok=True)
-                member_dest.write_bytes(zf.read(member.filename))
-
-                display_name = pathlib.Path(member.filename).name
-                try:
-                    fake = _BytesUploadFile(member_dest.read_bytes(), display_name)
-                    fid, _, _ = core.upload_CAD_file_persistent(fake)
-                    resolved.append((fid, display_name))
-                except Exception as exc:
-                    errors.append({"filename": display_name, "detail": str(exc)})
+    try:
+        new_resolved, new_errors = core.extract_zip_cad_files(
+            zip_data, max_total_bytes=_ZIP_MAX_TOTAL_BYTES, max_files=_ZIP_MAX_FILES
+        )
+    except core.ZipSlipError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except (core.ZipSizeLimitError, core.ZipFileLimitError) as exc:
+        raise HTTPException(status_code=413, detail=str(exc))
+    resolved.extend(new_resolved)
+    errors.extend(new_errors)
 
