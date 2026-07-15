@@ -2468,3 +2468,221 @@ def get_part_class_preview_image(file_ids: list, k: int = 25, grid_cols: int = 8
     plt.close(fig)
     return image_filename
 
+
+# ---------------------------------------------------------------------------
+# Context Layer prediction
+# ---------------------------------------------------------------------------
+
+
+class _Hit:
+    """Lightweight hit proxy exposing ``.id`` and ``.score`` for ContextPredictor.
+
+    Wraps a single ``{"id": str, "score": float}`` entry returned by a prior
+    similarity search so that it satisfies the duck-typed contract expected by
+    ``ContextPredictor.infer()``.
+    """
+
+    __slots__ = ("id", "score")
+
+    def __init__(self, id: str, score: float) -> None:  # noqa: A002
+        self.id = id
+        self.score = score
+
+
+def _build_aggregation_rule(spec: dict[str, Any]) -> Any:
+    """Build a ``NumericWeightedRule`` or ``NearestNeighborRule`` from a spec dict.
+
+    *spec* must contain a ``"type"`` key with value ``"numeric_weighted"`` or
+    ``"nearest_neighbor"``.  Remaining keys are forwarded as constructor kwargs.
+
+    Raises
+    ------
+    ValueError
+        When ``"type"`` is missing or not a recognised rule-type string.
+
+    Notes
+    -----
+    This helper performs its own lazy import and therefore relies on Python's
+    import cache; it should only be called after the ``hoops_ai.ml.context_layer``
+    guard in :func:`predict_context` has already run successfully.
+    """
+    from hoops_ai.ml.context_layer import NearestNeighborRule, NumericWeightedRule
+
+    rule_type = spec.get("type")
+    if rule_type == "numeric_weighted":
+        kwargs: dict[str, Any] = {
+            "log_scale": spec["log_scale"],
+            "auto_relevance_weight": spec["auto_relevance_weight"],
+        }
+        if spec.get("nearest_neighbor_threshold") is not None:
+            kwargs["nearest_neighbor_threshold"] = spec["nearest_neighbor_threshold"]
+        if spec.get("score_temperature") is not None:
+            kwargs["score_temperature"] = spec["score_temperature"]
+        return NumericWeightedRule(**kwargs)
+    elif rule_type == "nearest_neighbor":
+        kwargs = {}
+        if spec.get("threshold") is not None:
+            kwargs["threshold"] = spec["threshold"]
+        return NearestNeighborRule(**kwargs)
+    else:
+        raise ValueError(
+            f"Unknown rule type '{rule_type}'. "
+            "Must be 'numeric_weighted' or 'nearest_neighbor'."
+        )
+
+
+def predict_context(
+    hits: list[dict[str, Any]],
+    contexts: dict[str, dict[str, Any]],
+    keys: list[str],
+    numeric_keys: Optional[list[str]] = None,
+    query_context: Optional[dict[str, Any]] = None,
+    default_categorical_rule: Optional[dict[str, Any]] = None,
+    per_key_rules: Optional[dict[str, dict[str, Any]]] = None,
+    status_policy: Optional[dict[str, float]] = None,
+) -> dict[str, Any]:
+    """Predict missing metadata values from similarity-search hits.
+
+    Builds an in-memory ``_StaticContextProvider`` from *contexts*, wraps each
+    entry in *hits* as a :class:`_Hit`, constructs a ``ContextPredictor`` with
+    the supplied rule configuration, calls ``infer()``, and converts the result
+    to a JSON-serialisable dict.
+
+    This function is **stateless** — it performs no network I/O and holds no
+    reference to PLM/ERP systems.  The caller is responsible for populating
+    *contexts* from whatever metadata store it has access to.
+
+    Parameters
+    ----------
+    hits:
+        List of ``{"id": str, "score": float}`` dicts from a prior similarity
+        search.  Each entry is wrapped in a :class:`_Hit`.
+    contexts:
+        Caller-supplied metadata keyed by part id.  Only ids present here
+        are visible to the predictor; missing ids get an empty dict.
+    keys:
+        Metadata keys to predict (e.g. ``["Material", "Process", "CostUSD"]``).
+    numeric_keys:
+        Keys in *contexts* that should be treated as numeric by the predictor.
+        Forwarded to ``ContextProvider.list_numeric_keys()``.
+    query_context:
+        Known metadata for the query part (e.g. already-known ``Material``)
+        that the predictor can use as a boosting signal when computing
+        ``NumericWeightedRule`` or ``NearestNeighborRule`` scores.
+    default_categorical_rule:
+        Dict with ``temperature`` and/or ``min_margin`` for the default
+        ``CategoricalRule``.  ``None`` uses the hoops_ai built-in defaults.
+    per_key_rules:
+        Mapping from key name to a rule-spec dict as returned by
+        ``NumericRuleSpec.model_dump()``.  Keys not listed here fall back to
+        *default_categorical_rule*.
+    status_policy:
+        Optional ``{status_label: threshold}`` mapping forwarded verbatim to
+        ``ContextPredictor.infer()``.
+
+    Returns
+    -------
+    dict
+        ``{key: {"value": ..., "confidence": float, "status": str,
+        "injected_context": dict | None}}`` for every predicted key.
+
+    Raises
+    ------
+    EnvConfigError
+        When ``hoops_ai.ml.context_layer`` cannot be imported (e.g. the
+        hoops_ai package is not installed or the licence is not configured).
+        Other endpoints are unaffected.
+    ValueError
+        When an unknown rule type is supplied in *per_key_rules*.
+    """
+    try:
+        from hoops_ai.ml.context_layer import (
+            CategoricalRule,
+            ContextPredictor,
+            ContextProvider,
+        )
+    except ImportError as exc:
+        msg = (
+            "[CONFIG] hoops_ai.ml.context_layer could not be imported. "
+            "Ensure the hoops_ai package is installed and the licence is configured: "
+            f"{exc}"
+        )
+        logger.error(msg)
+        print(msg, flush=True)
+        raise EnvConfigError(msg) from exc
+
+    class _StaticContextProvider(ContextProvider):
+        """In-request ContextProvider that serves pre-supplied metadata dicts.
+
+        Instantiated once per request from caller-supplied *contexts* so that
+        ``ContextPredictor`` can retrieve metadata without any network I/O.
+
+        Parameters
+        ----------
+        contexts:
+            Part id → metadata dict.  Only ids present here are returned by
+            ``get_contexts``; unknown ids yield an empty dict.
+        numeric_keys:
+            Keys that ``ContextPredictor`` should treat as numeric.
+        """
+
+        def __init__(
+            self,
+            ctx: dict[str, dict[str, Any]],
+            nkeys: list[str],
+        ) -> None:
+            self._ctx = ctx
+            self._nkeys = list(nkeys)
+
+        def get_contexts(self, ids: list[str]) -> dict[str, dict[str, Any]]:
+            return {id_: self._ctx.get(id_, {}) for id_ in ids}
+
+        def list_numeric_keys(self) -> list[str]:
+            return self._nkeys
+
+    provider = _StaticContextProvider(
+        ctx=contexts,
+        nkeys=numeric_keys or [],
+    )
+
+    cat_rule_kwargs: dict[str, Any] = {}
+    if default_categorical_rule:
+        if "temperature" in default_categorical_rule:
+            cat_rule_kwargs["temperature"] = default_categorical_rule["temperature"]
+        if "min_margin" in default_categorical_rule:
+            cat_rule_kwargs["min_margin"] = default_categorical_rule["min_margin"]
+    default_cat = CategoricalRule(**cat_rule_kwargs)
+
+    built_per_key: dict[str, Any] = {}
+    if per_key_rules:
+        for key, spec in per_key_rules.items():
+            built_per_key[key] = _build_aggregation_rule(spec)
+
+    predictor = ContextPredictor(
+        context_provider=provider,
+        default_categorical_rule=default_cat,
+        per_key_rules=built_per_key,
+    )
+
+    hit_objs = [_Hit(id=h["id"], score=h["score"]) for h in hits]
+
+    infer_kwargs: dict[str, Any] = {"keys": keys}
+    if query_context is not None:
+        infer_kwargs["query_context"] = query_context
+    if status_policy is not None:
+        infer_kwargs["status_policy"] = status_policy
+
+    results = predictor.infer(hit_objs, **infer_kwargs)
+
+    return {
+        key: {
+            "value": _json_safe(pred.value),
+            "confidence": float(pred.confidence),
+            "status": str(pred.status),
+            "injected_context": (
+                _json_safe(pred.injected_context) if pred.injected_context else None
+            ),
+        }
+        for key, pred in results.items()
+    }
+

@@ -9,7 +9,7 @@ import core
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from routers import brep, cad, files, mfr, part_classification, similarity
+from routers import brep, cad, context_layer, files, mfr, part_classification, similarity
 
 
 @asynccontextmanager
@@ -58,6 +58,7 @@ app.include_router(cad.router)
 app.include_router(brep.router)
 app.include_router(similarity.router)
 app.include_router(part_classification.router)
+app.include_router(context_layer.router)
 
 core.CAD_VIEWER_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/out", StaticFiles(directory=str(core.CAD_VIEWER_OUTPUT_DIR)), name="out")
