@@ -37,6 +37,7 @@ MFR_dataset_explorer = None
 MFR_inference_model = None
 CAD_viewers: dict[str, dict[str, Any]] = {}  # session_id -> {file_key -> viewer_info}
 CAD_face_colors: dict[str, list] = {}  # scs_filename -> [[r,g,b], ...] indexed by face_id
+CAD_color_maps: dict[str, dict] = {}  # scs_filename -> {label_id: {name, color_rgb}}
 PART_CLASS_inference_model = None
 PART_CLASS_dataset_explorer = None
 _embedder = None
@@ -1864,6 +1865,9 @@ def run_MFR_inference(cad_file_path: pathlib.Path, session_id: Optional[str] = N
         if int(label_id) in present_label_ids
     }
 
+    if scs_filename:
+        CAD_color_maps[scs_filename] = color_map
+
     return {
         "predictions": _json_safe(predictions),
         "probabilities": _json_safe(probabilities),
@@ -2144,6 +2148,7 @@ def terminate_CAD_viewer(session_id: Optional[str] = None, terminate_all: bool =
         scs = info.get("scs_filename")
         if scs:
             CAD_face_colors.pop(scs, None)
+            CAD_color_maps.pop(scs, None)
 
     if terminate_all:
         count = len(session_viewers)
