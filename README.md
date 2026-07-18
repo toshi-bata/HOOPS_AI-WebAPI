@@ -397,6 +397,43 @@ curl -X POST "http://127.0.0.1:8000/BRep/attributes" -F "file=@/path/to/model.SL
 }
 ```
 
+#### Face and edge type counts
+
+Return face and edge counts grouped by type, aggregated server-side. Prefer this
+endpoint over `/BRep/attributes` for any counting question (e.g. "how many faces",
+"faces by type") — an AI/MCP client asked to tally a raw array of a few hundred
+per-face/per-edge entries by hand is prone to reporting a wrong, non-reproducible
+count; this endpoint returns the counts already aggregated.
+
+```
+POST /BRep/type-counts
+```
+
+**Windows (PowerShell):**
+```powershell
+curl.exe -X POST "http://127.0.0.1:8000/BRep/type-counts" -F "file=@C:\path\to\model.SLDPRT"
+```
+
+**Linux:**
+```bash
+curl -X POST "http://127.0.0.1:8000/BRep/type-counts" -F "file=@/path/to/model.SLDPRT"
+```
+
+**Response:**
+
+```json
+{
+  "faces": {
+    "total": 448,
+    "by_type": {"Plane": 8, "Cylinder": 343, "Cone": 49, "Torus": 48}
+  },
+  "edges": {
+    "total": 1222,
+    "by_type": {"Line": 392, "Circle": 494, "Nurbs": 336}
+  }
+}
+```
+
 ---
 
 ### Manufacturing Feature Recognition (MFR)

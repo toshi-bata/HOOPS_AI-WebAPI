@@ -2221,7 +2221,7 @@ def build_brep_adjacency_graph(cad_file_path: pathlib.Path) -> dict[str, Any]:
     }
 
 
-def get_brep_attributes(cad_file_path: pathlib.Path) -> dict[str, Any]:
+def _create_brep_encoder(cad_file_path: pathlib.Path):
     from hoops_ai.cadaccess import HOOPSLoader, HOOPSTools
     from hoops_ai.cadencoder import BrepEncoder
 
@@ -2231,7 +2231,11 @@ def get_brep_attributes(cad_file_path: pathlib.Path) -> dict[str, Any]:
     hoopstools = HOOPSTools()
     hoopstools.adapt_brep(cad_model)
 
-    brep_encoder = BrepEncoder(cad_model.get_brep())
+    return BrepEncoder(cad_model.get_brep())
+
+
+def get_brep_attributes(cad_file_path: pathlib.Path) -> dict[str, Any]:
+    brep_encoder = _create_brep_encoder(cad_file_path)
 
     [face_types, face_areas, face_centroids, face_loops], face_types_descr = brep_encoder.push_face_attributes()
     [edge_types, edge_lengths, edge_dihedrals, edge_convexities], edge_types_descr = brep_encoder.push_edge_attributes()
@@ -2251,6 +2255,37 @@ def get_brep_attributes(cad_file_path: pathlib.Path) -> dict[str, Any]:
             "convexities": _json_safe(edge_convexities),
             "types_description": _json_safe(edge_types_descr),
         },
+    }
+
+
+def get_brep_type_counts(cad_file_path: pathlib.Path) -> dict[str, Any]:
+    """Return face/edge counts grouped by type, pre-aggregated server-side.
+
+    This is intentionally a separate, narrow endpoint from ``get_brep_attributes``:
+    handing an AI agent a raw array of a few hundred face/edge entries and asking it
+    to tally counts by type is unreliable (the agent tends to eyeball the array
+    instead of counting every entry). Aggregating server-side guarantees a correct,
+    reproducible count regardless of model size.
+    """
+    import numpy as np
+
+    brep_encoder = _create_brep_encoder(cad_file_path)
+
+    [face_types, *_], face_types_descr = brep_encoder.push_face_attributes()
+    [edge_types, *_], edge_types_descr = brep_encoder.push_edge_attributes()
+
+    def _counts_by_type(types_array, types_descr: dict) -> dict[str, Any]:
+        types_array = np.asarray(types_array)
+        unique_codes, counts = np.unique(types_array, return_counts=True)
+        by_type = {
+            types_descr.get(int(code), str(int(code))): int(count)
+            for code, count in zip(unique_codes, counts)
+        }
+        return {"total": int(types_array.size), "by_type": by_type}
+
+    return {
+        "faces": _counts_by_type(face_types, face_types_descr),
+        "edges": _counts_by_type(edge_types, edge_types_descr),
     }
 
 
