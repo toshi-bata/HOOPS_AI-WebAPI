@@ -78,7 +78,7 @@ def set_active_embedding_model(model: str) -> None:
 
 # ---------------------------------------------------------------------------
 # Default index preset management
-# "signal" = TMCAD_SIGNAL.faiss (SIGNAL model)  Edefault
+# "signal" = HOOPS_AI_FAISS_INDEX_PATH_SIGNAL (SIGNAL model)  Edefault
 # "legacy" = HOOPS_AI_FAISS_INDEX_PATH (1M model)
 # ---------------------------------------------------------------------------
 
@@ -1051,9 +1051,10 @@ def _resolve_default_index_paths(preset: str) -> dict:
         )
         model_key = _EMBEDDER_MODEL_LEGACY
     elif preset == _EMBEDDER_MODEL_SIGNAL:
+        faiss_file_name_signal = os.environ.get("HOOPS_AI_FAISS_INDEX_PATH_SIGNAL") or "TMCAD_SIGNAL.faiss"
         faiss_path = require_path(
-            notebooks_dir.parent / "packages" / "vectorstores" / "tmcad" / "TMCAD_SIGNAL.faiss",
-            env_name="packages/vectorstores/tmcad/TMCAD_SIGNAL.faiss",
+            notebooks_dir.parent / "packages" / "vectorstores" / "tmcad" / faiss_file_name_signal,
+            env_name="HOOPS_AI_FAISS_INDEX_PATH_SIGNAL",
         )
         images_dir = notebooks_dir.parent / "packages" / "vectorstores" / "tmcad" / "images_tmcad"
         model_key = _EMBEDDER_MODEL_SIGNAL

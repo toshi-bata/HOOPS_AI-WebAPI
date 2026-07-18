@@ -102,8 +102,9 @@ cp .env.example .env
 | `HOOPS_AI_MFR_FLOW_NAME` | optional | MFR flow name (dataset files are resolved relative to this) |
 | `HOOPS_AI_MFR_MODEL_NAME` | optional | MFR trained model checkpoint filename (e.g. `ts3d_162k_mfr.ckpt`) |
 | `HOOPS_AI_EMBEDDINGS_MODEL_NAME` | optional | Embeddings trained model checkpoint filename (e.g. `ts3d_1M_hoops_embeddings.ckpt`). Used by the **`legacy` default-index preset** and when `PUT /similarity/default-model/setting?model=legacy`. |
-| `HOOPS_AI_EMBEDDINGS_MODEL_NAME_SIGNAL` | optional | SIGNAL architecture embeddings model checkpoint (e.g. `ts3d_2M_hoops_embeddings_SIGNAL-preview.ckpt`). Used as the **default active model** for `/compare`, `/map`, and `/index/create`, and also by the **`signal` default-index preset** (`TMCAD_SIGNAL.faiss`). Change the active model at runtime via `PUT /similarity/default-model/setting`. |
 | `HOOPS_AI_FAISS_INDEX_PATH` | optional | FAISS index file for the **`legacy` preset** of similarity search (e.g. `fabwave_embeddings_store.faiss`), located directly under `HOOPS_AI_NOTEBOOK_DIR`. Not used when the active default-index is `signal`. |
+| `HOOPS_AI_EMBEDDINGS_MODEL_NAME_SIGNAL` | optional | SIGNAL architecture embeddings model checkpoint (e.g. `ts3d_2M_hoops_embeddings_SIGNAL-preview.ckpt`). Used as the **default active model** for `/compare`, `/map`, and `/index/create`, and also by the **`signal` default-index preset** (`TMCAD_SIGNAL.faiss`). Change the active model at runtime via `PUT /similarity/default-model/setting`. |
+| `HOOPS_AI_FAISS_INDEX_PATH_SIGNAL` | optional | FAISS index filename for the **`signal` preset** (default) of similarity search (e.g. `TMCAD_SIGNAL.faiss`), located under `<HOOPS_AI_NOTEBOOK_DIR>\..\packages\vectorstores\tmcad\`. Defaults to `TMCAD_SIGNAL.faiss` when unset. |
 | `HOOPS_AI_PART_CLASS_MODEL_NAME` | optional | Filename of the trained GraphClassification checkpoint under `packages/trained_ml_models/` (e.g. `ts3d_graphclassification_5k_10epochs.ckpt`) |
 | `HOOPS_AI_PART_CLASS_FLOW_NAME` | optional | Part Classification flow name (required for `/part-classification/dataset/*` endpoints). The server automatically prefers `<HOOPS_AI_NOTEBOOK_DIR>/out/flows/<name>` (notebook output, includes thumbnails) and falls back to `../packages/flows/<name>` (pre-packaged). |
 | `HOOPS_AI_PART_CLASS_LABEL_KEY` | optional | Label array key for dataset queries (default: `part_label`; use `task_A` for custom ETL) |
@@ -118,8 +119,9 @@ HOOPS_AI_NOTEBOOK_DIR=C:\hoops_ai\notebooks
 HOOPS_AI_MFR_FLOW_NAME=ETL_CADSYNTH_training_b2
 HOOPS_AI_MFR_MODEL_NAME=ts3d_162k_mfr.ckpt
 HOOPS_AI_EMBEDDINGS_MODEL_NAME=ts3d_1M_hoops_embeddings.ckpt
-HOOPS_AI_EMBEDDINGS_MODEL_NAME_SIGNAL=ts3d_2M_hoops_embeddings_SIGNAL-preview.ckpt
 HOOPS_AI_FAISS_INDEX_PATH=fabwave_embeddings_store.faiss
+HOOPS_AI_EMBEDDINGS_MODEL_NAME_SIGNAL=ts3d_2M_hoops_embeddings_SIGNAL-preview.ckpt
+HOOPS_AI_FAISS_INDEX_PATH_SIGNAL=TMCAD_SIGNAL.faiss
 HOOPS_AI_PART_CLASS_MODEL_NAME=ts3d_graphclassification_5k_10epochs.ckpt
 HOOPS_AI_PART_CLASS_FLOW_NAME=ETL_Fabwave_training_b2
 ```
@@ -854,7 +856,7 @@ PUT  /similarity/default-index/setting?index=<preset>
 
 | Parameter | Values | Description |
 |---|---|---|
-| `index` | `signal` *(default)*, `legacy` | `'signal'` = TMCAD_SIGNAL.faiss (39 k parts, SIGNAL model); `'legacy'` = `HOOPS_AI_FAISS_INDEX_PATH` (1M model, notebook-generated) |
+| `index` | `signal` *(default)*, `legacy` | `'signal'` = `HOOPS_AI_FAISS_INDEX_PATH_SIGNAL` (TMCAD_SIGNAL.faiss, 39 k parts, SIGNAL model); `'legacy'` = `HOOPS_AI_FAISS_INDEX_PATH` (1M model, notebook-generated) |
 
 **Windows (PowerShell)  Eread current setting:**
 ```powershell
