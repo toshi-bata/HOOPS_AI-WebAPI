@@ -162,7 +162,7 @@ def get_part_image(
         images_base_dir = pathlib.Path(paths["images_dir"])
     except Exception:
         # Fall back to legacy default if path resolution fails
-        notebooks_dir = pathlib.Path(core.get_required_env("HOOPS_AI_NOTEBOOK_DIR"))
+        notebooks_dir = core.get_notebooks_dir()
         images_base_dir = pathlib.Path(
             os.environ.get("HOOPS_AI_EMBEDDINGS_IMAGES_DIR")
             or notebooks_dir / "out" / "images"

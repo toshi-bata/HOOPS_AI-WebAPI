@@ -265,9 +265,9 @@ def list_indexes() -> list[dict[str, Any]]:
     load_env_file()
     faiss_name = os.environ.get("HOOPS_AI_FAISS_INDEX_PATH")
     if faiss_name:
-        notebooks_dir_str = os.environ.get("HOOPS_AI_NOTEBOOK_DIR")
-        if notebooks_dir_str:
-            default_path = pathlib.Path(notebooks_dir_str) / faiss_name
+        sdk_dir_str = os.environ.get("HOOPS_AI_SDK_DIR")
+        if sdk_dir_str:
+            default_path = pathlib.Path(sdk_dir_str) / "notebooks" / faiss_name
             last_modified: Optional[str] = None
             if default_path.exists():
                 mtime = default_path.stat().st_mtime
@@ -842,6 +842,35 @@ def require_path(path: pathlib.Path, *, env_name: str = "", label: str = "") -> 
     return path
 
 
+def get_sdk_dir() -> pathlib.Path:
+    """Return the HOOPS AI SDK install directory (``HOOPS_AI_SDK_DIR``).
+
+    This directory must contain the ``notebooks/`` and ``packages/`` subdirectories.
+    """
+    return require_path(
+        pathlib.Path(get_required_env("HOOPS_AI_SDK_DIR")),
+        env_name="HOOPS_AI_SDK_DIR",
+    )
+
+
+def get_notebooks_dir() -> pathlib.Path:
+    """Return ``<HOOPS_AI_SDK_DIR>/notebooks``."""
+    return require_path(
+        get_sdk_dir() / "notebooks",
+        env_name="HOOPS_AI_SDK_DIR",
+        label="notebooks directory",
+    )
+
+
+def get_packages_dir() -> pathlib.Path:
+    """Return ``<HOOPS_AI_SDK_DIR>/packages``."""
+    return require_path(
+        get_sdk_dir() / "packages",
+        env_name="HOOPS_AI_SDK_DIR",
+        label="packages directory",
+    )
+
+
 def read_env_literal_assignment(names: tuple[str, ...]) -> Optional[str]:
     if not ENV_FILE_PATH.exists():
         return None
@@ -978,15 +1007,12 @@ def create_MFR_dataset_explorer():
 
     DatasetExplorer = import_MFR_dataset_explorer()
 
-    notebooks_dir = require_path(
-        pathlib.Path(get_required_env("HOOPS_AI_NOTEBOOK_DIR")),
-        env_name="HOOPS_AI_NOTEBOOK_DIR",
-    )
+    notebooks_dir = get_notebooks_dir()
     MFR_flow_name = get_required_env("HOOPS_AI_MFR_FLOW_NAME")
 
     # Dataset files are produced by running the ETL tutorial notebook:
     #   notebooks/3b_workflow_for_MFR_cadsynth.ipynb
-    # Output is written to: <HOOPS_AI_NOTEBOOK_DIR>/out/flows/<HOOPS_AI_MFR_FLOW_NAME>/
+    # Output is written to: <HOOPS_AI_SDK_DIR>/notebooks/out/flows/<HOOPS_AI_MFR_FLOW_NAME>/
     flow_root_dir = require_path(
         notebooks_dir / "out" / "flows" / MFR_flow_name,
         env_name="HOOPS_AI_MFR_FLOW_NAME",
@@ -1007,13 +1033,10 @@ def create_MFR_inference_model():
 
     load_env_file()
 
-    notebooks_dir = require_path(
-        pathlib.Path(get_required_env("HOOPS_AI_NOTEBOOK_DIR")),
-        env_name="HOOPS_AI_NOTEBOOK_DIR",
-    )
+    notebooks_dir = get_notebooks_dir()
     model_name = get_required_env("HOOPS_AI_MFR_MODEL_NAME")
     trained_model = require_path(
-        notebooks_dir.parent.joinpath("packages", "trained_ml_models", model_name),
+        get_packages_dir().joinpath("trained_ml_models", model_name),
         env_name="HOOPS_AI_MFR_MODEL_NAME",
     )
     output_dir = notebooks_dir.joinpath("out")
@@ -1035,10 +1058,7 @@ def _resolve_default_index_paths(preset: str) -> dict:
       ``faiss_path`` (Path), ``images_dir`` (Path), ``model_key`` (str)
     """
     load_env_file()
-    notebooks_dir = require_path(
-        pathlib.Path(get_required_env("HOOPS_AI_NOTEBOOK_DIR")),
-        env_name="HOOPS_AI_NOTEBOOK_DIR",
-    )
+    notebooks_dir = get_notebooks_dir()
     if preset == _EMBEDDER_MODEL_LEGACY:
         faiss_file_name = get_required_env("HOOPS_AI_FAISS_INDEX_PATH")
         faiss_path = require_path(
@@ -1053,10 +1073,10 @@ def _resolve_default_index_paths(preset: str) -> dict:
     elif preset == _EMBEDDER_MODEL_SIGNAL:
         faiss_file_name_signal = os.environ.get("HOOPS_AI_FAISS_INDEX_PATH_SIGNAL") or "TMCAD_SIGNAL.faiss"
         faiss_path = require_path(
-            notebooks_dir.parent / "packages" / "vectorstores" / "tmcad" / faiss_file_name_signal,
+            get_packages_dir() / "vectorstores" / "tmcad" / faiss_file_name_signal,
             env_name="HOOPS_AI_FAISS_INDEX_PATH_SIGNAL",
         )
-        images_dir = notebooks_dir.parent / "packages" / "vectorstores" / "tmcad" / "images_tmcad"
+        images_dir = get_packages_dir() / "vectorstores" / "tmcad" / "images_tmcad"
         model_key = _EMBEDDER_MODEL_SIGNAL
     else:
         raise ValueError(f"Unknown default-index preset: '{preset}'")
@@ -1241,13 +1261,9 @@ def get_embedder(model: str = _EMBEDDER_MODEL_LEGACY):
 
         load_env_file()
 
-        notebooks_dir = require_path(
-            pathlib.Path(get_required_env("HOOPS_AI_NOTEBOOK_DIR")),
-            env_name="HOOPS_AI_NOTEBOOK_DIR",
-        )
         ckpt_name = get_required_env("HOOPS_AI_EMBEDDINGS_MODEL_NAME_SIGNAL")
         trained_model = require_path(
-            notebooks_dir.parent.joinpath("packages", "trained_ml_models", ckpt_name),
+            get_packages_dir().joinpath("trained_ml_models", ckpt_name),
             env_name="HOOPS_AI_EMBEDDINGS_MODEL_NAME_SIGNAL",
         )
 
@@ -1270,13 +1286,9 @@ def get_embedder(model: str = _EMBEDDER_MODEL_LEGACY):
 
     load_env_file()
 
-    notebooks_dir = require_path(
-        pathlib.Path(get_required_env("HOOPS_AI_NOTEBOOK_DIR")),
-        env_name="HOOPS_AI_NOTEBOOK_DIR",
-    )
     ckpt_name = get_required_env("HOOPS_AI_EMBEDDINGS_MODEL_NAME")
     trained_model = require_path(
-        notebooks_dir.parent.joinpath("packages", "trained_ml_models", ckpt_name),
+        get_packages_dir().joinpath("trained_ml_models", ckpt_name),
         env_name="HOOPS_AI_EMBEDDINGS_MODEL_NAME",
     )
 
@@ -2266,18 +2278,15 @@ def _get_part_class_flow_root_dir() -> pathlib.Path:
     """Resolve the flow root directory for the part classification dataset.
 
     Priority (same convention as MFR):
-    1. <HOOPS_AI_NOTEBOOK_DIR>/out/flows/<FLOW_NAME>   Enotebook-generated output (has stream_cache)
-    2. <HOOPS_AI_NOTEBOOK_DIR>/../packages/flows/<FLOW_NAME>   Epre-packaged dataset
+    1. <HOOPS_AI_SDK_DIR>/notebooks/out/flows/<FLOW_NAME>  Enotebook-generated output (has stream_cache)
+    2. <HOOPS_AI_SDK_DIR>/packages/flows/<FLOW_NAME>  Epre-packaged dataset
     """
-    notebooks_dir = require_path(
-        pathlib.Path(get_required_env("HOOPS_AI_NOTEBOOK_DIR")),
-        env_name="HOOPS_AI_NOTEBOOK_DIR",
-    )
+    notebooks_dir = get_notebooks_dir()
     flow_name = get_required_env("HOOPS_AI_PART_CLASS_FLOW_NAME")
     notebook_out = notebooks_dir / "out" / "flows" / flow_name
     if notebook_out.exists():
         return notebook_out.resolve()
-    packages_flow = (notebooks_dir.parent / "packages" / "flows" / flow_name).resolve()
+    packages_flow = (get_packages_dir() / "flows" / flow_name).resolve()
     return require_path(
         packages_flow,
         env_name="HOOPS_AI_PART_CLASS_FLOW_NAME",
@@ -2293,13 +2302,10 @@ def create_part_class_inference_model():
 
     load_env_file()
 
-    notebooks_dir = require_path(
-        pathlib.Path(get_required_env("HOOPS_AI_NOTEBOOK_DIR")),
-        env_name="HOOPS_AI_NOTEBOOK_DIR",
-    )
+    notebooks_dir = get_notebooks_dir()
     model_name = get_required_env("HOOPS_AI_PART_CLASS_MODEL_NAME")
     ckpt_path = require_path(
-        notebooks_dir.parent / "packages" / "trained_ml_models" / model_name,
+        get_packages_dir() / "trained_ml_models" / model_name,
         env_name="HOOPS_AI_PART_CLASS_MODEL_NAME",
     )
 
