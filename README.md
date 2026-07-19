@@ -119,6 +119,7 @@ in the private `HOOPS_AI-MCPServer-demo` companion repo and are hidden (return `
 unless `HOOPS_AI_ENABLE_DEMO_FEATURES=true`:
 
 - `GET`/`PUT /similarity/default-model/setting` (embedding-model switch)
+- `GET`/`PUT /similarity/default-index/setting` (default FAISS index preset switch)
 - `POST /similarity/index/create`, `GET /similarity/index/list`, `POST /similarity/index/add`,
   `DELETE /similarity/index/{name}/parts`, `DELETE /similarity/index/{name}` (named index management)
 - `POST /similarity/map`, `GET /similarity/map/job/{job_id}`, `POST /similarity/map/{map_id}/query`,
