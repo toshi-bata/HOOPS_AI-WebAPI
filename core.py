@@ -817,6 +817,32 @@ def get_required_env(name: str) -> str:
     return value
 
 
+def demo_features_enabled() -> bool:
+    """Return True when demo-only endpoints (named similarity index management,
+    embedding-model switching, Shape Space Map generation/query, MFR and Part
+    Classification dataset browsing, context-layer prediction) should be served.
+
+    Controlled by HOOPS_AI_ENABLE_DEMO_FEATURES in .env / the environment.
+    Defaults to disabled so a freshly cloned public deployment never exposes
+    these routes unless explicitly opted in.
+    """
+    return os.environ.get("HOOPS_AI_ENABLE_DEMO_FEATURES", "false").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def require_demo_enabled() -> None:
+    """FastAPI dependency that hides demo-only endpoints unless enabled.
+
+    Raises a 404 (rather than 403) so a disabled endpoint is indistinguishable
+    from one that does not exist on this deployment.
+    """
+    from fastapi import HTTPException
+
+    if not demo_features_enabled():
+        raise HTTPException(status_code=404, detail="Not Found")
+
+
 def get_required_file_env(name: str) -> str:
     value = read_env_file().get(name)
     if not value:

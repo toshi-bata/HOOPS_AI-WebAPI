@@ -2,7 +2,7 @@ import io
 from typing import Optional
 
 import core
-from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 
 router = APIRouter(prefix="/part-classification", tags=["Part Classification"])
 
@@ -46,7 +46,7 @@ def part_class_labels():
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.get("/dataset/table-of-contents")
+@router.get("/dataset/table-of-contents", dependencies=[Depends(core.require_demo_enabled)])
 def part_class_table_of_contents():
     """Return dataset table of contents and available groups."""
     try:
@@ -57,7 +57,7 @@ def part_class_table_of_contents():
         raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
 
 
-@router.get("/dataset/label-distribution")
+@router.get("/dataset/label-distribution", dependencies=[Depends(core.require_demo_enabled)])
 def part_class_label_distribution():
     """Return per-class file count distribution across the training dataset."""
     try:

@@ -108,8 +108,30 @@ cp .env.example .env
 | `HOOPS_AI_PART_CLASS_MODEL_NAME` | optional | Filename of the trained GraphClassification checkpoint under `packages/trained_ml_models/` (e.g. `ts3d_graphclassification_5k_10epochs.ckpt`) |
 | `HOOPS_AI_PART_CLASS_FLOW_NAME` | optional | Part Classification flow name (required for `/part-classification/dataset/*` endpoints). The server automatically prefers `<HOOPS_AI_SDK_DIR>/notebooks/out/flows/<name>` (notebook output, includes thumbnails) and falls back to `<HOOPS_AI_SDK_DIR>/packages/flows/<name>` (pre-packaged). |
 | `HOOPS_AI_PART_CLASS_LABEL_KEY` | optional | Label array key for dataset queries (default: `part_label`; use `task_A` for custom ETL) |
+| `HOOPS_AI_ENABLE_DEMO_FEATURES` | optional | Set to `true` to expose the demo-only endpoints listed below. Defaults to `false` (disabled) so a public deployment never serves them by accident. |
 
 > **Note:** `HOOPS_AI_LICENSE` is read **only** from the `.env` file, not from system environment variables.
+
+#### Demo-only endpoints (`HOOPS_AI_ENABLE_DEMO_FEATURES`)
+
+These endpoints mutate server-wide state or run long/heavy jobs. They back the tools
+in the private `HOOPS_AI-MCPServer-demo` companion repo and are hidden (return `404`)
+unless `HOOPS_AI_ENABLE_DEMO_FEATURES=true`:
+
+- `GET`/`PUT /similarity/default-model/setting` (embedding-model switch)
+- `POST /similarity/index/create`, `GET /similarity/index/list`, `POST /similarity/index/add`,
+  `DELETE /similarity/index/{name}/parts`, `DELETE /similarity/index/{name}` (named index management)
+- `POST /similarity/map`, `GET /similarity/map/job/{job_id}`, `POST /similarity/map/{map_id}/query`,
+  `POST /similarity/map/{map_id}/add-to-index` (Shape Space Map)
+- `GET /MFR/dataset/table-of-contents`, `GET /MFR/labels/description`, `GET /MFR/files/search`,
+  `GET /MFR/files/{file_id}/thumbnail` (MFR dataset browsing)
+- `GET /part-classification/dataset/table-of-contents`, `GET /part-classification/dataset/label-distribution`
+  (Part Classification dataset browsing)
+- `POST /context/predict` (context-layer prediction)
+
+All other endpoints (upload, viewer, B-Rep analysis, MFR/Part-Classification inference,
+`compare`/`embed`/`search` similarity, and searching an *existing* named index via
+`POST /similarity/index/{name}/search`) remain available regardless of this flag.
 
 Example `.env`:
 

@@ -2,7 +2,7 @@ import io
 from typing import Optional
 
 import core
-from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 
 router = APIRouter(prefix="/MFR", tags=["MFR"])
@@ -12,7 +12,7 @@ def _get_session_id(request: Request) -> Optional[str]:
     return request.headers.get("X-Session-ID") or None
 
 
-@router.get("/files/search")
+@router.get("/files/search", dependencies=[Depends(core.require_demo_enabled)])
 def MFR_search_files(feature_name: str = Query(..., description="MFR feature name to search for.")):
     try:
         return core.search_MFR_files(feature_name)
@@ -20,7 +20,7 @@ def MFR_search_files(feature_name: str = Query(..., description="MFR feature nam
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.get("/labels/description")
+@router.get("/labels/description", dependencies=[Depends(core.require_demo_enabled)])
 def MFR_labels_description():
     try:
         return {"labels_description": core._json_safe(core.get_MFR_labels_description())}
@@ -28,7 +28,7 @@ def MFR_labels_description():
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.get("/dataset/table-of-contents")
+@router.get("/dataset/table-of-contents", dependencies=[Depends(core.require_demo_enabled)])
 def MFR_table_of_contents():
     try:
         return core.get_MFR_table_of_contents()
@@ -36,7 +36,7 @@ def MFR_table_of_contents():
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.get("/files/{file_id}/thumbnail")
+@router.get("/files/{file_id}/thumbnail", dependencies=[Depends(core.require_demo_enabled)])
 def MFR_file_thumbnail(file_id: int):
     try:
         png_bytes = core.get_MFR_file_thumbnail(file_id)

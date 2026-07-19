@@ -6,7 +6,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 import core
-from fastapi import APIRouter, File, HTTPException, Query, Request, Response, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 
@@ -55,7 +55,7 @@ class EmbeddingSettings(BaseModel):
     model: str
 
 
-@router.get("/default-model/setting", response_model=EmbeddingSettings)
+@router.get("/default-model/setting", response_model=EmbeddingSettings, dependencies=[Depends(core.require_demo_enabled)])
 def get_settings():
     """Return the server-wide active embedding model used by ``/compare``, ``/map``, and ``/index/create``.
 
@@ -65,7 +65,7 @@ def get_settings():
     return EmbeddingSettings(model=core.get_active_embedding_model())
 
 
-@router.put("/default-model/setting", response_model=EmbeddingSettings)
+@router.put("/default-model/setting", response_model=EmbeddingSettings, dependencies=[Depends(core.require_demo_enabled)])
 def put_settings(model: str = Query(..., description="Embedding model key: 'signal' or 'legacy'.")):
     """Set the server-wide active embedding model.
 
@@ -477,7 +477,7 @@ class MapJobStatus(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-@router.post("/map", response_model=MapJobStatus, status_code=202)
+@router.post("/map", response_model=MapJobStatus, status_code=202, dependencies=[Depends(core.require_demo_enabled)])
 def similarity_map(
     request: Request,
     response: Response,
@@ -669,7 +669,7 @@ def similarity_map(
 # ---------------------------------------------------------------------------
 
 
-@router.get("/map/job/{job_id}", response_model=MapJobStatus)
+@router.get("/map/job/{job_id}", response_model=MapJobStatus, dependencies=[Depends(core.require_demo_enabled)])
 def similarity_map_job_status(job_id: str):
     """Poll the status of a shape-space map job started by ``POST /similarity/map``.
 
@@ -745,7 +745,7 @@ class MapQueryResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-@router.post("/map/{map_id}/query", response_model=MapQueryResponse)
+@router.post("/map/{map_id}/query", response_model=MapQueryResponse, dependencies=[Depends(core.require_demo_enabled)])
 def similarity_map_query(
     map_id: str,
     request: Request,
@@ -835,7 +835,7 @@ class MapAddToIndexResponse(BaseModel):
     errors: list[dict]
 
 
-@router.post("/map/{map_id}/add-to-index", response_model=MapAddToIndexResponse)
+@router.post("/map/{map_id}/add-to-index", response_model=MapAddToIndexResponse, dependencies=[Depends(core.require_demo_enabled)])
 def add_map_parts_to_index(
     map_id: str,
     index_name: str = Query(..., description="Name of the target index."),
@@ -925,7 +925,7 @@ class IndexDeleteResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # POST /similarity/index/create
 # ---------------------------------------------------------------------------
-@router.post("/index/create", response_model=IndexCreateResponse)
+@router.post("/index/create", response_model=IndexCreateResponse, dependencies=[Depends(core.require_demo_enabled)])
 def create_index(
     name: str = Query(..., description="Name of the new index (^[a-z0-9_-]{1,64}$)."),
 ):
@@ -959,7 +959,7 @@ def create_index(
 # ---------------------------------------------------------------------------
 
 
-@router.get("/index/list", response_model=list[IndexInfo])
+@router.get("/index/list", response_model=list[IndexInfo], dependencies=[Depends(core.require_demo_enabled)])
 def list_indexes():
     """Return metadata for all known similarity indexes.
 
@@ -978,7 +978,7 @@ def list_indexes():
 # ---------------------------------------------------------------------------
 
 
-@router.post("/index/add", response_model=IndexAddResponse)
+@router.post("/index/add", response_model=IndexAddResponse, dependencies=[Depends(core.require_demo_enabled)])
 def add_to_index(
     name: str = Query(..., description="Target index name."),
     file_ids: Optional[str] = Query(
@@ -1124,7 +1124,7 @@ def search_named_index(
 # ---------------------------------------------------------------------------
 
 
-@router.delete("/index/{name}/parts", response_model=IndexRemoveResponse)
+@router.delete("/index/{name}/parts", response_model=IndexRemoveResponse, dependencies=[Depends(core.require_demo_enabled)])
 def remove_parts_from_index(
     name: str,
     part_ids: str = Query(..., description="Comma-separated part IDs (file_ids) to remove."),
@@ -1158,7 +1158,7 @@ def remove_parts_from_index(
 # ---------------------------------------------------------------------------
 
 
-@router.delete("/index/{name}", response_model=IndexDeleteResponse)
+@router.delete("/index/{name}", response_model=IndexDeleteResponse, dependencies=[Depends(core.require_demo_enabled)])
 def delete_index(
     name: str,
     confirm: bool = Query(

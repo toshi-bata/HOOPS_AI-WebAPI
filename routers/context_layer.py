@@ -22,7 +22,7 @@ Error codes
 from typing import Any, Optional
 
 import core
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 router = APIRouter(prefix="/context", tags=["Context Layer Prediction"])
@@ -112,7 +112,7 @@ class ContextPredictResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-@router.post("/predict", response_model=ContextPredictResponse)
+@router.post("/predict", response_model=ContextPredictResponse, dependencies=[Depends(core.require_demo_enabled)])
 def context_predict(request: ContextPredictRequest):
     """Predict missing metadata values from similarity-search hits.
 
