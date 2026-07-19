@@ -288,6 +288,11 @@ def similarity_embed(
 
     This endpoint does **not** require a FAISS index — the embedding model alone
     is sufficient.
+
+    The embeddings model is taken from the server-wide setting (``PUT
+    /similarity/default-model/setting``). Default is ``'signal'`` (HOOPS AI
+    SIGNAL model), so this works out of the box even when
+    ``HOOPS_AI_EMBEDDINGS_MODEL_NAME`` (legacy) is not configured.
     """
     try:
         if file_id:
@@ -297,7 +302,7 @@ def similarity_embed(
         else:
             raise HTTPException(status_code=422, detail="Either 'file' or 'file_id' is required.")
 
-        result = core.compute_embedding(resolved_id)
+        result = core.compute_embedding(resolved_id, model=core.get_active_embedding_model())
         return EmbedResponse(
             file_id=result["file_id"],
             filename=result["filename"],
