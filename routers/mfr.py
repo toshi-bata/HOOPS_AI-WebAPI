@@ -64,9 +64,8 @@ def MFR_inference(
         else:
             raise HTTPException(status_code=422, detail="Either 'file' or 'file_id' is required.")
         result = core.run_MFR_inference(cad_file_path, _get_session_id(request))
-        for key in ("viewer_url", "image_url"):
-            if result.get(key) and result[key].startswith("/"):
-                result[key] = str(request.base_url).rstrip("/") + result[key]
+        if result.get("viewer_url") and result["viewer_url"].startswith("/"):
+            result["viewer_url"] = str(request.base_url).rstrip("/") + result["viewer_url"]
         result.pop("_scs_filename", None)
         return result
     except HTTPException:

@@ -1868,12 +1868,10 @@ def run_MFR_inference(cad_file_path: pathlib.Path, session_id: Optional[str] = N
     session_preds = _json_safe(predictions)
 
     viewer_url = None
-    image_url = None
     scs_filename = None
     try:
         viewer_result = create_CAD_viewer(cad_file_path, session_id)
         viewer_url = viewer_result.get("viewer_url")
-        image_url = viewer_result.get("image_url")
         scs_filename = viewer_result.get("_scs_filename")
     except Exception:
         pass
@@ -1911,7 +1909,6 @@ def run_MFR_inference(cad_file_path: pathlib.Path, session_id: Optional[str] = N
         "predictions": _json_safe(predictions),
         "probabilities": _json_safe(probabilities),
         "viewer_url": viewer_url,
-        "image_url": image_url,
         "color_map": color_map,
     }
 

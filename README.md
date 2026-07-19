@@ -547,6 +547,7 @@ curl "http://127.0.0.1:8000/MFR/files/1/thumbnail" -o thumbnail.png
 #### Run inference
 
 Upload a CAD file and run MFR inference. Launches the CAD viewer and returns predictions, probabilities, and viewer URL.
+Note: no `image_url` preview is returned — the static PNG snapshot has no prediction colors baked in (colorization is applied client-side in the viewer only), so open `viewer_url` to see the colorized result.
 
 ```
 POST /MFR/inference
@@ -568,8 +569,7 @@ curl -X POST "http://127.0.0.1:8000/MFR/inference" -F "file=@/path/to/model.SLDP
 {
   "predictions": [...],
   "probabilities": [...],
-  "viewer_url": "http://<server-ip>:<viewer_port>/index.html",
-  "image_url": "http://127.0.0.1:8000/out/<stem>.png"
+  "viewer_url": "http://<server-ip>:<viewer_port>/index.html"
 }
 ```
 
