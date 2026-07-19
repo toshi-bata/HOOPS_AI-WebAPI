@@ -46,6 +46,7 @@ class DemoFeatureGateTests(unittest.TestCase):
         for method, path in (
             ("get", "/MFR/dataset/table-of-contents"),
             ("get", "/similarity/default-model/setting"),
+            ("get", "/similarity/default-index/setting"),
             ("get", "/similarity/index/list"),
             ("post", "/similarity/map"),
             ("get", "/part-classification/dataset/label-distribution"),

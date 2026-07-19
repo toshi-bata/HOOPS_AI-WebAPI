@@ -91,7 +91,7 @@ class DefaultIndexSettings(BaseModel):
     index: str
 
 
-@router.get("/default-index/setting", response_model=DefaultIndexSettings)
+@router.get("/default-index/setting", response_model=DefaultIndexSettings, dependencies=[Depends(core.require_demo_enabled)])
 def get_default_index_setting():
     """Return the active default-index preset used by ``/search``, ``/part-image``, and ``/index-info``.
 
@@ -101,7 +101,7 @@ def get_default_index_setting():
     return DefaultIndexSettings(index=core.get_active_default_index())
 
 
-@router.put("/default-index/setting", response_model=DefaultIndexSettings)
+@router.put("/default-index/setting", response_model=DefaultIndexSettings, dependencies=[Depends(core.require_demo_enabled)])
 def put_default_index_setting(index: str = Query(..., description="Index preset key: 'signal' or 'legacy'.")):
     """Switch the active default-index preset.
 
