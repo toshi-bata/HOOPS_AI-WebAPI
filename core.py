@@ -330,6 +330,43 @@ def list_indexes() -> list[dict[str, Any]]:
     return result
 
 
+def _embed_error_detail(
+    embed_errors: Any,
+    fid: str,
+    filename: str,
+    norm_path: str,
+) -> str:
+    """Best-effort failure reason for *fid* from ``batch.metadata['errors']``.
+
+    The structure of that metadata is SDK-version dependent (list of dicts,
+    list of strings, or a dict keyed by path/file_id). We match defensively and
+    always return a non-empty string, falling back to an explicit message.
+    """
+    default = "embedding produced no rows (file skipped by embed_shape_batch)"
+    candidates = [c for c in (norm_path, filename, fid) if c]
+
+    def _matches(text: str) -> bool:
+        return any(c and (c == text or c in text) for c in candidates)
+
+    if isinstance(embed_errors, dict):
+        for key, val in embed_errors.items():
+            if _matches(str(key)) and val:
+                return str(val)
+    elif isinstance(embed_errors, (list, tuple)):
+        for item in embed_errors:
+            if isinstance(item, dict):
+                text = " ".join(str(v) for v in item.values())
+                if _matches(text):
+                    for k in ("detail", "message", "error", "reason"):
+                        if item.get(k):
+                            return str(item[k])
+                    return text.strip() or default
+            elif isinstance(item, str):
+                if _matches(item):
+                    return item
+    return default
+
+
 def _embed_bodies_for_index(
     file_ids: list[str],
     index_name: str,
@@ -366,6 +403,7 @@ def _embed_bodies_for_index(
     # Resolve real CAD paths; keep bidirectional maps keyed by file_id and by
     # the resolved path string (embed_shape_batch echoes input paths in .ids).
     fid_by_norm_path: dict[str, str] = {}
+    norm_by_fid: dict[str, str] = {}
     filename_by_fid: dict[str, str] = {}
     ordered_paths: list[str] = []
     for fid in file_ids:
@@ -376,6 +414,7 @@ def _embed_bodies_for_index(
             continue
         norm = str(cad_path.resolve())
         fid_by_norm_path[norm] = fid
+        norm_by_fid[fid] = norm
         parts = cad_path.name.split("_", 1)
         filename_by_fid[fid] = (
             parts[1] if len(parts) == 2 and len(parts[0]) == 64 else cad_path.name
@@ -416,11 +455,59 @@ def _embed_bodies_for_index(
 
         # Group row indices by file_id, preserving first-seen order.
         rows_by_fid: "OrderedDict[str, list[int]]" = OrderedDict()
+        unmatched_rows = 0
         for i, raw_id in enumerate(ids):
             fid = _fid_for_row(raw_id)
             if fid is None:
+                unmatched_rows += 1
                 continue
             rows_by_fid.setdefault(fid, []).append(i)
+
+        if unmatched_rows:
+            logger.warning(
+                "%d embedded row(s) could not be matched to an input file "
+                "in index '%s'",
+                unmatched_rows,
+                index_name,
+            )
+
+        # Surface files that embed_shape_batch silently skipped (CAD load error,
+        # timeout, etc.): they never appear in batch.ids, so they are missing
+        # from rows_by_fid. Report each one instead of dropping it silently.
+        embed_errors = meta.get("errors") if hasattr(meta, "get") else None
+        if embed_errors:
+            try:
+                if isinstance(embed_errors, dict):
+                    _first = next(iter(embed_errors.items()))
+                else:
+                    _first = embed_errors[0]
+                print(
+                    f"[INDEX] metadata['errors'] type={type(embed_errors).__name__} "
+                    f"first={_first!r}",
+                    flush=True,
+                )
+            except Exception:
+                pass
+
+        submitted_fids = set(fid_by_norm_path.values())
+        for fid in file_ids:
+            if fid in submitted_fids and fid not in rows_by_fid:
+                detail = _embed_error_detail(
+                    embed_errors,
+                    fid,
+                    filename_by_fid.get(fid, ""),
+                    norm_by_fid.get(fid, ""),
+                )
+                errors.append({"file_id": fid, "detail": detail})
+
+        failed_count = meta.get("failed_count") if hasattr(meta, "get") else None
+        logger.info(
+            "index '%s' batch: input=%d rows=%d failed=%s",
+            index_name,
+            len(ordered_paths),
+            len(ids),
+            failed_count,
+        )
 
         # Relocate PNG + SCS once per file (png_paths repeats per body row).
         thumb_dir = _index_thumbnails_dir(index_name)

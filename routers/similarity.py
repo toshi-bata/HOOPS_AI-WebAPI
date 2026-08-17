@@ -863,6 +863,8 @@ def add_map_parts_to_index(
         )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except core.SchemaVersionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (core.EnvConfigError, core.PathConfigError):
         raise
     except Exception as exc:

@@ -222,5 +222,144 @@ class TestListIndexPartsPaging(unittest.TestCase):
         self.assertFalse(item["has_scs"])
 
 
+class TestEmbedBodiesMissingFiles(unittest.TestCase):
+    """Files that embed_shape_batch silently skips must surface in errors."""
+
+    def setUp(self):
+        import types
+
+        # Fake the hoops_ai.ml.embeddings symbols that _embed_bodies_for_index
+        # imports, so no SDK/license is needed.
+        self._saved_mods = {}
+        for name in ("hoops_ai", "hoops_ai.ml", "hoops_ai.ml.embeddings"):
+            self._saved_mods[name] = sys.modules.get(name)
+        pkg = types.ModuleType("hoops_ai")
+        ml = types.ModuleType("hoops_ai.ml")
+        emb = types.ModuleType("hoops_ai.ml.embeddings")
+
+        class _Embedding:
+            def __init__(self, values, model, dim):
+                self.values, self.model, self.dim = values, model, dim
+
+        class _VectorRecord:
+            def __init__(self, id, embedding, metadata):
+                self.id, self.embedding, self.metadata = id, embedding, metadata
+
+        emb.Embedding = _Embedding
+        emb.VectorRecord = _VectorRecord
+        pkg.ml = ml
+        ml.embeddings = emb
+        sys.modules["hoops_ai"] = pkg
+        sys.modules["hoops_ai.ml"] = ml
+        sys.modules["hoops_ai.ml.embeddings"] = emb
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self._uploads = tempfile.TemporaryDirectory()
+        self._orig_idx = core.INDEXES_DIR
+        core.INDEXES_DIR = pathlib.Path(self._tmp.name)
+
+        # Three real CAD files so path .resolve() round-trips inside _fid_for_row.
+        self.fids = []
+        self.paths = {}
+        self.filenames = {}
+        for i in range(3):
+            fid = f"{i:064d}"
+            fname = f"file{i}.step"
+            p = pathlib.Path(self._uploads.name) / f"{fid}_{fname}"
+            p.write_bytes(b"x")
+            self.fids.append(fid)
+            self.paths[fid] = p
+            self.filenames[fid] = fname
+
+        self._orig_get_embedder = core.get_embedder
+        self._orig_find = core.find_persistent_CAD_file
+        core.find_persistent_CAD_file = lambda fid: self.paths[fid]
+
+    def tearDown(self):
+        core.get_embedder = self._orig_get_embedder
+        core.find_persistent_CAD_file = self._orig_find
+        core.INDEXES_DIR = self._orig_idx
+        self._tmp.cleanup()
+        self._uploads.cleanup()
+        for name, mod in self._saved_mods.items():
+            if mod is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = mod
+
+    def _install_embedder(self, errors_meta, include_errors=True):
+        """Fake embedder whose batch returns rows for the first two files only
+        (file index 0 gets 2 body rows, file index 1 gets 1), skipping file 2.
+        """
+        import numpy as np
+
+        def _embed_shape_batch(paths, show_progress=False, specifications=None):
+            # paths[0] -> 2 rows, paths[1] -> 1 row; paths[2] is skipped.
+            ids = [paths[0], paths[0], paths[1]]
+            values = np.ones((3, 4), dtype=np.float32)
+            meta = {
+                "kind": ["assembly", "assembly", "part"],
+                "failed_count": 1,
+                "total_processed": 3,
+            }
+            if include_errors:
+                meta["errors"] = errors_meta
+            return SimpleNamespace(ids=ids, values=values, metadata=meta)
+
+        embedder = SimpleNamespace(
+            model_name="fake-model", embed_shape_batch=_embed_shape_batch
+        )
+        core.get_embedder = lambda model: embedder
+
+    def test_missing_file_reported_with_list_errors(self):
+        skipped = self.filenames[self.fids[2]]
+        self._install_embedder([{"file": skipped, "error": "CAD load failed"}])
+        records, errors = core._embed_bodies_for_index(self.fids, "idx", "signal")
+
+        # Two successful files became records; the skipped one is in errors.
+        self.assertEqual({r.id for r in records}, {self.fids[0], self.fids[1]})
+        self.assertEqual(len(records), 3)  # 2 rows + 1 row
+        err_ids = {e["file_id"] for e in errors}
+        self.assertIn(self.fids[2], err_ids)
+        detail = next(e["detail"] for e in errors if e["file_id"] == self.fids[2])
+        self.assertEqual(detail, "CAD load failed")
+        self.assertTrue(detail)
+
+    def test_detail_never_empty_or_none(self):
+        self._install_embedder([{"file": self.filenames[self.fids[2]], "error": ""}])
+        _records, errors = core._embed_bodies_for_index(self.fids, "idx", "signal")
+        detail = next(e["detail"] for e in errors if e["file_id"] == self.fids[2])
+        self.assertIsNotNone(detail)
+        self.assertNotEqual(detail, "")
+
+    def test_dict_errors_structure(self):
+        skipped_fname = self.filenames[self.fids[2]]
+        self._install_embedder({skipped_fname: "timeout while loading"})
+        _records, errors = core._embed_bodies_for_index(self.fids, "idx", "signal")
+        detail = next(e["detail"] for e in errors if e["file_id"] == self.fids[2])
+        self.assertEqual(detail, "timeout while loading")
+
+    def test_missing_errors_key_falls_back(self):
+        self._install_embedder(None, include_errors=False)
+        _records, errors = core._embed_bodies_for_index(self.fids, "idx", "signal")
+        detail = next(e["detail"] for e in errors if e["file_id"] == self.fids[2])
+        self.assertTrue(detail)
+        self.assertIn("embedding produced no rows", detail)
+
+    def test_unrelated_list_errors_falls_back(self):
+        # errors present but with no entry matching the skipped file.
+        self._install_embedder([{"file": "someone_else.step", "error": "boom"}])
+        _records, errors = core._embed_bodies_for_index(self.fids, "idx", "signal")
+        detail = next(e["detail"] for e in errors if e["file_id"] == self.fids[2])
+        self.assertIn("embedding produced no rows", detail)
+
+    def test_success_not_dragged_down_by_failure(self):
+        self._install_embedder([{"file": self.filenames[self.fids[2]], "error": "x"}])
+        records, errors = core._embed_bodies_for_index(self.fids, "idx", "signal")
+        added_files = {r.id for r in records}
+        self.assertEqual(len(added_files), 2)
+        self.assertNotIn(self.fids[2], added_files)
+
+
 if __name__ == "__main__":
     unittest.main()
