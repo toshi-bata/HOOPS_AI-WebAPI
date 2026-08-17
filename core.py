@@ -644,9 +644,9 @@ def add_to_index(
 
         if schema["schema_version"] < _INDEX_SCHEMA_VERSION:
             raise SchemaVersionError(
-                f"この索引は旧スキーマです。再構築してください。 "
-                f"(index '{name}' uses schema v{schema['schema_version']}; "
-                f"rebuild it as schema v{_INDEX_SCHEMA_VERSION} before adding parts.)"
+                f"Index '{name}' uses legacy schema v{schema['schema_version']} "
+                f"and must be rebuilt as schema v{_INDEX_SCHEMA_VERSION} "
+                f"before adding parts."
             )
 
         records, errors = _embed_bodies_for_index(file_ids, name, effective_model)
@@ -756,9 +756,9 @@ def remove_from_index(name: str, part_ids: list[str]) -> dict[str, Any]:
         vs = _load_named_index(name)
         if schema["schema_version"] < _INDEX_SCHEMA_VERSION:
             raise SchemaVersionError(
-                f"この索引は旧スキーマです。再構築してください。 "
-                f"(index '{name}' uses schema v{schema['schema_version']}; "
-                f"rebuild it as schema v{_INDEX_SCHEMA_VERSION} before removing parts.)"
+                f"Index '{name}' uses legacy schema v{schema['schema_version']} "
+                f"and must be rebuilt as schema v{_INDEX_SCHEMA_VERSION} "
+                f"before removing parts."
             )
         vs.delete(part_ids)
         _save_named_index_atomic(name, vs)
