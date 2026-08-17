@@ -922,6 +922,35 @@ class IndexDeleteResponse(BaseModel):
     deleted: bool
 
 
+class IndexStatsResponse(BaseModel):
+    name: str
+    files: int
+    bodies: int
+    assemblies: int
+    single_part: int
+    dim: Optional[int] = None
+    model: str
+    schema_version: int
+    last_modified: Optional[str] = None
+
+
+class IndexPartItem(BaseModel):
+    id: str
+    filename: Optional[str] = None
+    kind: str
+    bodies: int
+    thumbnail_url: Optional[str] = None
+    scs_url: Optional[str] = None
+    registered_at: Optional[str] = None
+
+
+class IndexPartsResponse(BaseModel):
+    total: int
+    offset: int
+    limit: int
+    items: list[IndexPartItem]
+
+
 # ---------------------------------------------------------------------------
 # POST /similarity/index/create
 # ---------------------------------------------------------------------------
@@ -1054,6 +1083,8 @@ def add_to_index(
         result = core.add_to_index(name, all_file_ids, model=None)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except core.SchemaVersionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (core.EnvConfigError, core.PathConfigError):
         raise
     except Exception as exc:
@@ -1120,6 +1151,137 @@ def search_named_index(
 
 
 # ---------------------------------------------------------------------------
+# GET /similarity/index/{name}/stats
+# ---------------------------------------------------------------------------
+
+
+@router.get("/index/{name}/stats", response_model=IndexStatsResponse)
+def get_index_stats(name: str):
+    """Return body-level statistics for a named index.
+
+    ``files`` counts distinct CAD files, ``bodies`` counts vector rows,
+    ``assemblies`` counts files with >= 2 bodies and ``single_part`` counts
+    single-body files. Legacy (schema v1) indexes report one body per file.
+    """
+    try:
+        _validate_name_or_raise(name)
+    except HTTPException:
+        raise
+    try:
+        return IndexStatsResponse(**core.get_index_stats(name))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (core.EnvConfigError, core.PathConfigError):
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to get stats: {exc}") from exc
+
+
+# ---------------------------------------------------------------------------
+# GET /similarity/index/{name}/parts
+# ---------------------------------------------------------------------------
+
+
+@router.get("/index/{name}/parts", response_model=IndexPartsResponse)
+def list_index_parts(
+    name: str,
+    request: Request,
+    offset: int = Query(0, ge=0, description="Number of items to skip."),
+    limit: int = Query(100, ge=1, le=2000, description="Max items per page (1-2000)."),
+    kind: Optional[str] = Query(
+        None, description="Filter by kind: 'part' or 'assembly'. Omit for all."
+    ),
+):
+    """Return a paginated, file-level listing of a named index.
+
+    ``thumbnail_url`` / ``scs_url`` are absolute URLs to the per-part asset
+    endpoints, or ``null`` when the asset does not exist on disk.
+    """
+    try:
+        _validate_name_or_raise(name)
+    except HTTPException:
+        raise
+    if kind is not None and kind not in ("part", "assembly"):
+        raise HTTPException(
+            status_code=422, detail="kind must be 'part' or 'assembly' when supplied."
+        )
+    try:
+        result = core.list_index_parts(name, offset=offset, limit=limit, kind=kind)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (core.EnvConfigError, core.PathConfigError):
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to list parts: {exc}") from exc
+
+    base = str(request.base_url).rstrip("/")
+    items = []
+    for it in result["items"]:
+        pid = it["id"]
+        thumbnail_url = (
+            f"{base}/similarity/index/{name}/parts/{pid}/thumbnail"
+            if it.get("has_thumbnail")
+            else None
+        )
+        scs_url = (
+            f"{base}/similarity/index/{name}/parts/{pid}/scs"
+            if it.get("has_scs")
+            else None
+        )
+        items.append(
+            IndexPartItem(
+                id=pid,
+                filename=it.get("filename"),
+                kind=it["kind"],
+                bodies=it["bodies"],
+                thumbnail_url=thumbnail_url,
+                scs_url=scs_url,
+                registered_at=it.get("registered_at"),
+            )
+        )
+    return IndexPartsResponse(
+        total=result["total"], offset=result["offset"], limit=result["limit"], items=items
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /similarity/index/{name}/parts/{part_id}/thumbnail | /scs
+# ---------------------------------------------------------------------------
+
+
+@router.get("/index/{name}/parts/{part_id}/thumbnail")
+def get_index_part_thumbnail(name: str, part_id: str):
+    """Return the stored PNG thumbnail for a registered part (404 if missing)."""
+    try:
+        _validate_name_or_raise(name)
+    except HTTPException:
+        raise
+    try:
+        path = core._resolve_index_asset(name, part_id, "thumbnail")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    if path is None:
+        raise HTTPException(status_code=404, detail="Thumbnail not found.")
+    return FileResponse(str(path), media_type="image/png")
+
+
+@router.get("/index/{name}/parts/{part_id}/scs")
+def get_index_part_scs(name: str, part_id: str):
+    """Return the stored SCS stream cache for a registered part (404 if missing)."""
+    try:
+        _validate_name_or_raise(name)
+    except HTTPException:
+        raise
+    try:
+        path = core._resolve_index_asset(name, part_id, "scs")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    if path is None:
+        raise HTTPException(status_code=404, detail="SCS file not found.")
+    return FileResponse(str(path), media_type="application/octet-stream")
+
+
+# ---------------------------------------------------------------------------
 # DELETE /similarity/index/{name}/parts
 # ---------------------------------------------------------------------------
 
@@ -1147,6 +1309,8 @@ def remove_parts_from_index(
         return IndexRemoveResponse(**result)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except core.SchemaVersionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (core.EnvConfigError, core.PathConfigError):
         raise
     except Exception as exc:

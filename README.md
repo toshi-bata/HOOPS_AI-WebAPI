@@ -131,8 +131,11 @@ unless `HOOPS_AI_ENABLE_DEMO_FEATURES=true`:
 - `POST /context/predict` (context-layer prediction)
 
 All other endpoints (upload, viewer, B-Rep analysis, MFR/Part-Classification inference,
-`compare`/`embed`/`search` similarity, and searching an *existing* named index via
-`POST /similarity/index/{name}/search`) remain available regardless of this flag.
+`compare`/`embed`/`search` similarity, searching an *existing* named index via
+`POST /similarity/index/{name}/search`, and the read-only named-index reporting/asset
+endpoints `GET /similarity/index/{name}/stats`, `GET /similarity/index/{name}/parts`,
+`GET /similarity/index/{name}/parts/{part_id}/thumbnail`, `.../scs`) remain available
+regardless of this flag.
 
 Example `.env`:
 
@@ -1070,11 +1073,26 @@ are fully writable: create an empty index, register new parts whenever they arri
 and query immediately  Eall via Web API with no notebook re-runs.
 
 Each named index is bound to the embeddings model used when it was created (stored in
-a `model.json` sidecar).  The model for new indexes is taken from the server-wide
-setting (`PUT /similarity/default-model/setting`; default `'signal'`).  Indexes with different
-models can coexist; the correct embedder is applied automatically at search and add time.
+an `index.json` sidecar together with a `schema_version`).  The model for new indexes is
+taken from the server-wide setting (`PUT /similarity/default-model/setting`; default
+`'signal'`).  Indexes with different models can coexist; the correct embedder is applied
+automatically at search and add time.
 
-Indexes are stored under ``APP_ROOT/indexes/<name>/`` (FAISS files + model sidecar).
+**Body-level indexing (schema v2).**  New indexes store **one FAISS row per body**
+(not one averaged vector per file).  This unlocks per-index statistics (files / bodies /
+assemblies / single-part), `part` vs `assembly` classification, and per-body matching for
+future assembly-to-assembly search.  Registering a file also produces a thumbnail
+(`thumbnails/<file_id>.png`) and a stream cache (`scs/<file_id>.scs`) from the same CAD
+load.  Search transparently de-duplicates body rows so each file appears once, ranked by
+its best-matching body — the `POST /index/{name}/search` response schema is unchanged.
+
+Legacy indexes created before this change are **schema v1** (one averaged vector per
+file).  They remain fully readable (search / list / stats), but **writes**
+(`POST /index/add`, `DELETE /index/{name}/parts`) return **409** with an instruction to
+rebuild the index.  Migration tooling is provided separately.
+
+Indexes are stored under ``APP_ROOT/indexes/<name>/``
+(`index.faiss`, `index.meta`, `index.json`, `thumbnails/`, `scs/`).
 Index names must match ``^[a-z0-9_-]{1,64}$``; ``default`` is reserved.
 
 ##### Incremental workflow example
@@ -1280,6 +1298,91 @@ curl -X DELETE "http://127.0.0.1:8000/similarity/index/my-parts?confirm=true"
 **Response:**
 ```json
 { "name": "my-parts", "deleted": true }
+```
+
+##### Index statistics
+
+```
+GET /similarity/index/{name}/stats
+```
+
+Body-level counts for a named index.  Works for both schema versions (a legacy index
+reports one body per file, so `bodies == files` and `assemblies == 0`).
+
+**Windows (PowerShell):**
+```powershell
+curl.exe "http://127.0.0.1:8000/similarity/index/my-parts/stats"
+```
+
+**Linux:**
+```bash
+curl "http://127.0.0.1:8000/similarity/index/my-parts/stats"
+```
+
+**Response:**
+```json
+{
+  "name": "my-parts",
+  "files": 9,
+  "bodies": 47,
+  "assemblies": 7,
+  "single_part": 2,
+  "dim": 2048,
+  "model": "signal",
+  "schema_version": 2,
+  "last_modified": "2026-08-17T06:00:00Z"
+}
+```
+
+##### List registered parts (paginated)
+
+```
+GET /similarity/index/{name}/parts?offset=0&limit=100&kind=part|assembly
+```
+
+One item per file.  `limit` is clamped to `1..2000` (default `100`); `offset` is `>= 0`.
+Omit `kind` for all items, or filter by `part` / `assembly`.  `thumbnail_url` / `scs_url`
+are absolute URLs to the asset endpoints below, or `null` when the asset is missing.
+
+**Linux:**
+```bash
+curl "http://127.0.0.1:8000/similarity/index/my-parts/parts?limit=50&kind=assembly"
+```
+
+**Response:**
+```json
+{
+  "total": 9,
+  "offset": 0,
+  "limit": 50,
+  "items": [
+    {
+      "id": "<file_id>",
+      "filename": "1005.stp",
+      "kind": "assembly",
+      "bodies": 12,
+      "thumbnail_url": "http://127.0.0.1:8000/similarity/index/my-parts/parts/<file_id>/thumbnail",
+      "scs_url": "http://127.0.0.1:8000/similarity/index/my-parts/parts/<file_id>/scs",
+      "registered_at": "2026-08-17T06:00:00Z"
+    }
+  ]
+}
+```
+
+##### Part thumbnail / stream cache
+
+```
+GET /similarity/index/{name}/parts/{part_id}/thumbnail   -> image/png
+GET /similarity/index/{name}/parts/{part_id}/scs         -> application/octet-stream
+```
+
+Serve the per-part PNG thumbnail or SCS stream cache generated at registration time.
+Returns **404** when the asset does not exist.  Paths are validated to stay within
+`indexes/<name>/`.
+
+**Linux:**
+```bash
+curl -o thumb.png "http://127.0.0.1:8000/similarity/index/my-parts/parts/<file_id>/thumbnail"
 ```
 
 ---
