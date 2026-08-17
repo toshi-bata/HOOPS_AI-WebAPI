@@ -338,32 +338,67 @@ def _embed_error_detail(
 ) -> str:
     """Best-effort failure reason for *fid* from ``batch.metadata['errors']``.
 
-    The structure of that metadata is SDK-version dependent (list of dicts,
-    list of strings, or a dict keyed by path/file_id). We match defensively and
-    always return a non-empty string, falling back to an explicit message.
+    Observed on hoops_ai 1.1.0: a list of plain strings shaped like
+    ``"Failed to compute embedding for <abs path>: <reason>"``. Other shapes
+    (list of dicts, dict keyed by path) are still handled defensively because
+    the contract is not documented. Always returns a non-empty string.
+
+    Matching is path-first and filename matching is boundary-aware, so a file
+    named ``0.stp`` never picks up the error belonging to ``100.stp``. Matched
+    messages are returned verbatim -- they are short and already name the file.
     """
     default = "embedding produced no rows (file skipped by embed_shape_batch)"
-    candidates = [c for c in (norm_path, filename, fid) if c]
 
-    def _matches(text: str) -> bool:
-        return any(c and (c == text or c in text) for c in candidates)
+    def _norm(p: str) -> str:
+        try:
+            return os.path.normcase(os.path.normpath(p))
+        except Exception:
+            return os.path.normcase(p)
+
+    want_path = _norm(norm_path) if norm_path else ""
+    want_file = os.path.normcase(filename) if filename else ""
+
+    def _mentions(text: str) -> bool:
+        if not text:
+            return False
+        low = _norm(text)
+        if want_path and want_path in low:
+            return True
+        if fid and fid in text:
+            return True
+        if not want_file:
+            return False
+        # Boundary-aware filename search: reject "0.stp" inside "100.stp".
+        start = 0
+        while True:
+            k = low.find(want_file, start)
+            if k < 0:
+                return False
+            before_ok = k == 0 or low[k - 1] in "\\/\"' \t([<,"
+            end = k + len(want_file)
+            after_ok = end >= len(low) or not (
+                low[end].isalnum() or low[end] in "._-"
+            )
+            if before_ok and after_ok:
+                return True
+            start = k + 1
 
     if isinstance(embed_errors, dict):
         for key, val in embed_errors.items():
-            if _matches(str(key)) and val:
-                return str(val)
+            if _mentions(str(key)) and val:
+                return str(val).strip() or default
     elif isinstance(embed_errors, (list, tuple)):
         for item in embed_errors:
-            if isinstance(item, dict):
+            if isinstance(item, str):
+                if _mentions(item):
+                    return item.strip() or default
+            elif isinstance(item, dict):
                 text = " ".join(str(v) for v in item.values())
-                if _matches(text):
+                if _mentions(text):
                     for k in ("detail", "message", "error", "reason"):
                         if item.get(k):
-                            return str(item[k])
+                            return str(item[k]).strip() or default
                     return text.strip() or default
-            elif isinstance(item, str):
-                if _matches(item):
-                    return item
     return default
 
 

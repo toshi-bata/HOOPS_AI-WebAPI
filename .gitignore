@@ -11,3 +11,5 @@ embeddings_cache/
 indexes/
 poc_out/
 poc_body_level_index.py
+# Written to the cwd by hoops_ai when a batch item fails to embed
+error_summary.json

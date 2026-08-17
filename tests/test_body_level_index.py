@@ -361,5 +361,77 @@ class TestEmbedBodiesMissingFiles(unittest.TestCase):
         self.assertNotIn(self.fids[2], added_files)
 
 
+class TestEmbedErrorDetail(unittest.TestCase):
+    """Reason extraction from batch.metadata['errors'].
+
+    The real shape observed on hoops_ai 1.1.0 is a list of plain strings:
+      "Failed to compute embedding for <abs path>: <reason>"
+    """
+
+    REAL_REASON = "Error in generating scs image for file {p}"
+    REAL_MSG = "Failed to compute embedding for {p}: " + REAL_REASON
+
+    def test_real_observed_string_format(self):
+        p = os.path.join("root", "temp", "broken.stp")
+        errs = [self.REAL_MSG.format(p=p)]
+        out = core._embed_error_detail(errs, "a" * 64, "broken.stp", p)
+        # Kept verbatim: the message is short and already names the file.
+        self.assertEqual(out, self.REAL_MSG.format(p=p))
+
+    def test_similar_filename_does_not_false_match(self):
+        # Regression: substring matching made "0.stp" match "100.stp".
+        other = os.path.join("root", "mix", "100.stp")
+        mine = os.path.join("root", "mix", "0.stp")
+        errs = [self.REAL_MSG.format(p=other)]
+        out = core._embed_error_detail(errs, "b" * 64, "0.stp", mine)
+        self.assertIn("embedding produced no rows", out)
+
+    def test_correct_entry_picked_among_several(self):
+        a = os.path.join("root", "mix", "1.stp")
+        b = os.path.join("root", "mix", "10.stp")
+        errs = [
+            "Failed to compute embedding for {}: reason A".format(a),
+            "Failed to compute embedding for {}: reason B".format(b),
+        ]
+        self.assertEqual(core._embed_error_detail(errs, "c" * 64, "10.stp", b), errs[1])
+        self.assertEqual(core._embed_error_detail(errs, "d" * 64, "1.stp", a), errs[0])
+
+    def test_unparseable_string_kept_verbatim(self):
+        p = os.path.join("root", "temp", "x.stp")
+        errs = ["something odd happened with " + p]
+        out = core._embed_error_detail(errs, "e" * 64, "x.stp", p)
+        self.assertEqual(out, "something odd happened with " + p)
+
+    def test_dict_keyed_by_path(self):
+        p = os.path.join("root", "temp", "x.stp")
+        out = core._embed_error_detail({p: "timeout"}, "f" * 64, "x.stp", p)
+        self.assertEqual(out, "timeout")
+
+    def test_list_of_dicts(self):
+        p = os.path.join("root", "temp", "x.stp")
+        errs = [{"file": p, "detail": "load failed"}]
+        out = core._embed_error_detail(errs, "0" * 64, "x.stp", p)
+        self.assertEqual(out, "load failed")
+
+    def test_empty_and_none_fall_back(self):
+        p = os.path.join("root", "temp", "x.stp")
+        for errs in (None, [], {}, "", 123):
+            out = core._embed_error_detail(errs, "1" * 64, "x.stp", p)
+            self.assertIn("embedding produced no rows", out)
+            self.assertTrue(out)
+
+    def test_matched_but_blank_reason_falls_back(self):
+        p = os.path.join("root", "temp", "x.stp")
+        errs = [{"file": p, "detail": "", "message": None}]
+        out = core._embed_error_detail(errs, "2" * 64, "x.stp", p)
+        self.assertTrue(out.strip())
+
+    def test_matches_by_file_id(self):
+        fid = "3" * 64
+        errs = ["embedding failed for " + fid]
+        out = core._embed_error_detail(errs, fid, "x.stp", os.path.join("root", "x.stp"))
+        self.assertEqual(out, "embedding failed for " + fid)
+
+
 if __name__ == "__main__":
     unittest.main()
