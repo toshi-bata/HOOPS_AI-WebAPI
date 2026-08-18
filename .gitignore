@@ -16,3 +16,6 @@ error_summary.json
 
 # Throwaway tool: imports a hoops_ai_native_bridge index into indexes/
 import_bridge_index.py
+
+# Throwaway probe: measures the CADSearch cold-start cost of a named index
+poc_searcher_coldstart.py
