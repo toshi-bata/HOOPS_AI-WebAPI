@@ -118,6 +118,11 @@ cp .env.example .env
 | `HOOPS_AI_CAD_SHARED_DIR` | optional | Location of the **CAD store** (default: `uploads/`). This directory holds the only copy of the payload behind every registered index and is never cleared by the server. |
 | `HOOPS_AI_OUT_TTL_HOURS` | optional | Age at which files under `out/` (viewer streams, result images, shape maps) are swept at startup (default `24`). `0` disables the sweep. |
 | `HOOPS_AI_EMBEDDINGS_CACHE_TTL_DAYS` | optional | Age at which cached embeddings under `embeddings_cache/` are swept at startup (default `0`, i.e. keep forever). Recomputing one entry costs a full CAD load. |
+| `HOOPS_AI_JOB_MAX_CONCURRENCY` | optional | How many registration jobs run at once (default `1`). Serialised because hoops_ai writes `error_summary.json` to the process working directory with no way to redirect it. |
+| `HOOPS_AI_JOB_TTL_DAYS` | optional | Retention of finished job records under `jobs/` (default `7`). `0` keeps them until the record cap evicts them. |
+| `HOOPS_AI_JOB_MAX_RECORDS` | optional | Hard cap on retained job records (default `1000`). |
+| `HOOPS_AI_JOB_BATCH_SIZE` | optional | Files per embedding call inside a job (default `100`). Also the granularity at which progress advances and cancellation is observed. |
+| `HOOPS_AI_ALLOW_SERVER_PATHS` | optional | Set to `true` to let jobs read CAD from `server_paths` on the server machine. Defaults to `false`: it reads any file the server process can read and bypasses the upload size and extension checks. |
 
 > **Note:** `HOOPS_AI_LICENSE` is read **only** from the `.env` file, not from system environment variables.
 
@@ -130,8 +135,7 @@ unless `HOOPS_AI_ENABLE_DEMO_FEATURES=true`:
 - `GET`/`PUT /similarity/default-model/setting` (embedding-model switch)
 - `GET`/`PUT /similarity/default-index/setting` (default FAISS index preset switch)
 - `POST /similarity/index/create`, `GET /similarity/index/list`, `POST /similarity/index/add`,
-  `DELETE /similarity/index/{name}/parts`, `DELETE /similarity/index/{name}` (named index management)
-- `POST /similarity/map`, `GET /similarity/map/job/{job_id}`, `POST /similarity/map/{map_id}/query`,
+  `DELETE /similarity/index/{name}/parts`, `DELETE /similarity/index/{name}` (named index management)- `POST /similarity/map`, `GET /similarity/map/job/{job_id}`, `POST /similarity/map/{map_id}/query`,
   `POST /similarity/map/{map_id}/add-to-index` (Shape Space Map)
 - `GET /MFR/dataset/table-of-contents`, `GET /MFR/labels/description`, `GET /MFR/files/search`,
   `GET /MFR/files/{file_id}/thumbnail` (MFR dataset browsing)
@@ -145,8 +149,9 @@ All other endpoints (upload, viewer, B-Rep analysis, MFR/Part-Classification inf
 `POST /similarity/index/{name}/search-assembly`, and the read-only named-index
 reporting/asset endpoints `GET /similarity/index/{name}/stats`,
 `GET /similarity/index/{name}/parts`,
-`GET /similarity/index/{name}/parts/{part_id}/thumbnail`, `.../scs`) remain available
-regardless of this flag.
+`GET /similarity/index/{name}/parts/{part_id}/thumbnail`, `.../scs`, and the bulk
+registration job endpoints `POST`/`GET`/`DELETE /similarity/index/{name}/jobs[...]`)
+remain available regardless of this flag.
 
 Example `.env`:
 
@@ -1312,6 +1317,76 @@ curl -X POST "http://127.0.0.1:8000/similarity/index/add?name=my-parts" -F "file
 ```json
 { "name": "my-parts", "added": 1, "updated": 0, "index_count": 4, "errors": [] }
 ```
+
+---
+
+##### Bulk registration as a background job
+
+`POST /similarity/index/add` above is synchronous: the client holds a connection
+open for the whole run and gets no progress and no way to stop. For hundreds or
+thousands of files, use the job form instead.
+
+```
+POST   /similarity/index/{name}/jobs/add       → 202 {"job_id": ...}
+GET    /similarity/index/{name}/jobs/{job_id}  → status + progress + summary
+GET    /similarity/index/{name}/jobs           → list, newest first (paginated)
+DELETE /similarity/index/{name}/jobs/{job_id}  → request cancellation
+```
+
+Request body (supply at least one input):
+
+| Field | Meaning |
+|---|---|
+| `file_ids` | `file_id`s already in the CAD store. **The standard route** — upload with `POST /files/upload-batch` and skip what `POST /files/exists` already knows. |
+| `zip_file_id` | `file_id` of an uploaded ZIP archive, expanded server-side. |
+| `server_paths` | Paths on the server machine. Disabled by default; returns **403** unless `HOOPS_AI_ALLOW_SERVER_PATHS=true`. Administrator seeding only, since it reads any file the server process can read and bypasses the upload checks. |
+| `workers`, `time_limit` | Accepted but ignored for now; reserved for the two-pass strategy. |
+
+Job records are JSON files under `jobs/`, so they survive a restart. Finished
+records are swept after `HOOPS_AI_JOB_TTL_DAYS` (default 7) and capped at
+`HOOPS_AI_JOB_MAX_RECORDS` (default 1000). Duplicate `file_id`s in one request
+are collapsed; every rejected input is reported in `errors` rather than dropped.
+A job that was still `queued` or `running` when the server stopped is marked
+`failed` at the next startup — nothing resumes it, but everything it had already
+registered is kept, so resubmitting the remainder is safe.
+
+> **Jobs run one at a time by default.** hoops_ai writes `error_summary.json`
+> into the process working directory and offers no way to redirect it, so two
+> concurrent registration jobs would read each other's failure report. Raise
+> `HOOPS_AI_JOB_MAX_CONCURRENCY` only if you accept that.
+
+> **Cancellation is observed at batch boundaries only.** `embed_shape_batch` is a
+> single blocking SDK call that cannot be interrupted, so a job stops after the
+> batch in flight finishes (`HOOPS_AI_JOB_BATCH_SIZE` files, default 100). Files
+> already registered stay registered.
+
+**Windows (PowerShell):**
+```powershell
+$body = @{ file_ids = @("a3f8c2...", "b71e94...") } | ConvertTo-Json
+$job = curl.exe -s -X POST "http://127.0.0.1:8000/similarity/index/my-parts/jobs/add" `
+  -H "Content-Type: application/json" -d $body | ConvertFrom-Json
+
+# Poll until the job settles
+do {
+  Start-Sleep -Seconds 2
+  $s = curl.exe -s "http://127.0.0.1:8000/similarity/index/my-parts/jobs/$($job.job_id)" | ConvertFrom-Json
+  "{0} {1}/{2} errors={3}" -f $s.status, $s.progress.done, $s.progress.total, $s.progress.errors
+} while ($s.status -in @("queued", "running"))
+```
+
+**Response (status):**
+```json
+{
+  "job_id": "…", "kind": "index_add", "index_name": "my-parts", "status": "done",
+  "progress": {"phase": "done", "done": 240, "total": 240, "errors": 3},
+  "summary": {"added": 235, "updated": 2, "failed": 3, "skipped": 0, "index_count": 1042},
+  "errors": [{"file_id": "…", "detail": "Timeout"}],
+  "timings": {"embed_seconds": 812.4, "total_seconds": 815.1}
+}
+```
+
+`timings` is recorded so tuning decisions can be based on this server's own
+measurements rather than guesswork.
 
 ---
 

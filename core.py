@@ -27,6 +27,7 @@ CAD_UPLOAD_DIR = APP_ROOT.joinpath("uploads")
 CAD_VIEWER_OUTPUT_DIR = APP_ROOT.joinpath("out")
 EMBEDDINGS_CACHE_DIR = APP_ROOT.joinpath("embeddings_cache")
 INDEXES_DIR = APP_ROOT.joinpath("indexes")
+JOBS_DIR = APP_ROOT.joinpath("jobs")
 
 # Named-index on-disk schema version.
 #   1 = legacy: one averaged vector row per file (created before this migration)
@@ -3376,6 +3377,7 @@ def ensure_runtime_dirs() -> None:
         CAD_VIEWER_OUTPUT_DIR,
         EMBEDDINGS_CACHE_DIR,
         INDEXES_DIR,
+        JOBS_DIR,
     ):
         folder.mkdir(parents=True, exist_ok=True)
 
@@ -3395,7 +3397,175 @@ def run_startup_maintenance() -> dict[str, dict[str, int]]:
                 "[GC] %s: removed %d, kept %d, failed %d",
                 label, stats["removed"], stats["kept"], stats["failed"],
             )
+    get_index_job_store().recover_interrupted()
+    get_index_job_store().collect_garbage()
     return results
+
+
+# --- Background registration jobs -------------------------------------------
+
+JOB_KIND_INDEX_ADD = "index_add"
+
+_JOB_MAX_CONCURRENCY_DEFAULT = 1
+_JOB_TTL_DAYS_DEFAULT = 7
+_JOB_MAX_RECORDS_DEFAULT = 1000
+_JOB_BATCH_SIZE_DEFAULT = 100
+
+_index_job_store: Any = None
+_index_job_store_lock = threading.Lock()
+
+
+def job_max_concurrency() -> int:
+    """How many jobs may run at once, from HOOPS_AI_JOB_MAX_CONCURRENCY.
+
+    Defaults to 1, i.e. registration jobs are serialised across all indexes.
+    hoops_ai writes ``error_summary.json`` into the process working directory
+    and gives no way to redirect it: ``flowdir`` is a Flow-API attribute that
+    ``embed_shape_batch`` never populates, and no environment override exists
+    (verified against the compiled SDK). Concurrent jobs would therefore read
+    each other's failure summary and misreport which files failed.
+    """
+    return _env_int("HOOPS_AI_JOB_MAX_CONCURRENCY", _JOB_MAX_CONCURRENCY_DEFAULT, minimum=1)
+
+
+def job_ttl_seconds() -> int:
+    """Retention of finished job records, from HOOPS_AI_JOB_TTL_DAYS."""
+    return _env_int("HOOPS_AI_JOB_TTL_DAYS", _JOB_TTL_DAYS_DEFAULT, minimum=0) * 86400
+
+
+def job_max_records() -> int:
+    """Hard cap on retained job records, from HOOPS_AI_JOB_MAX_RECORDS."""
+    return _env_int("HOOPS_AI_JOB_MAX_RECORDS", _JOB_MAX_RECORDS_DEFAULT, minimum=1)
+
+
+def job_batch_size() -> int:
+    """Files per ``add_to_index`` call inside a job, from HOOPS_AI_JOB_BATCH_SIZE.
+
+    A job splits its input into batches so that progress advances and a
+    cancellation request is observed without waiting for thousands of files.
+    Each batch commits the index, so a crash keeps everything already embedded.
+    """
+    return _env_int("HOOPS_AI_JOB_BATCH_SIZE", _JOB_BATCH_SIZE_DEFAULT, minimum=1)
+
+
+def server_paths_enabled() -> bool:
+    """Whether jobs may read CAD from arbitrary server-side paths.
+
+    Off by default: it lets any client with API access read any file the server
+    process can read, and it bypasses the upload path's size and extension
+    checks. It exists only for an administrator seeding a fresh installation
+    from a local corpus, so it must be switched on deliberately.
+    """
+    value = os.environ.get("HOOPS_AI_ALLOW_SERVER_PATHS") or read_env_file().get(
+        "HOOPS_AI_ALLOW_SERVER_PATHS", ""
+    )
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def get_index_job_store():
+    """Process-wide job store for index registration jobs."""
+    global _index_job_store
+    with _index_job_store_lock:
+        if _index_job_store is None:
+            import jobstore
+
+            _index_job_store = jobstore.JobStore(
+                root=JOBS_DIR,
+                max_workers=job_max_concurrency(),
+                ttl_seconds=job_ttl_seconds(),
+                max_records=job_max_records(),
+            )
+        return _index_job_store
+
+
+def resolve_server_paths(paths: list[str]) -> tuple[list[str], list[dict[str, Any]]]:
+    """Import CAD files from server-side *paths* into the CAD store.
+
+    Returns ``(file_ids, errors)``. Every rejected path yields an error entry,
+    so a caller can always account for each input. Raises ``PermissionError``
+    when the feature is disabled.
+    """
+    if not server_paths_enabled():
+        raise PermissionError(
+            "Server-side paths are disabled. Set HOOPS_AI_ALLOW_SERVER_PATHS=true "
+            "to enable them (administrator seeding only)."
+        )
+    file_ids: list[str] = []
+    errors: list[dict[str, Any]] = []
+    for raw in paths:
+        path = pathlib.Path(raw).expanduser()
+        try:
+            if not path.is_file():
+                raise RuntimeError("not a file")
+            if path.suffix.lower() not in CAD_ALLOWED_EXTENSIONS:
+                raise RuntimeError(f"unsupported CAD extension '{path.suffix}'")
+            with path.open("rb") as fh:
+                fid, _, _ = upload_CAD_file_persistent(
+                    _BytesUploadFile(fh.read(), path.name)
+                )
+            file_ids.append(fid)
+        except Exception as exc:
+            errors.append({"filename": str(raw), "detail": str(exc)})
+    return file_ids, errors
+
+
+def run_index_add_job(
+    ctx,
+    name: str,
+    file_ids: list[str],
+    model: Optional[str] = None,
+    batch_size: Optional[int] = None,
+) -> None:
+    """Job body: register *file_ids* into index *name*, in batches.
+
+    Progress is reported per batch. Cancellation is observed only at batch
+    boundaries: ``embed_shape_batch`` is a single blocking SDK call that cannot
+    be interrupted, so a request made mid-batch takes effect once that batch
+    finishes. Failures are recorded per file with the reason reported by the
+    SDK, never dropped.
+    """
+    total = len(file_ids)
+    ctx.set_total(total)
+    ctx.set_phase("embedding")
+    ctx.set_summary(added=0, updated=0, failed=0, skipped=0)
+
+    size = batch_size if batch_size is not None else job_batch_size()
+    added = updated = failed = 0
+    embed_seconds = 0.0
+    index_count = 0
+
+    for start in range(0, total, size):
+        ctx.check_canceled()
+        batch = file_ids[start:start + size]
+        t0 = time.perf_counter()
+        result = add_to_index(name, batch, model=model)
+        embed_seconds += time.perf_counter() - t0
+
+        errors = list(result.get("errors") or [])
+        added += int(result.get("added", 0))
+        updated += int(result.get("updated", 0))
+        failed += len(errors)
+        index_count = int(result.get("index_count", index_count))
+
+        # Accounting guard: every submitted file must be added, updated or
+        # reported as failed. A silent shortfall means the SDK contract moved.
+        accounted = int(result.get("added", 0)) + int(result.get("updated", 0)) + len(errors)
+        if accounted != len(batch):
+            logger.warning(
+                "[JOB] index '%s': batch of %d files accounted for only %d "
+                "(added/updated/errors); some inputs were not reported",
+                name, len(batch), accounted,
+            )
+
+        ctx.add_errors(errors)
+        ctx.advance(done=len(batch), errors=len(errors))
+        ctx.set_summary(
+            added=added, updated=updated, failed=failed, skipped=0,
+            index_count=index_count,
+        )
+        ctx.set_timings(embed_seconds=round(embed_seconds, 3))
+
+    ctx.set_phase("done")
 
 
 # Default limits for ZIP extraction (also used by routers). Both can be raised
