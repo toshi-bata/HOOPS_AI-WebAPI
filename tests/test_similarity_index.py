@@ -192,47 +192,35 @@ class TestIndexLifecycle(unittest.TestCase):
             self.assertIn("demo", names)
 
     def test_add_increments_count(self):
-        """add_to_index upserts and increments the count."""
+        """add_to_index upserts body-level records and increments the count."""
         import core
-        import numpy as np
 
         vs_inst = _fake_vs([])
         id_store: list[str] = []
 
         def upsert_impl(records):
             for r in records:
-                _id = getattr(r, "id", None) or getattr(r, "_mock_name", None)
-                # extract id via how VectorRecord mock is set up
-                if hasattr(r, "id") and isinstance(r.id, str):
-                    if r.id not in id_store:
-                        id_store.append(r.id)
+                if hasattr(r, "id") and isinstance(r.id, str) and r.id not in id_store:
+                    id_store.append(r.id)
 
         vs_inst.upsert.side_effect = upsert_impl
         vs_inst.get_ids.side_effect = lambda: list(id_store)
 
         fid = "a" * 64
-        FaissVS = MagicMock()
-        FaissVS.load.return_value = vs_inst
 
-        # Pre-create the index.faiss file under the new per-index subdirectory
+        # schema v2 index on disk so the write guard passes
         (core.INDEXES_DIR / "demo").mkdir(parents=True, exist_ok=True)
         (core.INDEXES_DIR / "demo" / "index.faiss").write_bytes(b"fake")
         (core.INDEXES_DIR / "demo" / "index.meta").write_bytes(b"fake")
+        core._save_index_schema("demo", "legacy", 2)
         core._named_indexes["demo"] = vs_inst
 
-        EmbeddingMock = MagicMock()
-        VRMock = MagicMock(side_effect=lambda id, embedding, metadata: MagicMock(id=id))
+        fake_record = MagicMock(id=fid)
 
         with (
-            patch.dict(
-                "sys.modules",
-                {"hoops_ai.ml.embeddings": MagicMock(
-                    FaissVectorStore=FaissVS,
-                    Embedding=EmbeddingMock,
-                    VectorRecord=VRMock,
-                )},
+            patch.object(
+                core, "_embed_bodies_for_index", return_value=([fake_record], [])
             ),
-            patch.object(core, "compute_embedding", side_effect=_fake_embedding),
             patch.object(core, "_save_named_index_atomic"),
         ):
             result = core.add_to_index("demo", [fid])
@@ -251,22 +239,15 @@ class TestIndexLifecycle(unittest.TestCase):
         (core.INDEXES_DIR / "myidx").mkdir(parents=True, exist_ok=True)
         (core.INDEXES_DIR / "myidx" / "index.faiss").write_bytes(b"fake")
         (core.INDEXES_DIR / "myidx" / "index.meta").write_bytes(b"fake")
+        core._save_index_schema("myidx", "legacy", 2)
         core._named_indexes["myidx"] = vs_inst
 
-        FaissVS = MagicMock()
-        EmbeddingMock = MagicMock()
-        VRMock = MagicMock(side_effect=lambda id, embedding, metadata: MagicMock(id=id))
+        fake_record = MagicMock(id=fid)
 
         with (
-            patch.dict(
-                "sys.modules",
-                {"hoops_ai.ml.embeddings": MagicMock(
-                    FaissVectorStore=FaissVS,
-                    Embedding=EmbeddingMock,
-                    VectorRecord=VRMock,
-                )},
+            patch.object(
+                core, "_embed_bodies_for_index", return_value=([fake_record], [])
             ),
-            patch.object(core, "compute_embedding", side_effect=_fake_embedding),
             patch.object(core, "_save_named_index_atomic"),
         ):
             result = core.add_to_index("myidx", [fid])
@@ -312,6 +293,7 @@ class TestIndexLifecycle(unittest.TestCase):
         (core.INDEXES_DIR / "idx").mkdir(parents=True, exist_ok=True)
         (core.INDEXES_DIR / "idx" / "index.faiss").write_bytes(b"fake")
         (core.INDEXES_DIR / "idx" / "index.meta").write_bytes(b"fake")
+        core._save_index_schema("idx", "legacy", 2)
         core._named_indexes["idx"] = vs_inst
 
         FaissVS = MagicMock()

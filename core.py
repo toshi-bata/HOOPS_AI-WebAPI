@@ -26,6 +26,12 @@ CAD_VIEWER_OUTPUT_DIR = APP_ROOT.joinpath("out")
 EMBEDDINGS_CACHE_DIR = APP_ROOT.joinpath("embeddings_cache")
 INDEXES_DIR = APP_ROOT.joinpath("indexes")
 
+# Named-index on-disk schema version.
+#   1 = legacy: one averaged vector row per file (created before this migration)
+#   2 = body-level: one vector row per body, with kind/bodies/thumbnail/scs/obb
+# schema_version is recorded in indexes/<name>/index.json.
+_INDEX_SCHEMA_VERSION = 2
+
 # Allowed CAD file extensions for upload/ZIP extraction
 CAD_ALLOWED_EXTENSIONS = frozenset({
     ".step", ".stp", ".iges", ".igs", ".x_t", ".x_b",
@@ -252,7 +258,7 @@ def create_index(name: str, model: str = _EMBEDDER_MODEL_LEGACY) -> dict[str, An
         dim = _get_embedder_dim(model)
         vs = FaissVectorStore(dim)
         _save_named_index_atomic(name, vs)
-        _save_index_model(name, model)
+        _save_index_schema(name, model, _INDEX_SCHEMA_VERSION)
         _named_indexes[name] = vs
         return {"name": name, "count": 0, "dim": dim, "model": model}
 
@@ -324,26 +330,345 @@ def list_indexes() -> list[dict[str, Any]]:
     return result
 
 
+def _embed_error_detail(
+    embed_errors: Any,
+    fid: str,
+    filename: str,
+    norm_path: str,
+) -> str:
+    """Best-effort failure reason for *fid* from ``batch.metadata['errors']``.
+
+    Observed on hoops_ai 1.1.0: a list of plain strings shaped like
+    ``"Failed to compute embedding for <abs path>: <reason>"``. Other shapes
+    (list of dicts, dict keyed by path) are still handled defensively because
+    the contract is not documented. Always returns a non-empty string.
+
+    Matching is path-first and filename matching is boundary-aware, so a file
+    named ``0.stp`` never picks up the error belonging to ``100.stp``. Matched
+    messages are returned verbatim -- they are short and already name the file.
+    """
+    default = "embedding produced no rows (file skipped by embed_shape_batch)"
+
+    def _norm(p: str) -> str:
+        try:
+            return os.path.normcase(os.path.normpath(p))
+        except Exception:
+            return os.path.normcase(p)
+
+    want_path = _norm(norm_path) if norm_path else ""
+    want_file = os.path.normcase(filename) if filename else ""
+
+    def _mentions(text: str) -> bool:
+        if not text:
+            return False
+        low = _norm(text)
+        if want_path and want_path in low:
+            return True
+        if fid and fid in text:
+            return True
+        if not want_file:
+            return False
+        # Boundary-aware filename search: reject "0.stp" inside "100.stp".
+        start = 0
+        while True:
+            k = low.find(want_file, start)
+            if k < 0:
+                return False
+            before_ok = k == 0 or low[k - 1] in "\\/\"' \t([<,"
+            end = k + len(want_file)
+            after_ok = end >= len(low) or not (
+                low[end].isalnum() or low[end] in "._-"
+            )
+            if before_ok and after_ok:
+                return True
+            start = k + 1
+
+    if isinstance(embed_errors, dict):
+        for key, val in embed_errors.items():
+            if _mentions(str(key)) and val:
+                return str(val).strip() or default
+    elif isinstance(embed_errors, (list, tuple)):
+        for item in embed_errors:
+            if isinstance(item, str):
+                if _mentions(item):
+                    return item.strip() or default
+            elif isinstance(item, dict):
+                text = " ".join(str(v) for v in item.values())
+                if _mentions(text):
+                    for k in ("detail", "message", "error", "reason"):
+                        if item.get(k):
+                            return str(item[k]).strip() or default
+                    return text.strip() or default
+    return default
+
+
+def _embed_bodies_for_index(
+    file_ids: list[str],
+    index_name: str,
+    model: str,
+) -> tuple[list, list[dict[str, Any]]]:
+    """Embed *file_ids* at body granularity and build one VectorRecord per body.
+
+    Calls ``embedder.embed_shape_batch()`` exactly once for the whole batch
+    (performance-critical: never loop per file). Thumbnails (PNG) and stream
+    caches (SCS) are produced by the same CAD load via ``generate_images`` and
+    relocated to the canonical ``thumbnails/<file_id>.png`` / ``scs/<file_id>.scs``
+    locations. Per-body vectors are L2-normalised individually (never averaged).
+
+    Returns ``(records, errors)`` where *records* is a flat list of VectorRecord
+    (multiple rows share the same file_id) and *errors* is a per-file error list.
+    """
+    import json
+    import shutil
+    from collections import OrderedDict
+
+    import numpy as np
+
+    from hoops_ai.ml.embeddings import Embedding, VectorRecord
+
+    embedder = get_embedder(model)
+    model_name = (
+        getattr(embedder, "model_name", None)
+        or getattr(embedder, "model", None)
+        or "hoops_embeddings_model"
+    )
+
+    errors: list[dict[str, Any]] = []
+
+    # Resolve real CAD paths; keep bidirectional maps keyed by file_id and by
+    # the resolved path string (embed_shape_batch echoes input paths in .ids).
+    fid_by_norm_path: dict[str, str] = {}
+    norm_by_fid: dict[str, str] = {}
+    filename_by_fid: dict[str, str] = {}
+    ordered_paths: list[str] = []
+    for fid in file_ids:
+        try:
+            cad_path = find_persistent_CAD_file(fid)
+        except Exception as exc:
+            errors.append({"file_id": fid, "detail": str(exc)})
+            continue
+        norm = str(cad_path.resolve())
+        fid_by_norm_path[norm] = fid
+        norm_by_fid[fid] = norm
+        parts = cad_path.name.split("_", 1)
+        filename_by_fid[fid] = (
+            parts[1] if len(parts) == 2 and len(parts[0]) == 64 else cad_path.name
+        )
+        ordered_paths.append(str(cad_path))
+
+    if not ordered_paths:
+        return [], errors
+
+    def _fid_for_row(raw_id: str) -> Optional[str]:
+        norm = str(pathlib.Path(str(raw_id)).resolve())
+        if norm in fid_by_norm_path:
+            return fid_by_norm_path[norm]
+        # Single-input fallback: every row belongs to the only file.
+        if len(fid_by_norm_path) == 1:
+            return next(iter(fid_by_norm_path.values()))
+        return None
+
+    tmp_images = INDEXES_DIR / index_name / f"_tmp_images_{uuid.uuid4().hex}"
+    tmp_images.mkdir(parents=True, exist_ok=True)
+
+    records: list = []
+    try:
+        batch = embedder.embed_shape_batch(
+            ordered_paths,
+            show_progress=False,
+            specifications={"generate_images": True, "images_out_dir": str(tmp_images)},
+        )
+
+        ids = list(getattr(batch, "ids", []) or [])
+        values = np.asarray(getattr(batch, "values", []), dtype=np.float32)
+        if values.ndim == 1 and values.size:
+            values = values.reshape(1, -1)
+        meta = getattr(batch, "metadata", None) or {}
+        png_paths = meta.get("png_paths") if hasattr(meta, "get") else None
+        kinds = meta.get("kind") if hasattr(meta, "get") else None
+        obbs = meta.get("oriented_bounding_box") if hasattr(meta, "get") else None
+
+        # Group row indices by file_id, preserving first-seen order.
+        rows_by_fid: "OrderedDict[str, list[int]]" = OrderedDict()
+        unmatched_rows = 0
+        for i, raw_id in enumerate(ids):
+            fid = _fid_for_row(raw_id)
+            if fid is None:
+                unmatched_rows += 1
+                continue
+            rows_by_fid.setdefault(fid, []).append(i)
+
+        if unmatched_rows:
+            logger.warning(
+                "%d embedded row(s) could not be matched to an input file "
+                "in index '%s'",
+                unmatched_rows,
+                index_name,
+            )
+
+        # Surface files that embed_shape_batch silently skipped (CAD load error,
+        # timeout, etc.): they never appear in batch.ids, so they are missing
+        # from rows_by_fid. Report each one instead of dropping it silently.
+        embed_errors = meta.get("errors") if hasattr(meta, "get") else None
+        if embed_errors:
+            try:
+                if isinstance(embed_errors, dict):
+                    _first = next(iter(embed_errors.items()))
+                else:
+                    _first = embed_errors[0]
+                print(
+                    f"[INDEX] metadata['errors'] type={type(embed_errors).__name__} "
+                    f"first={_first!r}",
+                    flush=True,
+                )
+            except Exception:
+                pass
+
+        submitted_fids = set(fid_by_norm_path.values())
+        for fid in file_ids:
+            if fid in submitted_fids and fid not in rows_by_fid:
+                detail = _embed_error_detail(
+                    embed_errors,
+                    fid,
+                    filename_by_fid.get(fid, ""),
+                    norm_by_fid.get(fid, ""),
+                )
+                errors.append({"file_id": fid, "detail": detail})
+
+        failed_count = meta.get("failed_count") if hasattr(meta, "get") else None
+        logger.info(
+            "index '%s' batch: input=%d rows=%d failed=%s",
+            index_name,
+            len(ordered_paths),
+            len(ids),
+            failed_count,
+        )
+
+        # Relocate PNG + SCS once per file (png_paths repeats per body row).
+        thumb_dir = _index_thumbnails_dir(index_name)
+        scs_dir = _index_scs_dir(index_name)
+        thumbnail_rel: dict[str, str] = {}
+        scs_rel: dict[str, str] = {}
+        for fid, row_idx in rows_by_fid.items():
+            src_png = None
+            if png_paths:
+                for i in row_idx:
+                    if i < len(png_paths) and png_paths[i]:
+                        p = pathlib.Path(png_paths[i])
+                        # embed_shape_batch returns paths relative to images_out_dir.
+                        if not p.is_absolute():
+                            p = tmp_images / p
+                        if p.exists():
+                            src_png = p
+                            break
+            if src_png is None:
+                continue
+            try:
+                thumb_dir.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(src_png), str(thumb_dir / f"{fid}.png"))
+                thumbnail_rel[fid] = f"thumbnails/{fid}.png"
+                # SCS sibling shares the stem minus the "_white" suffix.
+                stem = src_png.stem
+                base_stem = stem[: -len("_white")] if stem.endswith("_white") else stem
+                scs_src = src_png.parent / f"{base_stem}.scs"
+                if scs_src.exists():
+                    scs_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(scs_src), str(scs_dir / f"{fid}.scs"))
+                    scs_rel[fid] = f"scs/{fid}.scs"
+            except Exception as exc:  # non-fatal: search still works without assets
+                logger.warning("Failed to relocate thumbnail/scs for %s: %s", fid, exc)
+
+        # Build one record per body row.
+        registered_at = datetime.datetime.now(datetime.timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        obb_sample_logged = False
+        obb_dropped_logged = False
+        for fid, row_idx in rows_by_fid.items():
+            bodies = len(row_idx)
+            row_kind = None
+            if kinds and row_idx[0] < len(kinds):
+                row_kind = kinds[row_idx[0]]
+            kind = row_kind or ("assembly" if bodies >= 2 else "part")
+
+            base_meta: dict[str, Any] = {
+                "file_id": fid,
+                "filename": filename_by_fid.get(fid, ""),
+                "registered_at": registered_at,
+                "kind": kind,
+                "bodies": bodies,
+            }
+            if fid in thumbnail_rel:
+                base_meta["thumbnail"] = thumbnail_rel[fid]
+            if fid in scs_rel:
+                base_meta["scs"] = scs_rel[fid]
+
+            # oriented_bounding_box is file-level: hoops_ai returns it as a dict
+            # keyed by the input path (== batch.ids entry), or as a per-row list.
+            # It is the same for every body row of a file, so resolve it once.
+            raw_id = ids[row_idx[0]]
+            obb_val = None
+            if isinstance(obbs, dict):
+                obb_val = obbs.get(raw_id)
+            elif isinstance(obbs, (list, tuple)) and row_idx[0] < len(obbs):
+                obb_val = obbs[row_idx[0]]
+
+            if obb_val is not None:
+                # Print the first OBB's type + serialised size so the human
+                # reviewer can judge whether to keep storing it.
+                if not obb_sample_logged:
+                    try:
+                        _n = len(json.dumps(obb_val).encode("utf-8"))
+                    except (TypeError, ValueError):
+                        _n = -1
+                    print(
+                        f"[INDEX] obb sample: type={type(obb_val).__name__} "
+                        f"serialized_bytes={_n}",
+                        flush=True,
+                    )
+                    obb_sample_logged = True
+                obb_str = _obb_meta_value(obb_val)
+                if obb_str is not None:
+                    base_meta["obb"] = obb_str
+                elif not obb_dropped_logged:
+                    logger.warning(
+                        "obb dropped for index '%s' (not serialisable or > 512 bytes)",
+                        index_name,
+                    )
+                    obb_dropped_logged = True
+
+            for i in row_idx:
+                vec = _l2_normalize(values[i].astype(np.float32).flatten())
+                emb_obj = Embedding(values=vec, model=model_name, dim=int(vec.shape[0]))
+                records.append(
+                    VectorRecord(id=fid, embedding=emb_obj, metadata=dict(base_meta))
+                )
+    finally:
+        shutil.rmtree(tmp_images, ignore_errors=True)
+
+    return records, errors
+
+
 def add_to_index(
     name: str,
     file_ids: list[str],
     model: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Compute embeddings for *file_ids* and upsert them into the named index.
+    """Embed *file_ids* at body granularity and upsert one row per body.
 
-    Re-uses the ``compute_embedding()`` disk cache.  Re-inserting the same
-    file_id overwrites the existing entry (delete-then-upsert to avoid FAISS
-    duplicate entries).
+    Re-inserting an existing file_id overwrites all of its previous body rows
+    (delete-then-upsert). *model* overrides the embedder used for this batch;
+    when ``None`` the model recorded in the index's ``index.json`` is used.
 
-    *model* overrides the embedder used for this batch.  When ``None`` (default)
-    the model recorded in the index's ``model.json`` sidecar is used so that all
-    entries in an index always use the same model.
+    Raises ``SchemaVersionError`` for legacy (schema v1) indexes, which must be
+    rebuilt before body-level writes are allowed.
 
     Returns ``added``, ``updated``, ``index_count``, and per-file ``errors``.
+    ``added``/``updated`` count distinct files (not body rows).
     """
     _validate_index_name(name)
-    # Resolve model: explicit param > sidecar > default
-    effective_model = model if model is not None else _load_index_model(name)
+    schema = _load_index_schema(name)
+    effective_model = model if model is not None else schema["model"]
     if effective_model not in _EMBEDDER_MODELS:
         raise ValueError(
             f"Invalid model '{effective_model}'. Must be one of: {sorted(_EMBEDDER_MODELS)}."
@@ -352,38 +677,35 @@ def add_to_index(
     with lock:
         vs = _load_named_index(name)
 
-        from hoops_ai.ml.embeddings import Embedding, FaissVectorStore, VectorRecord
+        if schema["schema_version"] < _INDEX_SCHEMA_VERSION:
+            raise SchemaVersionError(
+                f"Index '{name}' uses legacy schema v{schema['schema_version']} "
+                f"and must be rebuilt as schema v{_INDEX_SCHEMA_VERSION} "
+                f"before adding parts."
+            )
+
+        records, errors = _embed_bodies_for_index(file_ids, name, effective_model)
 
         existing_ids: set[str] = set(vs.get_ids())
+        distinct_fids: list[str] = []
+        seen: set[str] = set()
+        for rec in records:
+            if rec.id not in seen:
+                seen.add(rec.id)
+                distinct_fids.append(rec.id)
+
         added = 0
         updated = 0
-        errors: list[dict[str, Any]] = []
+        for fid in distinct_fids:
+            if fid in existing_ids:
+                # delete first to prevent FAISS duplicate entries on re-insert
+                vs.delete([fid])
+                updated += 1
+            else:
+                added += 1
 
-        for fid in file_ids:
-            try:
-                emb_result = compute_embedding(fid, model=effective_model)
-                v = emb_result["vector"]
-                emb_obj = Embedding(values=v, model=emb_result["model_name"], dim=emb_result["dim"])
-                meta: dict[str, Any] = {
-                    "file_id": fid,
-                    "filename": emb_result["filename"],
-                    "registered_at": datetime.datetime.now(datetime.timezone.utc).strftime(
-                        "%Y-%m-%dT%H:%M:%SZ"
-                    ),
-                }
-                rec = VectorRecord(id=fid, embedding=emb_obj, metadata=meta)
-
-                if fid in existing_ids:
-                    # delete first to prevent FAISS duplicate entries on re-insert
-                    vs.delete([fid])
-                    updated += 1
-                else:
-                    added += 1
-                    existing_ids.add(fid)
-
-                vs.upsert([rec])
-            except Exception as exc:
-                errors.append({"file_id": fid, "detail": str(exc)})
+        if records:
+            vs.upsert(records)
 
         _save_named_index_atomic(name, vs)
         result = {
@@ -393,10 +715,6 @@ def add_to_index(
             "index_count": len(vs.get_ids()),
             "errors": errors,
         }
-
-    # Generate thumbnails outside the lock (non-fatal, can be slow)
-    for fid in [f for f in file_ids if f not in [e["file_id"] for e in errors]]:
-        _generate_part_thumbnail(fid, name)
 
     return result
 
@@ -462,19 +780,30 @@ def add_map_parts_to_index(map_id: str, index_name: str) -> dict[str, Any]:
 
 
 def remove_from_index(name: str, part_ids: list[str]) -> dict[str, Any]:
-    """Delete *part_ids* from the named index, persist, and remove their thumbnails."""
+    """Delete *part_ids* from the named index, persist, and remove their assets.
+
+    Raises ``SchemaVersionError`` for legacy (schema v1) indexes.
+    """
     _validate_index_name(name)
+    schema = _load_index_schema(name)
     lock = _get_index_lock(name)
     with lock:
         vs = _load_named_index(name)
+        if schema["schema_version"] < _INDEX_SCHEMA_VERSION:
+            raise SchemaVersionError(
+                f"Index '{name}' uses legacy schema v{schema['schema_version']} "
+                f"and must be rebuilt as schema v{_INDEX_SCHEMA_VERSION} "
+                f"before removing parts."
+            )
         vs.delete(part_ids)
         _save_named_index_atomic(name, vs)
 
-    # Remove thumbnails outside the lock (non-fatal)
+    # Remove thumbnails + stream caches outside the lock (non-fatal)
     thumb_dir = _index_thumbnails_dir(name)
+    scs_dir = _index_scs_dir(name)
     for pid in part_ids:
-        png = thumb_dir / f"{pid}.png"
-        png.unlink(missing_ok=True)
+        (thumb_dir / f"{pid}.png").unlink(missing_ok=True)
+        (scs_dir / f"{pid}.scs").unlink(missing_ok=True)
 
     return {"name": name, "removed": len(part_ids), "index_count": len(vs.get_ids())}
 
@@ -483,7 +812,11 @@ def search_index(name: str, file_id: str, top_k: int) -> dict[str, Any]:
     """Search the named index for the top-k most similar parts to *file_id*.
 
     The query embedding is computed using the same model that was selected when
-    the index was created (recorded in ``model.json``).
+    the index was created (recorded in ``index.json``).
+
+    Body-level indexes store multiple rows per file_id, so the raw query is
+    over-fetched and collapsed to one hit per file_id (best score) before being
+    truncated to *top_k*. The response schema is unchanged.
 
     Returns an empty hits list (and no image_url) when the index has no entries.
     Generates a result-grid PNG in out/ and returns its relative URL as ``image_url``.
@@ -492,17 +825,21 @@ def search_index(name: str, file_id: str, top_k: int) -> dict[str, Any]:
     index_model = _load_index_model(name)
     lock = _get_index_lock(name)
 
+    # Over-fetch so that, after per-file dedup, at least top_k distinct files remain.
+    over_k = max(top_k * 8, 50)
+
     # Phase 1: vector store operations (locked)
     with lock:
         vs = _load_named_index(name)
         if len(vs.get_ids()) == 0:
             return {"hits": [], "count": 0, "image_url": None}
         emb_result = compute_embedding(file_id, model=index_model)
-        raw_hits = vs.query(emb_result["vector"], top_k=top_k)
+        raw_hits = vs.query(emb_result["vector"], top_k=over_k)
 
+    deduped = _dedup_hits_by_file(raw_hits, top_k)
     hit_dicts = [
         {"id": h.id, "score": round(float(h.score), 6), "metadata": h.metadata}
-        for h in raw_hits
+        for h in deduped
     ]
 
     # Phase 2: thumbnail + grid generation (outside lock, non-fatal)
@@ -510,6 +847,120 @@ def search_index(name: str, file_id: str, top_k: int) -> dict[str, Any]:
     image_url = _build_search_grid_image(file_id, hit_dicts, name) if hit_dicts else None
 
     return {"hits": hit_dicts, "count": len(hit_dicts), "image_url": image_url}
+
+
+def get_index_stats(name: str) -> dict[str, Any]:
+    """Return body-level statistics for the named index.
+
+    Keys: ``name, files, bodies, assemblies, single_part, dim, model,
+    schema_version, last_modified``. Works for both schema versions (a legacy
+    index simply reports one body per file).
+
+    Raises ``KeyError`` when the index does not exist.
+    """
+    _validate_index_name(name)
+    schema = _load_index_schema(name)
+    lock = _get_index_lock(name)
+    with lock:
+        vs = _load_named_index(name)
+        stats = _compute_faiss_stats(vs)
+        dim = getattr(vs, "dim", None)
+
+    last_modified: Optional[str] = None
+    faiss_file = _index_faiss_path(name)
+    if faiss_file.exists():
+        last_modified = (
+            datetime.datetime.fromtimestamp(
+                faiss_file.stat().st_mtime, tz=datetime.timezone.utc
+            ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        )
+
+    return {
+        "name": name,
+        "files": stats["files"],
+        "bodies": stats["bodies"],
+        "assemblies": stats["assemblies"],
+        "single_part": stats["single_part"],
+        "dim": int(dim) if dim is not None else None,
+        "model": schema["model"],
+        "schema_version": schema["schema_version"],
+        "last_modified": last_modified,
+    }
+
+
+def list_index_parts(
+    name: str,
+    offset: int = 0,
+    limit: int = 100,
+    kind: Optional[str] = None,
+) -> dict[str, Any]:
+    """Return a paginated, file-level listing of the named index.
+
+    ``iter_metadata()`` is walked exactly once and collapsed to one item per
+    file_id. *limit* is clamped to ``[1, 2000]`` (default 100) and *offset* to
+    ``>= 0``. *kind* (``"part"``/``"assembly"``) filters when supplied.
+
+    Each item: ``id, filename, kind, bodies, registered_at, has_thumbnail,
+    has_scs`` (the router turns the boolean flags into absolute URLs).
+
+    Raises ``KeyError`` when the index does not exist.
+    """
+    _validate_index_name(name)
+    limit = max(1, min(int(limit), 2000))
+    offset = max(0, int(offset))
+
+    lock = _get_index_lock(name)
+    with lock:
+        vs = _load_named_index(name)
+        order: list[str] = []
+        by_fid: dict[str, dict[str, Any]] = {}
+        for raw in vs.iter_metadata():
+            md = raw if isinstance(raw, dict) else (getattr(raw, "metadata", None) or {})
+            fid = md.get("file_id")
+            if fid is None:
+                continue
+            if fid not in by_fid:
+                order.append(fid)
+                by_fid[fid] = {
+                    "id": fid,
+                    "filename": md.get("filename"),
+                    "kind": md.get("kind") or "part",
+                    "bodies": int(md.get("bodies") or 1),
+                    "registered_at": md.get("registered_at"),
+                    "thumbnail": md.get("thumbnail"),
+                    "scs": md.get("scs"),
+                }
+
+    items = [by_fid[f] for f in order]
+    if kind:
+        items = [it for it in items if it["kind"] == kind]
+    total = len(items)
+    page = items[offset : offset + limit]
+
+    # Resolve asset existence (path-traversal safe) and drop the raw rel paths.
+    result_items: list[dict[str, Any]] = []
+    for it in page:
+        has_thumbnail = (
+            it.get("thumbnail") is not None
+            and _resolve_index_asset(name, it["id"], "thumbnail") is not None
+        )
+        has_scs = (
+            it.get("scs") is not None
+            and _resolve_index_asset(name, it["id"], "scs") is not None
+        )
+        result_items.append(
+            {
+                "id": it["id"],
+                "filename": it["filename"],
+                "kind": it["kind"],
+                "bodies": it["bodies"],
+                "registered_at": it["registered_at"],
+                "has_thumbnail": has_thumbnail,
+                "has_scs": has_scs,
+            }
+        )
+
+    return {"total": total, "offset": offset, "limit": limit, "items": result_items}
 
 
 def delete_index(name: str) -> dict[str, Any]:
@@ -539,36 +990,148 @@ def _index_thumbnails_dir(name: str) -> pathlib.Path:
 
 
 def _index_model_sidecar_path(name: str) -> pathlib.Path:
-    """Return the per-index model sidecar JSON path (indexes/{name}/model.json)."""
+    """Return the legacy per-index model sidecar JSON path (indexes/{name}/model.json).
+
+    Only read for backward compatibility with schema-v1 indexes. New indexes
+    record their model + schema_version in ``index.json`` (see _index_json_path).
+    """
     return INDEXES_DIR / name / "model.json"
 
 
-def _load_index_model(name: str) -> str:
-    """Return the model key ('default' or 'signal') recorded for the named index.
+def _index_json_path(name: str) -> pathlib.Path:
+    """Return the per-index metadata JSON path (indexes/{name}/index.json)."""
+    return INDEXES_DIR / name / "index.json"
 
-    Falls back to 'default' for indexes created before model selection was added.
+
+def _index_scs_dir(name: str) -> pathlib.Path:
+    """Return the per-index SCS stream-cache directory path."""
+    return INDEXES_DIR / name / "scs"
+
+
+def _load_index_schema(name: str) -> dict[str, Any]:
+    """Return ``{"model": <key>, "schema_version": <int>}`` for the named index.
+
+    Fallback order:
+      1. ``index.json`` present  -> use it (body-level, schema 2 by default)
+      2. only ``model.json``     -> ``{"model": <that>, "schema_version": 1}``
+      3. neither present         -> ``{"model": "legacy", "schema_version": 1}``
     """
     import json
 
-    path = _index_model_sidecar_path(name)
-    if not path.exists():
-        return _EMBEDDER_MODEL_LEGACY
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        return data.get("model", _EMBEDDER_MODEL_LEGACY)
-    except Exception:
-        return _EMBEDDER_MODEL_LEGACY
+    json_path = _index_json_path(name)
+    if json_path.exists():
+        try:
+            with open(json_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            return {
+                "model": data.get("model", _EMBEDDER_MODEL_LEGACY),
+                "schema_version": int(data.get("schema_version", _INDEX_SCHEMA_VERSION)),
+            }
+        except Exception:
+            # Corrupt index.json: treat as body-level but unknown model.
+            return {"model": _EMBEDDER_MODEL_LEGACY, "schema_version": _INDEX_SCHEMA_VERSION}
+
+    model_path = _index_model_sidecar_path(name)
+    if model_path.exists():
+        try:
+            with open(model_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            return {"model": data.get("model", _EMBEDDER_MODEL_LEGACY), "schema_version": 1}
+        except Exception:
+            return {"model": _EMBEDDER_MODEL_LEGACY, "schema_version": 1}
+
+    return {"model": _EMBEDDER_MODEL_LEGACY, "schema_version": 1}
 
 
-def _save_index_model(name: str, model: str) -> None:
-    """Persist the model key for the named index."""
+def _save_index_schema(name: str, model: str, schema_version: int = _INDEX_SCHEMA_VERSION) -> None:
+    """Persist ``index.json`` for the named index."""
     import json
 
-    path = _index_model_sidecar_path(name)
+    path = _index_json_path(name)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
-        json.dump({"model": model}, fh)
+        json.dump({"model": model, "schema_version": schema_version}, fh)
+
+
+def _load_index_model(name: str) -> str:
+    """Return the embedding model key recorded for the named index."""
+    return _load_index_schema(name)["model"]
+
+
+def _obb_meta_value(value: Any) -> Optional[str]:
+    """Return a JSON string for *value* suitable for storing in record metadata.
+
+    Returns ``None`` (drop the key) when the value is not JSON-serialisable or
+    when the serialised form exceeds 512 bytes, keeping index.meta compact.
+    """
+    import json
+
+    try:
+        serialized = json.dumps(value)
+    except (TypeError, ValueError):
+        return None
+    if len(serialized.encode("utf-8")) > 512:
+        return None
+    return serialized
+
+
+def _dedup_hits_by_file(hits: list, top_k: int) -> list:
+    """Collapse body-level hits to one entry per file_id, keeping the best score.
+
+    *hits* is an iterable of objects exposing ``.id`` and ``.score``. The best
+    (highest) score per id is kept; the result is sorted by score descending and
+    truncated to *top_k* entries.
+    """
+    best: dict[str, Any] = {}
+    for h in hits:
+        hid = getattr(h, "id", None)
+        if hid is None:
+            continue
+        score = float(getattr(h, "score", 0.0))
+        if hid not in best or score > float(getattr(best[hid], "score", 0.0)):
+            best[hid] = h
+    ranked = sorted(best.values(), key=lambda h: float(getattr(h, "score", 0.0)), reverse=True)
+    return ranked[: max(0, int(top_k))]
+
+
+def _resolve_index_asset(name: str, part_id: str, asset: str) -> Optional[pathlib.Path]:
+    """Resolve a per-part thumbnail/scs file, guarding against path traversal.
+
+    *asset* is ``"thumbnail"`` (thumbnails/<id>.png) or ``"scs"`` (scs/<id>.scs).
+    Returns the file Path only when it exists AND resolves inside indexes/<name>/;
+    otherwise returns ``None``.
+    """
+    _validate_index_name(name)
+    index_dir = (INDEXES_DIR / name).resolve()
+    if asset == "thumbnail":
+        candidate = (INDEXES_DIR / name / "thumbnails" / f"{part_id}.png").resolve()
+    elif asset == "scs":
+        candidate = (INDEXES_DIR / name / "scs" / f"{part_id}.scs").resolve()
+    else:
+        return None
+    try:
+        candidate.relative_to(index_dir)
+    except ValueError:
+        return None
+    return candidate if candidate.is_file() else None
+
+
+def _compute_faiss_stats(vs: Any) -> dict[str, int]:
+    """Derive file/body/assembly/single-part counts from a FaissVectorStore.
+
+    Reads the underlying IndexIDMap directly (verified against hoops_ai 1.1.0).
+    """
+    import faiss
+    from collections import Counter
+
+    index = vs._index
+    idm = faiss.vector_to_array(index.id_map)
+    bodies = int(index.ntotal)
+    counts = Counter(int(x) for x in idm.tolist())
+    files = len(vs._id_to_int)
+    assemblies = sum(1 for v in counts.values() if v >= 2)
+    single = sum(1 for v in counts.values() if v == 1)
+    return {"files": files, "bodies": bodies, "assemblies": assemblies, "single_part": single}
 
 
 def _generate_part_thumbnail(file_id: str, index_name: str) -> Optional[pathlib.Path]:
@@ -805,6 +1368,14 @@ class ZipSizeLimitError(RuntimeError):
 
 class ZipFileLimitError(RuntimeError):
     """Raised when a ZIP archive contains more files than the configured limit."""
+
+
+class SchemaVersionError(RuntimeError):
+    """Raised when a write is attempted against a legacy (schema v1) index.
+
+    Mapped to HTTP 409 by the router. Legacy indexes store one averaged vector
+    per file and must be rebuilt before body-level writes are allowed.
+    """
 
 
 def get_required_env(name: str) -> str:
