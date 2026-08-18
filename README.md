@@ -1344,12 +1344,18 @@ ranking explainable:
 
 **Cost.**  The first request against an index builds an `AssemblyMatcher`,
 which runs a FAISS k-means over *every* body vector in the corpus to derive the
-rarity weights.  The instance is cached by (index path, mtime) — a single entry,
-because it holds a normalised copy of the whole corpus — and is rebuilt
-automatically after any write to the index.  The build time is logged as
-`[ASSEMBLY] built matcher for index '<name>' in <n>s`.  Stage-2 scoring runs on
-a thread pool sized by `HOOPS_AI_ASSEMBLY_SEARCH_JOBS` (default `8`); lower it
-if assembly searches starve the server's request workers.
+rarity weights.  Measured at **19.3 s** for 42,098 bodies clustered into 4,096
+centroids (`k = min(max(64, N/8), 4096)`); the build time is logged as
+`[ASSEMBLY] built matcher for index '<name>' in <n>s`.  The instance is cached
+by (index path, mtime) — a single entry, because it holds a normalised copy of
+the whole corpus — and is rebuilt automatically after any write to the index.
+
+That cost is paid by whichever request arrives first after a restart or an
+index write, so **the first assembly search on a large index takes ~20 s while
+later ones take well under a second**.  Warm it deliberately after indexing if
+that latency is user-visible.  Stage-2 scoring runs on a thread pool sized by
+`HOOPS_AI_ASSEMBLY_SEARCH_JOBS` (default `8`); lower it if assembly searches
+starve the server's request workers.
 
 **Registered queries skip re-embedding.**  A query that is already in the index
 is handed to the matcher by its record id (the `file_id`) rather than by path,
