@@ -1,7 +1,23 @@
+import pathlib
+
 import core
-from fastapi import APIRouter, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Body, File, HTTPException, Query, UploadFile
+from pydantic import BaseModel, Field
 
 router = APIRouter(prefix="/files", tags=["File Management"])
+
+
+class FileExistsRequest(BaseModel):
+    file_ids: list[str] = Field(
+        default_factory=list,
+        description="Client-computed SHA-256 hex digests to check against the CAD store.",
+    )
+
+
+class FileExistsResponse(BaseModel):
+    known: list[str] = []
+    unknown: list[str] = []
+    invalid: list[str] = []
 
 
 @router.post("/upload")
@@ -12,6 +28,8 @@ def upload_file(file: UploadFile = File(...)):
     Uploading the same file again returns the same ``file_id`` without re-storing
     the file (``already_existed`` will be ``true``).
     Pass the ``file_id`` to any processing endpoint instead of re-uploading the file.
+
+    To send many files in one request, use ``POST /files/upload-batch``.
     """
     try:
         file_id, path, existed = core.upload_CAD_file_persistent(file)
@@ -20,8 +38,59 @@ def upload_file(file: UploadFile = File(...)):
             "filename": path.name,
             "already_existed": existed,
         }
+    except core.UploadSizeLimitError as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/upload-batch")
+def upload_files(files: list[UploadFile] = File(...)):
+    """Upload several CAD files in one request.
+
+    A separate endpoint rather than an extra parameter on ``POST /files/upload``:
+    that endpoint returns a single object and is already consumed by
+    HOOPS_AI-MCPServer, so its response shape must not change.
+
+    One failing file does not abort the request. Every input is reported in
+    either ``files`` or ``errors``, so ``len(files) + len(errors)`` always equals
+    the number of parts sent.
+    """
+    uploaded: list[dict] = []
+    errors: list[dict] = []
+    for item in files:
+        display_name = pathlib.PurePath(item.filename or "").name or "<unnamed>"
+        try:
+            file_id, path, existed = core.upload_CAD_file_persistent(item)
+            uploaded.append(
+                {
+                    "file_id": file_id,
+                    "filename": path.name,
+                    "already_existed": existed,
+                }
+            )
+        except Exception as exc:
+            errors.append({"filename": display_name, "detail": str(exc)})
+    return {"files": uploaded, "errors": errors, "count": len(uploaded)}
+
+
+@router.post("/exists", response_model=FileExistsResponse)
+def check_files_exist(payload: FileExistsRequest = Body(...)):
+    """Report which of the given file_ids the server already holds.
+
+    Lets a bulk-registration client hash its folder locally and upload only what
+    is missing, instead of re-sending hundreds of megabytes on every run.
+    Duplicate ids are collapsed; malformed ones come back under ``invalid``
+    rather than ``unknown``, so a client that hashes incorrectly gets a distinct
+    signal instead of silently re-uploading everything each time.
+    """
+    limit = core.exists_max_ids()
+    if len(payload.file_ids) > limit:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Too many file_ids: {len(payload.file_ids)} (limit {limit}).",
+        )
+    return core.check_persistent_CAD_files(payload.file_ids)
 
 
 @router.post("/upload-from-path")
@@ -51,11 +120,11 @@ def upload_from_path(
     * **ZIP archive** – extracted, every recognised CAD file is uploaded, and all
       resulting ``file_id`` values are returned together.
 
-    Supported CAD extensions: ``.step``, ``.stp``, ``.iges``, ``.igs``,
-    ``.x_t``, ``.x_b``, ``.sat``, ``.ipt``, ``.prt``, ``.sldprt``,
-    ``.catpart``.
+    Supported CAD extensions: see ``core.CAD_ALLOWED_EXTENSIONS`` (mirrors the
+    HOOPS Exchange "All Supported Files" list).
 
-    ZIP limits: 500 MB total uncompressed size, 50 CAD files per archive.
+    ZIP limits default to 500 MB uncompressed and 50 CAD files per archive, and
+    can be raised with HOOPS_AI_ZIP_MAX_TOTAL_BYTES / HOOPS_AI_ZIP_MAX_FILES.
     """
     try:
         resolved_path = core.get_shared_CAD_file(file_path)
@@ -88,6 +157,8 @@ def upload_from_path(
         try:
             fake = core._BytesUploadFile(resolved_path.read_bytes(), resolved_path.name)
             file_id, dest, existed = core.upload_CAD_file_persistent(fake)
+        except core.UploadSizeLimitError as exc:
+            raise HTTPException(status_code=413, detail=str(exc)) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 

@@ -111,6 +111,10 @@ cp .env.example .env
 | `HOOPS_AI_ENABLE_DEMO_FEATURES` | optional | Set to `true` to expose the demo-only endpoints listed below. Defaults to `false` (disabled) so a public deployment never serves them by accident. |
 | `HOOPS_AI_ASSEMBLY_SEARCH_JOBS` | optional | Thread-pool size for assembly-to-assembly scoring (`POST /similarity/index/{name}/search-assembly`). Defaults to `8`, matching `hoops_ai_native_bridge`. Lower it when assembly searches starve the server's request workers. |
 | `HOOPS_AI_LOG_LEVEL` | optional | Root log level applied at startup (`DEBUG`, `INFO`, `WARNING`, ...). Defaults to `INFO`; an unrecognised value falls back to `INFO`. uvicorn configures only its own loggers, so without this the application's `logger.info()` diagnostics — such as the assembly matcher build time — are dropped. |
+| `HOOPS_AI_MAX_UPLOAD_BYTES` | optional | Per-file upload cap in bytes (default `4294967296`, i.e. 4 GB). Exceeding it returns **413**. |
+| `HOOPS_AI_EXISTS_MAX_IDS` | optional | Maximum ids per `POST /files/exists` request (default `1000`). Exceeding it returns **422**. |
+| `HOOPS_AI_ZIP_MAX_TOTAL_BYTES` | optional | Uncompressed-size cap for a ZIP archive (default `524288000`, i.e. 500 MB). |
+| `HOOPS_AI_ZIP_MAX_FILES` | optional | CAD-file-count cap for a ZIP archive (default `50`). |
 
 > **Note:** `HOOPS_AI_LICENSE` is read **only** from the `.env` file, not from system environment variables.
 
@@ -228,6 +232,65 @@ curl -X POST "http://127.0.0.1:8000/files/upload" -F "file=@/path/to/model.stp"
 
 Pass the returned `file_id` to any processing endpoint instead of re-uploading the same file.
 
+The body is streamed to disk and hashed in one pass, so large assemblies never
+have to fit in memory. A single file is capped by `HOOPS_AI_MAX_UPLOAD_BYTES`
+(default 4 GB); exceeding it returns **413**.
+
+---
+
+#### Upload several CAD files at once
+
+Send many files in one request. Use this with `POST /files/exists` to register a
+whole folder: hash locally, ask which ids the server already has, and upload only
+the missing ones.
+
+```
+POST /files/upload-batch
+```
+
+**Windows (PowerShell):**
+```powershell
+curl.exe -X POST "http://127.0.0.1:8000/files/upload-batch" `
+  -F "files=@C:\path\to\a.stp" -F "files=@C:\path\to\b.stp"
+```
+
+**Response:**
+
+```json
+{
+  "files": [ { "file_id": "a3f8c2...", "filename": "a.stp", "already_existed": false } ],
+  "errors": [ { "filename": "b.stp", "detail": "..." } ],
+  "count": 1
+}
+```
+
+One bad file does not abort the request: every part sent appears in either
+`files` or `errors`, so the two lists always add up to the number of parts.
+`POST /files/upload` keeps its single-object response and is unchanged.
+
+---
+
+#### Check which files the server already has
+
+```
+POST /files/exists
+```
+
+**Request / response:**
+
+```json
+{ "file_ids": ["a3f8c2...", "ffffff..."] }
+```
+```json
+{ "known": ["a3f8c2..."], "unknown": ["ffffff..."], "invalid": [] }
+```
+
+Ids must be lower-case 64-character SHA-256 hex digests; anything else comes
+back under `invalid` rather than `unknown`, so a client that hashes incorrectly
+gets a distinct signal instead of silently re-uploading everything on every run.
+Duplicates are collapsed. At most `HOOPS_AI_EXISTS_MAX_IDS` (default 1000) ids
+per request; more returns **422**.
+
 ---
 
 #### Upload CAD file or ZIP from server-side path
@@ -279,6 +342,7 @@ Pass the returned `file_id` values to `POST /similarity/compare`, `POST /similar
 `POST /similarity/index/add`, etc.
 
 ZIP limits: 500 MB total uncompressed size, 50 CAD files per archive (HTTP 413 if exceeded).
+Both are raised with `HOOPS_AI_ZIP_MAX_TOTAL_BYTES` / `HOOPS_AI_ZIP_MAX_FILES`.
 
 > **Note:** Requires the WebAPI server to be able to access the given path.
 > For the typical local setup (MCP and WebAPI on the same machine) this works out of the box.
@@ -761,9 +825,11 @@ curl -X POST "http://127.0.0.1:8000/similarity/compare" -F "zip_file=@/path/to/p
 | `pairs` | All i < j pairs sorted by similarity score descending |
 | `errors` | Per-file failures that were skipped (empty on full success) |
 
-ZIP archives are filtered to recognised CAD extensions (`.step .stp .iges .igs .x_t .x_b .sat .ipt .prt .sldprt .catpart`).
+ZIP archives are filtered to recognised CAD extensions (66 formats, mirroring the
+HOOPS Exchange "All Supported Files" list used by `hoops_ai_qt_sandbox`).
 Paths that escape the extraction directory (Zip Slip) are rejected with HTTP 400.
-Uncompressed size is capped at 500 MB and file count at 50 (HTTP 413 if exceeded).
+Uncompressed size is capped at 500 MB and file count at 50 (HTTP 413 if exceeded);
+raise them with `HOOPS_AI_ZIP_MAX_TOTAL_BYTES` / `HOOPS_AI_ZIP_MAX_FILES`.
 
 ---
 
