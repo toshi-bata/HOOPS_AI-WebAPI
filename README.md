@@ -109,6 +109,7 @@ cp .env.example .env
 | `HOOPS_AI_PART_CLASS_FLOW_NAME` | optional | Part Classification flow name (required for `/part-classification/dataset/*` endpoints). The server automatically prefers `<HOOPS_AI_SDK_DIR>/notebooks/out/flows/<name>` (notebook output, includes thumbnails) and falls back to `<HOOPS_AI_SDK_DIR>/packages/flows/<name>` (pre-packaged). |
 | `HOOPS_AI_PART_CLASS_LABEL_KEY` | optional | Label array key for dataset queries (default: `part_label`; use `task_A` for custom ETL) |
 | `HOOPS_AI_ENABLE_DEMO_FEATURES` | optional | Set to `true` to expose the demo-only endpoints listed below. Defaults to `false` (disabled) so a public deployment never serves them by accident. |
+| `HOOPS_AI_LOG_LEVEL` | optional | Root log level applied at startup (`DEBUG`, `INFO`, `WARNING`, ...). Defaults to `INFO`; an unrecognised value falls back to `INFO`. uvicorn configures only its own loggers, so without this the application's own `logger.info()` diagnostics are dropped. |
 
 > **Note:** `HOOPS_AI_LICENSE` is read **only** from the `.env` file, not from system environment variables.
 
