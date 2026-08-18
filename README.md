@@ -109,6 +109,7 @@ cp .env.example .env
 | `HOOPS_AI_PART_CLASS_FLOW_NAME` | optional | Part Classification flow name (required for `/part-classification/dataset/*` endpoints). The server automatically prefers `<HOOPS_AI_SDK_DIR>/notebooks/out/flows/<name>` (notebook output, includes thumbnails) and falls back to `<HOOPS_AI_SDK_DIR>/packages/flows/<name>` (pre-packaged). |
 | `HOOPS_AI_PART_CLASS_LABEL_KEY` | optional | Label array key for dataset queries (default: `part_label`; use `task_A` for custom ETL) |
 | `HOOPS_AI_ENABLE_DEMO_FEATURES` | optional | Set to `true` to expose the demo-only endpoints listed below. Defaults to `false` (disabled) so a public deployment never serves them by accident. |
+| `HOOPS_AI_ASSEMBLY_SEARCH_JOBS` | optional | Thread-pool size for assembly-to-assembly scoring (`POST /similarity/index/{name}/search-assembly`). Defaults to `8`, matching `hoops_ai_native_bridge`. Lower it when assembly searches starve the server's request workers. |
 
 > **Note:** `HOOPS_AI_LICENSE` is read **only** from the `.env` file, not from system environment variables.
 
@@ -132,8 +133,10 @@ unless `HOOPS_AI_ENABLE_DEMO_FEATURES=true`:
 
 All other endpoints (upload, viewer, B-Rep analysis, MFR/Part-Classification inference,
 `compare`/`embed`/`search` similarity, searching an *existing* named index via
-`POST /similarity/index/{name}/search`, and the read-only named-index reporting/asset
-endpoints `GET /similarity/index/{name}/stats`, `GET /similarity/index/{name}/parts`,
+`POST /similarity/index/{name}/search` and
+`POST /similarity/index/{name}/search-assembly`, and the read-only named-index
+reporting/asset endpoints `GET /similarity/index/{name}/stats`,
+`GET /similarity/index/{name}/parts`,
 `GET /similarity/index/{name}/parts/{part_id}/thumbnail`, `.../scs`) remain available
 regardless of this flag.
 
@@ -1081,7 +1084,8 @@ automatically at search and add time.
 **Body-level indexing (schema v2).**  New indexes store **one FAISS row per body**
 (not one averaged vector per file).  This unlocks per-index statistics (files / bodies /
 assemblies / single-part), `part` vs `assembly` classification, and per-body matching for
-future assembly-to-assembly search.  Registering a file also produces a thumbnail
+assembly-to-assembly search (`POST /index/{name}/search-assembly`).  Registering a file
+also produces a thumbnail
 (`thumbnails/<file_id>.png`) and a stream cache (`scs/<file_id>.scs`) from the same CAD
 load.  Search runs through `CADSearch.search_by_shape()`, which embeds the query at body
 granularity and applies the geometric reranker; the per-body ranked lists are then
@@ -1286,6 +1290,120 @@ curl -X POST "http://127.0.0.1:8000/similarity/index/my-parts/search?top_k=5" -F
   "count": 1
 }
 ```
+
+---
+
+##### Assembly-to-assembly search
+
+```
+POST /similarity/index/{name}/search-assembly?top_k=<n>&coverage_mode=<symmetric|containment|jaccard>
+```
+
+Finds **assemblies similar to a query assembly**, as opposed to
+`/index/{name}/search`, which ranks individual parts.  Query bodies are paired
+one-to-one with candidate bodies by Hungarian assignment over the per-body
+embeddings, and the geometric result is blended with a bag-of-parts composition
+score.  Requires a **schema v2** (body-level) index.
+
+The algorithm is the tutorials' `AssemblyMatcher`, vendored verbatim into
+`vendor/assembly_matcher.py` (see *Vendored assembly matcher* below).  The fixed
+arguments (`method="hungarian"`, `candidate_mode="search"`,
+`assemblies_only=True`, `reuse_index_vectors=True`) and every default match
+`hoops_ai_native_bridge`, so both projects rank the same corpus identically.
+
+Supply **either** a file upload or a `file_id`.  Returns an empty `hits` list
+when the index contains zero entries.
+
+| Query param | Default | Description |
+|---|---|---|
+| `top_k` | `10` | Maximum number of hits. |
+| `candidate_k` | `30` | Per-body shortlist size used to gather candidates (1–1000). Higher = better recall, slower. |
+| `sim_thresh` | `0.80` | Minimum body-to-body cosine similarity for a pair to count as matched (0.0–1.0). |
+| `bop_weight` | `0.30` | Blend weight of the bag-of-parts composition score against the geometric score (0.0–1.0). `0` = geometry only. |
+| `coverage_mode` | `symmetric` | Coverage denominator: `symmetric` (larger side), `containment` (query side — "which assemblies contain this one?"), `jaccard` (union). |
+| `use_idf` | `true` | Weight parts by cluster rarity so common fasteners contribute less. |
+| `include_self` | `false` | Keep the query itself, pinned first with score `1.0`. Dropped by default. Never exceeds `top_k`. |
+| `include_image` | `true` | When `false`, skip the result-grid PNG and return `image_url: null`. Hits are unaffected. |
+
+Out-of-range values return **422**.
+
+Each hit reports the diagnostics behind its score, which is what makes the
+ranking explainable:
+
+| Field | Meaning |
+|---|---|
+| `score` | Final blended score (geometry + composition). |
+| `geom_score` | Match quality × rarity-aware coverage. |
+| `coverage` | Matched mass over the `coverage_mode` denominator. |
+| `matched_parts` | Number of matched body pairs. |
+| `candidate_parts` | Bodies in the candidate assembly. |
+| `query_parts` | Bodies in the query assembly. |
+
+**Cost.**  The first request against an index builds an `AssemblyMatcher`,
+which runs a FAISS k-means over *every* body vector in the corpus to derive the
+rarity weights.  The instance is cached by (index path, mtime) — a single entry,
+because it holds a normalised copy of the whole corpus — and is rebuilt
+automatically after any write to the index.  The build time is logged as
+`[ASSEMBLY] built matcher for index '<name>' in <n>s`.  Stage-2 scoring runs on
+a thread pool sized by `HOOPS_AI_ASSEMBLY_SEARCH_JOBS` (default `8`); lower it
+if assembly searches starve the server's request workers.
+
+**Windows (PowerShell):**
+```powershell
+curl.exe -X POST "http://127.0.0.1:8000/similarity/index/my-parts/search-assembly?top_k=5" -F "file=@C:\path\to\assembly.step"
+
+# "Which assemblies contain this sub-assembly?"
+curl.exe -X POST "http://127.0.0.1:8000/similarity/index/my-parts/search-assembly?top_k=5&coverage_mode=containment" -F "file=@C:\path\to\assembly.step"
+
+# Geometry only, no preview image
+curl.exe -X POST "http://127.0.0.1:8000/similarity/index/my-parts/search-assembly?top_k=20&bop_weight=0&include_image=false" -F "file=@C:\path\to\assembly.step"
+```
+
+**Linux:**
+```bash
+curl -X POST "http://127.0.0.1:8000/similarity/index/my-parts/search-assembly?top_k=5" -F "file=@/path/to/assembly.step"
+```
+
+**Response:**
+```json
+{
+  "hits": [
+    {
+      "id": "<file_id>",
+      "score": 0.8123,
+      "geom_score": 0.8642,
+      "coverage": 0.75,
+      "matched_parts": 7,
+      "candidate_parts": 9,
+      "query_parts": 8,
+      "metadata": { "filename": "gearbox_v2.step", "kind": "assembly", "bodies": 9 }
+    }
+  ],
+  "count": 1,
+  "image_url": "http://127.0.0.1:8000/out/2f1c....png"
+}
+```
+
+###### Vendored assembly matcher
+
+`vendor/assembly_matcher.py` is a **verbatim copy** of
+`HOOPS-AI-tutorials/embeddings_pipeline/assembly_matcher.py` — the same source
+`hoops_ai_native_bridge` embeds in `assembly_matcher_py.h`.  Keeping a copy
+(rather than a re-implementation) guarantees both projects run identical
+scoring.  It carries a generated header with the source path, sync timestamp and
+source SHA-256, and **must not be hand-edited**: fix the tutorial copy and
+re-sync.
+
+```bash
+python tools/sync_assembly_matcher.py                 # copy + refresh the header
+python tools/sync_assembly_matcher.py --check         # verify only; exit 1 on drift
+python tools/sync_assembly_matcher.py --source <path> # non-default source location
+```
+
+The default source is `../HOOPS-AI-tutorials/embeddings_pipeline/assembly_matcher.py`,
+i.e. the tutorials repository cloned next to this one.  The matcher needs
+**scipy** (`scipy.optimize.linear_sum_assignment`), which is listed in
+`requirements.txt`.
 
 ---
 

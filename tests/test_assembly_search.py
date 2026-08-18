@@ -1,0 +1,598 @@
+"""SDK-free unit tests for assembly-to-assembly search.
+
+Covers ``core.search_assembly_index()`` and the
+``POST /similarity/index/{name}/search-assembly`` endpoint:
+
+  * the fixed AssemblyMatcher arguments that keep us aligned with
+    hoops_ai_native_bridge (hungarian / search / assemblies_only / reuse)
+  * self-hit removal and include_self promotion (same trap as PR #5)
+  * the matcher's key names mapped onto the response fields
+  * matcher caching (mtime invalidation, single-entry cap)
+  * parameter validation and the include_image display-only switch
+
+AssemblyMatcher, CADSearch and the vector store are faked; no HOOPS AI license
+is required.
+"""
+
+import os
+import pathlib
+import sys
+import tempfile
+import types
+import unittest
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+import core
+
+
+def _result(assembly, score, geom=0.0, coverage=0.0, matched=0, n_parts=0, m=0):
+    """One AssemblyMatcher.search() result row (keys observed in the tutorial)."""
+    return {
+        "assembly": assembly,
+        "score": score,
+        "geom_score": geom,
+        "bop_sim": 0.0,
+        "coverage": coverage,
+        "matched": matched,
+        "M": m,
+        "N": n_parts,
+        "n_parts": n_parts,
+        "display_metadata": None,
+    }
+
+
+class _FakeMatcher:
+    """Records the kwargs search() was called with and returns canned rows."""
+
+    def __init__(self, results):
+        self._results = results
+        self.calls = []
+
+    def search(self, **kwargs):
+        self.calls.append(kwargs)
+        return self._results
+
+
+class _AssemblySearchBase(unittest.TestCase):
+    QUERY_ID = "q" * 64
+    A = "a" * 64
+    B = "b" * 64
+    C = "c" * 64
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig_idx_dir = core.INDEXES_DIR
+        core.INDEXES_DIR = pathlib.Path(self._tmp.name)
+
+        self.results = [
+            _result(self.A, 0.91, geom=0.88, coverage=0.75, matched=7, n_parts=9, m=8),
+            _result(self.B, 0.62, geom=0.60, coverage=0.50, matched=4, n_parts=6, m=8),
+            _result(self.C, 0.31, geom=0.30, coverage=0.20, matched=2, n_parts=3, m=8),
+        ]
+        self.matcher = _FakeMatcher(self.results)
+
+        self.registered = {self.A, self.B, self.C}
+        self.metas = [
+            {"file_id": self.A, "filename": "a.stp", "kind": "assembly", "bodies": 9,
+             "_query_body_rep_count": 1},
+            {"file_id": self.B, "filename": "b.stp", "kind": "assembly", "bodies": 6},
+            {"file_id": self.C, "filename": "c.stp", "kind": "assembly", "bodies": 3},
+        ]
+
+        vs = MagicMock()
+        vs.get_ids.side_effect = lambda: list(self.registered)
+        vs.iter_metadata.side_effect = lambda: iter(self.metas)
+
+        self._saved = {
+            "_load_named_index": core._load_named_index,
+            "_get_assembly_matcher": core._get_assembly_matcher,
+            "_load_index_model": core._load_index_model,
+            "find_persistent_CAD_file": core.find_persistent_CAD_file,
+            "_generate_part_thumbnail": core._generate_part_thumbnail,
+            "_build_search_grid_image": core._build_search_grid_image,
+            "_resolve_index_asset": core._resolve_index_asset,
+        }
+        core._load_named_index = lambda name: vs
+        core._get_assembly_matcher = lambda name, model: self.matcher
+        core._load_index_model = lambda name: "signal"
+        core.find_persistent_CAD_file = lambda fid: pathlib.Path(self._tmp.name) / f"{fid}.stp"
+        self.thumbnail_calls = []
+        self.grid_calls = []
+        core._generate_part_thumbnail = lambda fid, name: self.thumbnail_calls.append(fid)
+
+        def _grid(fid, hits, name):
+            self.grid_calls.append((fid, list(hits), name))
+            return "/out/fake.png"
+
+        core._build_search_grid_image = _grid
+        core._resolve_index_asset = lambda name, pid, asset: None
+
+    def tearDown(self):
+        for attr, val in self._saved.items():
+            setattr(core, attr, val)
+        core.INDEXES_DIR = self._orig_idx_dir
+        self._tmp.cleanup()
+
+
+class TestBridgeArguments(_AssemblySearchBase):
+    """The fixed arguments must stay identical to hoops_ai_native_bridge."""
+
+    def test_fixed_arguments_match_bridge(self):
+        core.search_assembly_index("idx", self.QUERY_ID, 5)
+        kwargs = self.matcher.calls[0]
+        self.assertEqual(kwargs["method"], "hungarian")
+        self.assertEqual(kwargs["candidate_mode"], "search")
+        self.assertIs(kwargs["assemblies_only"], True)
+        self.assertIs(kwargs["reuse_index_vectors"], True)
+
+    def test_requests_one_extra_result_for_the_self_hit(self):
+        core.search_assembly_index("idx", self.QUERY_ID, 5)
+        self.assertEqual(self.matcher.calls[0]["top_k"], 6)
+
+    def test_defaults_match_bridge(self):
+        core.search_assembly_index("idx", self.QUERY_ID, 5)
+        kwargs = self.matcher.calls[0]
+        self.assertEqual(kwargs["candidate_k"], 30)
+        self.assertAlmostEqual(kwargs["sim_thresh"], 0.80)
+        self.assertAlmostEqual(kwargs["bop_weight"], 0.30)
+        self.assertEqual(kwargs["coverage_mode"], "symmetric")
+        self.assertIs(kwargs["use_idf"], True)
+
+    def test_tunables_are_forwarded(self):
+        core.search_assembly_index(
+            "idx", self.QUERY_ID, 5,
+            candidate_k=50, sim_thresh=0.5, bop_weight=0.0,
+            coverage_mode="containment", use_idf=False,
+        )
+        kwargs = self.matcher.calls[0]
+        self.assertEqual(kwargs["candidate_k"], 50)
+        self.assertAlmostEqual(kwargs["sim_thresh"], 0.5)
+        self.assertAlmostEqual(kwargs["bop_weight"], 0.0)
+        self.assertEqual(kwargs["coverage_mode"], "containment")
+        self.assertIs(kwargs["use_idf"], False)
+
+    def test_query_is_passed_as_a_resolved_path(self):
+        core.search_assembly_index("idx", self.QUERY_ID, 5)
+        self.assertTrue(self.matcher.calls[0]["query_path"].endswith(f"{self.QUERY_ID}.stp"))
+
+    def test_n_jobs_comes_from_the_environment(self):
+        os.environ["HOOPS_AI_ASSEMBLY_SEARCH_JOBS"] = "3"
+        try:
+            core.search_assembly_index("idx", self.QUERY_ID, 5)
+        finally:
+            os.environ.pop("HOOPS_AI_ASSEMBLY_SEARCH_JOBS", None)
+        self.assertEqual(self.matcher.calls[0]["n_jobs"], 3)
+
+
+class TestResultMapping(_AssemblySearchBase):
+    def test_matcher_keys_map_to_response_fields(self):
+        out = core.search_assembly_index("idx", self.QUERY_ID, 5)
+        hit = out["hits"][0]
+        self.assertEqual(hit["id"], self.A)
+        self.assertAlmostEqual(hit["score"], 0.91)
+        self.assertAlmostEqual(hit["geom_score"], 0.88)
+        self.assertAlmostEqual(hit["coverage"], 0.75)
+        self.assertEqual(hit["matched_parts"], 7)      # <- matched
+        self.assertEqual(hit["candidate_parts"], 9)    # <- n_parts
+        self.assertEqual(hit["query_parts"], 8)        # <- M
+
+    def test_metadata_comes_from_the_index(self):
+        out = core.search_assembly_index("idx", self.QUERY_ID, 5)
+        self.assertEqual(out["hits"][0]["metadata"]["filename"], "a.stp")
+        self.assertEqual(out["hits"][0]["metadata"]["bodies"], 9)
+
+    def test_metadata_is_read_in_a_single_pass(self):
+        vs = core._load_named_index("idx")
+        core.search_assembly_index("idx", self.QUERY_ID, 5)
+        self.assertEqual(vs.iter_metadata.call_count, 1)
+
+    def test_no_underscore_keys_in_any_hit(self):
+        for include_self in (False, True):
+            self.registered.add(self.QUERY_ID)
+            out = core.search_assembly_index(
+                "idx", self.QUERY_ID, 5, include_self=include_self
+            )
+            for hit in out["hits"]:
+                leaked = [k for k in hit["metadata"] if k.startswith("_")]
+                self.assertEqual(leaked, [], f"include_self={include_self}: {leaked}")
+
+    def test_unknown_id_still_yields_metadata(self):
+        self.results.append(_result("z" * 64, 0.1))
+        out = core.search_assembly_index("idx", self.QUERY_ID, 10)
+        self.assertEqual(out["hits"][-1]["metadata"], {"file_id": "z" * 64})
+
+    def test_malformed_rows_are_skipped(self):
+        self.results.insert(0, "not-a-dict")
+        self.results.insert(1, {"score": 0.5})  # no assembly id
+        out = core.search_assembly_index("idx", self.QUERY_ID, 10)
+        self.assertEqual([h["id"] for h in out["hits"]], [self.A, self.B, self.C])
+
+    def test_empty_index_returns_no_hits(self):
+        self.registered.clear()
+        out = core.search_assembly_index("idx", self.QUERY_ID, 5)
+        self.assertEqual(out, {"hits": [], "count": 0, "image_url": None})
+        self.assertEqual(self.matcher.calls, [])
+
+
+class TestSelfHit(_AssemblySearchBase):
+    """AssemblyMatcher cannot drop the query itself: ids are SHA-256, the
+    query is an uploads/<sha>_<name> path (see PR #5)."""
+
+    def setUp(self):
+        super().setUp()
+        self.registered.add(self.QUERY_ID)
+        self.metas.append(
+            {"file_id": self.QUERY_ID, "filename": "q.stp", "kind": "assembly", "bodies": 8}
+        )
+        # The matcher returns the query as a perfect self match.
+        self.results.insert(
+            0, _result(self.QUERY_ID, 1.0, geom=1.0, coverage=1.0, matched=8, n_parts=8, m=8)
+        )
+
+    def test_self_hit_excluded_by_default(self):
+        out = core.search_assembly_index("idx", self.QUERY_ID, 3)
+        self.assertNotIn(self.QUERY_ID, [h["id"] for h in out["hits"]])
+
+    def test_excluding_self_still_fills_top_k(self):
+        out = core.search_assembly_index("idx", self.QUERY_ID, 3)
+        self.assertEqual(len(out["hits"]), 3)
+        self.assertEqual([h["id"] for h in out["hits"]], [self.A, self.B, self.C])
+
+    def test_include_self_promotes_without_duplicating(self):
+        out = core.search_assembly_index("idx", self.QUERY_ID, 3, include_self=True)
+        ids = [h["id"] for h in out["hits"]]
+        self.assertEqual(ids[0], self.QUERY_ID)
+        self.assertEqual(ids.count(self.QUERY_ID), 1)
+        self.assertEqual(out["hits"][0]["score"], 1.0)
+
+    def test_include_self_does_not_exceed_top_k(self):
+        out = core.search_assembly_index("idx", self.QUERY_ID, 3, include_self=True)
+        self.assertEqual(len(out["hits"]), 3)
+        self.assertEqual(out["count"], 3)
+
+    def test_self_hit_carries_stored_metadata_and_body_count(self):
+        out = core.search_assembly_index("idx", self.QUERY_ID, 3, include_self=True)
+        self.assertEqual(out["hits"][0]["metadata"]["filename"], "q.stp")
+        self.assertEqual(out["hits"][0]["query_parts"], 8)
+        self.assertEqual(out["hits"][0]["candidate_parts"], 8)
+
+    def test_include_self_noop_when_query_not_registered(self):
+        self.registered.discard(self.QUERY_ID)
+        out = core.search_assembly_index("idx", self.QUERY_ID, 5, include_self=True)
+        self.assertNotIn(self.QUERY_ID, [h["id"] for h in out["hits"]])
+
+
+class TestValidation(_AssemblySearchBase):
+    def test_invalid_coverage_mode_raises(self):
+        with self.assertRaises(ValueError):
+            core.search_assembly_index("idx", self.QUERY_ID, 5, coverage_mode="bogus")
+        self.assertEqual(self.matcher.calls, [])
+
+    def test_valid_coverage_modes_accepted(self):
+        for mode in ("symmetric", "containment", "jaccard"):
+            core.search_assembly_index("idx", self.QUERY_ID, 5, coverage_mode=mode)
+        self.assertEqual(len(self.matcher.calls), 3)
+
+    def test_candidate_k_out_of_range_raises(self):
+        for bad in (0, -1, core._ASSEMBLY_CANDIDATE_K_MAX + 1):
+            with self.assertRaises(ValueError):
+                core.search_assembly_index("idx", self.QUERY_ID, 5, candidate_k=bad)
+
+    def test_sim_thresh_out_of_range_raises(self):
+        for bad in (-0.1, 1.1):
+            with self.assertRaises(ValueError):
+                core.search_assembly_index("idx", self.QUERY_ID, 5, sim_thresh=bad)
+
+    def test_bop_weight_out_of_range_raises(self):
+        for bad in (-0.1, 1.1):
+            with self.assertRaises(ValueError):
+                core.search_assembly_index("idx", self.QUERY_ID, 5, bop_weight=bad)
+
+    def test_non_positive_top_k_returns_one_hit(self):
+        out = core.search_assembly_index("idx", self.QUERY_ID, 0)
+        self.assertEqual(len(out["hits"]), 1)
+
+
+class TestIncludeImage(_AssemblySearchBase):
+    def test_image_generated_by_default(self):
+        out = core.search_assembly_index("idx", self.QUERY_ID, 3)
+        self.assertEqual(out["image_url"], "/out/fake.png")
+        self.assertEqual(len(self.grid_calls), 1)
+
+    def test_include_image_false_skips_grid_and_thumbnail(self):
+        out = core.search_assembly_index("idx", self.QUERY_ID, 3, include_image=False)
+        self.assertIsNone(out["image_url"])
+        self.assertEqual(self.grid_calls, [])
+        self.assertEqual(self.thumbnail_calls, [])
+
+    def test_include_image_does_not_change_hits(self):
+        with_img = core.search_assembly_index("idx", self.QUERY_ID, 3)
+        without = core.search_assembly_index("idx", self.QUERY_ID, 3, include_image=False)
+        self.assertEqual(with_img["hits"], without["hits"])
+        self.assertEqual(with_img["count"], without["count"])
+
+    def test_registered_thumbnail_is_reused(self):
+        core._resolve_index_asset = lambda name, pid, asset: pathlib.Path("exists.png")
+        core.search_assembly_index("idx", self.QUERY_ID, 3)
+        self.assertEqual(self.thumbnail_calls, [])
+
+
+class TestAssemblySearchJobs(unittest.TestCase):
+    def setUp(self):
+        self._orig = os.environ.get("HOOPS_AI_ASSEMBLY_SEARCH_JOBS")
+
+    def tearDown(self):
+        if self._orig is None:
+            os.environ.pop("HOOPS_AI_ASSEMBLY_SEARCH_JOBS", None)
+        else:
+            os.environ["HOOPS_AI_ASSEMBLY_SEARCH_JOBS"] = self._orig
+
+    def test_default_matches_bridge(self):
+        os.environ.pop("HOOPS_AI_ASSEMBLY_SEARCH_JOBS", None)
+        self.assertEqual(core._assembly_search_jobs(), 8)
+
+    def test_custom_value(self):
+        os.environ["HOOPS_AI_ASSEMBLY_SEARCH_JOBS"] = "2"
+        self.assertEqual(core._assembly_search_jobs(), 2)
+
+    def test_invalid_values_fall_back(self):
+        for bad in ("", "abc", "0", "-4"):
+            os.environ["HOOPS_AI_ASSEMBLY_SEARCH_JOBS"] = bad
+            self.assertEqual(core._assembly_search_jobs(), 8, bad)
+
+
+class TestAssemblyMatcherCache(unittest.TestCase):
+    """The matcher is expensive (FAISS k-means over every body), so it is
+    cached by (faiss path, mtime) and only one instance is kept."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig_idx_dir = core.INDEXES_DIR
+        core.INDEXES_DIR = pathlib.Path(self._tmp.name)
+        self._orig_get_embedder = core.get_embedder
+        core.get_embedder = lambda model: SimpleNamespace(model_name="fake")
+
+        self._saved_mods = {}
+        for name in ("hoops_ai", "hoops_ai.ml", "hoops_ai.ml.embeddings",
+                     "vendor", "vendor.assembly_matcher"):
+            self._saved_mods[name] = sys.modules.get(name)
+
+        pkg = types.ModuleType("hoops_ai")
+        ml = types.ModuleType("hoops_ai.ml")
+        emb = types.ModuleType("hoops_ai.ml.embeddings")
+
+        class _CADSearch:
+            def __init__(self, shape_model=None):
+                self.loaded = None
+
+            def load_shape_index(self, path=None):
+                self.loaded = path
+                return SimpleNamespace(ids=[], values=[], model="fake")
+
+        emb.CADSearch = _CADSearch
+        pkg.ml = ml
+        ml.embeddings = emb
+        sys.modules["hoops_ai"] = pkg
+        sys.modules["hoops_ai.ml"] = ml
+        sys.modules["hoops_ai.ml.embeddings"] = emb
+
+        class _AssemblyMatcher:
+            instances = 0
+
+            def __init__(self, searcher=None, embedding_batch=None, min_bodies_for_assembly=2):
+                type(self).instances += 1
+                self.serial = type(self).instances
+                self.searcher = searcher
+                self.batch = embedding_batch
+                self.min_bodies = min_bodies_for_assembly
+                self.weights_built = 0
+
+            def build_part_rarity_weights(self):
+                self.weights_built += 1
+
+        vendor_pkg = types.ModuleType("vendor")
+        matcher_mod = types.ModuleType("vendor.assembly_matcher")
+        matcher_mod.AssemblyMatcher = _AssemblyMatcher
+        vendor_pkg.assembly_matcher = matcher_mod
+        sys.modules["vendor"] = vendor_pkg
+        sys.modules["vendor.assembly_matcher"] = matcher_mod
+
+        self.AssemblyMatcher = _AssemblyMatcher
+        _AssemblyMatcher.instances = 0
+        core._assembly_matchers.clear()
+
+    def tearDown(self):
+        core._assembly_matchers.clear()
+        core.get_embedder = self._orig_get_embedder
+        core.INDEXES_DIR = self._orig_idx_dir
+        for name, mod in self._saved_mods.items():
+            if mod is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = mod
+        self._tmp.cleanup()
+
+    def _mk_index(self, name):
+        d = core.INDEXES_DIR / name
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "index.faiss").write_bytes(b"faiss")
+        return d / "index.faiss"
+
+    def test_missing_index_raises_key_error(self):
+        with self.assertRaises(KeyError):
+            core._get_assembly_matcher("nope", "signal")
+
+    def test_same_mtime_reuses_instance(self):
+        self._mk_index("a")
+        m1 = core._get_assembly_matcher("a", "signal")
+        m2 = core._get_assembly_matcher("a", "signal")
+        self.assertIs(m1, m2)
+        self.assertEqual(self.AssemblyMatcher.instances, 1)
+        self.assertEqual(m1.weights_built, 1)
+
+    def test_built_from_the_loaded_index(self):
+        p = self._mk_index("a")
+        m = core._get_assembly_matcher("a", "signal")
+        self.assertEqual(m.searcher.loaded, str(p))
+        self.assertIsNotNone(m.batch)
+        self.assertEqual(m.min_bodies, core._MIN_BODIES_FOR_ASSEMBLY)
+
+    def test_mtime_change_rebuilds_instance(self):
+        p = self._mk_index("a")
+        m1 = core._get_assembly_matcher("a", "signal")
+        st = p.stat()
+        os.utime(p, ns=(st.st_atime_ns + 10**9, st.st_mtime_ns + 10**9))
+        m2 = core._get_assembly_matcher("a", "signal")
+        self.assertIsNot(m1, m2)
+        self.assertEqual(len(core._assembly_matchers), 1)
+
+    def test_only_one_instance_is_kept(self):
+        for n in ("a", "b"):
+            self._mk_index(n)
+        core._get_assembly_matcher("a", "signal")
+        core._get_assembly_matcher("b", "signal")
+        self.assertEqual(len(core._assembly_matchers), core._ASSEMBLY_MATCHER_CACHE_MAX)
+        self.assertEqual(core._ASSEMBLY_MATCHER_CACHE_MAX, 1)
+        paths = [k[0] for k in core._assembly_matchers]
+        self.assertEqual(paths, [str(core.INDEXES_DIR / "b" / "index.faiss")])
+
+    def test_evict_drops_entry(self):
+        self._mk_index("a")
+        core._get_assembly_matcher("a", "signal")
+        core._evict_assembly_matchers("a")
+        self.assertEqual(len(core._assembly_matchers), 0)
+
+
+class TestAssemblyEndpoint(unittest.TestCase):
+    """Router-level validation and forwarding."""
+
+    QUERY_ID = "a" * 64
+
+    def setUp(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from routers.similarity import router
+
+        app = FastAPI()
+        app.include_router(router)
+        self.client = TestClient(app)
+
+        self._orig = core.search_assembly_index
+        self.calls = []
+
+        def _fake(name, file_id, top_k, candidate_k=30, sim_thresh=0.80,
+                  bop_weight=0.30, coverage_mode="symmetric", use_idf=True,
+                  include_self=False, include_image=True):
+            self.calls.append(
+                {"name": name, "file_id": file_id, "top_k": top_k,
+                 "candidate_k": candidate_k, "sim_thresh": sim_thresh,
+                 "bop_weight": bop_weight, "coverage_mode": coverage_mode,
+                 "use_idf": use_idf, "include_self": include_self,
+                 "include_image": include_image}
+            )
+            return {
+                "hits": [{
+                    "id": "b" * 64, "score": 0.9, "geom_score": 0.8,
+                    "coverage": 0.7, "matched_parts": 3, "candidate_parts": 5,
+                    "query_parts": 4, "metadata": {"filename": "b.stp"},
+                }],
+                "count": 1,
+                "image_url": None,
+            }
+
+        core.search_assembly_index = _fake
+
+    def tearDown(self):
+        core.search_assembly_index = self._orig
+
+    def _post(self, query=""):
+        url = f"/similarity/index/idx/search-assembly?file_id={self.QUERY_ID}"
+        if query:
+            url += "&" + query
+        return self.client.post(url)
+
+    def test_defaults_match_bridge(self):
+        resp = self._post()
+        self.assertEqual(resp.status_code, 200)
+        call = self.calls[0]
+        self.assertEqual(call["top_k"], 10)
+        self.assertEqual(call["candidate_k"], 30)
+        self.assertAlmostEqual(call["sim_thresh"], 0.80)
+        self.assertAlmostEqual(call["bop_weight"], 0.30)
+        self.assertEqual(call["coverage_mode"], "symmetric")
+        self.assertTrue(call["use_idf"])
+        self.assertFalse(call["include_self"])
+        self.assertTrue(call["include_image"])
+
+    def test_response_carries_the_diagnostic_fields(self):
+        body = self._post().json()
+        hit = body["hits"][0]
+        self.assertEqual(hit["matched_parts"], 3)
+        self.assertEqual(hit["candidate_parts"], 5)
+        self.assertEqual(hit["query_parts"], 4)
+        self.assertAlmostEqual(hit["geom_score"], 0.8)
+        self.assertAlmostEqual(hit["coverage"], 0.7)
+        self.assertEqual(body["count"], 1)
+        self.assertIsNone(body["image_url"])
+
+    def test_missing_query_is_422(self):
+        resp = self.client.post("/similarity/index/idx/search-assembly")
+        self.assertEqual(resp.status_code, 422)
+        self.assertEqual(self.calls, [])
+
+    def test_invalid_coverage_mode_is_422(self):
+        self.assertEqual(self._post("coverage_mode=bogus").status_code, 422)
+        self.assertEqual(self.calls, [])
+
+    def test_valid_coverage_modes_are_forwarded(self):
+        for mode in ("symmetric", "containment", "jaccard"):
+            self.calls.clear()
+            self.assertEqual(self._post("coverage_mode=" + mode).status_code, 200)
+            self.assertEqual(self.calls[0]["coverage_mode"], mode)
+
+    def test_candidate_k_out_of_range_is_422(self):
+        for bad in ("candidate_k=0", "candidate_k=1001"):
+            self.assertEqual(self._post(bad).status_code, 422, bad)
+        self.assertEqual(self.calls, [])
+
+    def test_sim_thresh_out_of_range_is_422(self):
+        for bad in ("sim_thresh=-0.1", "sim_thresh=1.1"):
+            self.assertEqual(self._post(bad).status_code, 422, bad)
+        self.assertEqual(self.calls, [])
+
+    def test_bop_weight_out_of_range_is_422(self):
+        for bad in ("bop_weight=-0.1", "bop_weight=1.1"):
+            self.assertEqual(self._post(bad).status_code, 422, bad)
+        self.assertEqual(self.calls, [])
+
+    def test_core_value_error_becomes_422(self):
+        def _raise(*a, **kw):
+            raise ValueError("Invalid coverage_mode 'x'.")
+
+        core.search_assembly_index = _raise
+        resp = self._post()
+        self.assertEqual(resp.status_code, 422)
+
+    def test_unknown_index_is_404(self):
+        def _raise(*a, **kw):
+            raise KeyError("Index 'idx' does not exist.")
+
+        core.search_assembly_index = _raise
+        self.assertEqual(self._post().status_code, 404)
+
+    def test_flags_are_forwarded(self):
+        self.assertEqual(self._post("include_self=true&include_image=false&use_idf=false").status_code, 200)
+        self.assertTrue(self.calls[0]["include_self"])
+        self.assertFalse(self.calls[0]["include_image"])
+        self.assertFalse(self.calls[0]["use_idf"])
+
+    def test_endpoint_is_not_demo_gated(self):
+        # Assembly search is a production feature: no require_demo_enabled.
+        self.assertEqual(self._post().status_code, 200)
+
+
+if __name__ == "__main__":
+    unittest.main()

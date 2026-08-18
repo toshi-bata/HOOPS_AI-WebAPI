@@ -10,6 +10,7 @@ import shutil
 import ssl
 import tempfile
 import threading
+import time
 import uuid
 import zipfile
 from collections import OrderedDict
@@ -149,6 +150,31 @@ _named_searchers: "OrderedDict[tuple[str, int], Any]" = OrderedDict()
 # Accepted values for the named-index search `kind` filter. "any" means no
 # filter is passed to CADSearch at all (preserves pre-filter behaviour).
 _SEARCH_KINDS = frozenset({"any", "part", "assembly"})
+
+# --- Assembly-to-assembly search (vendor/assembly_matcher.py) --------------
+# Accepted coverage denominators. "symmetric" = matched / larger side,
+# "containment" = matched / query size, "jaccard" = matched / union.
+_ASSEMBLY_COVERAGE_MODES = frozenset({"symmetric", "containment", "jaccard"})
+
+# An id with at least this many body rows counts as an assembly. Matches both
+# hoops_ai_native_bridge and _compute_faiss_stats().
+_MIN_BODIES_FOR_ASSEMBLY = 2
+
+# Cache of AssemblyMatcher instances, keyed by (faiss path, mtime_ns) exactly
+# like _named_searchers, so an index write invalidates it automatically.
+# Only ONE entry is kept (hoops_ai_native_bridge keeps one too): a matcher owns
+# a CADSearch *plus* an L2-normalised copy of every body vector, roughly twice
+# the on-disk index size, which is far too large to hold several of.
+_ASSEMBLY_MATCHER_CACHE_MAX = 1
+_assembly_matchers: "OrderedDict[tuple[str, int], Any]" = OrderedDict()
+
+# Thread-pool size for the matcher's stage-2 scoring. The bridge hard-codes 8;
+# here it is configurable because those threads compete with the server's own
+# request workers.
+_ASSEMBLY_SEARCH_JOBS_DEFAULT = 8
+
+# Bounds for the tunable scoring parameters, enforced before reaching the SDK.
+_ASSEMBLY_CANDIDATE_K_MAX = 1000
 
 # per-index write lock; also held while resolving the cached searcher
 _index_locks: dict[str, threading.Lock] = {}
@@ -1066,6 +1092,290 @@ def search_index(
     return {"hits": hit_dicts, "count": len(hit_dicts), "image_url": image_url}
 
 
+# ---------------------------------------------------------------------------
+# Assembly-to-assembly search
+# ---------------------------------------------------------------------------
+
+
+def _assembly_search_jobs() -> int:
+    """Thread-pool size for AssemblyMatcher stage-2 scoring.
+
+    Read from HOOPS_AI_ASSEMBLY_SEARCH_JOBS on every call so the value can be
+    tuned without restarting. Invalid or non-positive values fall back to the
+    default rather than failing a search.
+    """
+    raw = os.getenv("HOOPS_AI_ASSEMBLY_SEARCH_JOBS", "").strip()
+    if not raw:
+        return _ASSEMBLY_SEARCH_JOBS_DEFAULT
+    try:
+        jobs = int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid HOOPS_AI_ASSEMBLY_SEARCH_JOBS=%r; using %d.",
+            raw, _ASSEMBLY_SEARCH_JOBS_DEFAULT,
+        )
+        return _ASSEMBLY_SEARCH_JOBS_DEFAULT
+    if jobs < 1:
+        logger.warning(
+            "HOOPS_AI_ASSEMBLY_SEARCH_JOBS=%d is out of range; using %d.",
+            jobs, _ASSEMBLY_SEARCH_JOBS_DEFAULT,
+        )
+        return _ASSEMBLY_SEARCH_JOBS_DEFAULT
+    return jobs
+
+
+def _evict_assembly_matchers(name: str) -> None:
+    """Drop every cached AssemblyMatcher belonging to *name*."""
+    path_key = str(_index_faiss_path(name))
+    for stale in [k for k in _assembly_matchers if k[0] == path_key]:
+        _assembly_matchers.pop(stale, None)
+
+
+def _get_assembly_matcher(name: str, model: str) -> Any:
+    """Return an AssemblyMatcher for the named index, from cache.
+
+    Building one is far more expensive than a plain searcher: on top of loading
+    the index it runs ``build_part_rarity_weights()``, a FAISS k-means over
+    every body vector in the corpus. The construction time is logged so the
+    real cost stays visible.
+
+    Must be called while holding the per-index lock. The returned instance is
+    safe to use *outside* the lock for the same reason as
+    :func:`_get_named_searcher`: it holds its own copy of the corpus, so a
+    concurrent ``_save_named_index_atomic()`` cannot disturb an in-flight
+    search. The next request sees a new mtime and rebuilds.
+
+    Raises ``KeyError`` when the index does not exist.
+    """
+    faiss_path = _index_faiss_path(name)
+    if not faiss_path.exists():
+        raise KeyError(f"Index '{name}' does not exist.")
+
+    key = (str(faiss_path), faiss_path.stat().st_mtime_ns)
+    cached = _assembly_matchers.get(key)
+    if cached is not None:
+        _assembly_matchers.move_to_end(key)
+        return cached
+
+    try:
+        from hoops_ai.ml.embeddings import CADSearch
+    except ImportError:  # older/newer layouts re-export it one level up
+        from hoops_ai.ml import CADSearch
+
+    from vendor.assembly_matcher import AssemblyMatcher
+
+    started = time.perf_counter()
+    searcher = CADSearch(shape_model=get_embedder(model))
+    batch = _load_shape_index_pickle_compat(searcher, faiss_path)
+    matcher = AssemblyMatcher(
+        searcher=searcher,
+        embedding_batch=batch,
+        min_bodies_for_assembly=_MIN_BODIES_FOR_ASSEMBLY,
+    )
+    matcher.build_part_rarity_weights()
+    logger.info(
+        "[ASSEMBLY] built matcher for index '%s' in %.2fs",
+        name, time.perf_counter() - started,
+    )
+
+    _evict_assembly_matchers(name)
+    _assembly_matchers[key] = matcher
+    while len(_assembly_matchers) > _ASSEMBLY_MATCHER_CACHE_MAX:
+        _assembly_matchers.popitem(last=False)
+    return matcher
+
+
+def _assembly_metadata_by_id(vs: Any) -> dict[str, dict[str, Any]]:
+    """Map file_id -> stored metadata in a single pass over the index.
+
+    ``iter_metadata()`` yields one entry per body row, so the first entry per
+    file wins; per-file fields (filename, kind, bodies, ...) are identical
+    across the rows of a file.
+    """
+    by_id: dict[str, dict[str, Any]] = {}
+    for meta in vs.iter_metadata():
+        if not isinstance(meta, dict):
+            continue
+        fid = meta.get("file_id")
+        if fid and fid not in by_id:
+            by_id[str(fid)] = dict(meta)
+    return by_id
+
+
+def _assembly_hit(result: Any, meta_by_id: dict[str, dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """Convert one AssemblyMatcher result dict into a response hit.
+
+    The matcher's key names are kept verbatim on its side and renamed here:
+    ``matched`` -> matched_parts, ``n_parts`` -> candidate_parts (bodies in the
+    candidate) and ``M`` -> query_parts (bodies in the query). Returns None for
+    anything unusable so one odd row cannot fail the whole search.
+    """
+    if not isinstance(result, dict):
+        return None
+    hid = str(result.get("assembly") or "")
+    if not hid:
+        return None
+
+    def _num(key: str) -> float:
+        try:
+            return float(result.get(key) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _count(key: str) -> int:
+        try:
+            return int(result.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    return {
+        "id": hid,
+        "score": round(_num("score"), 6),
+        "geom_score": round(_num("geom_score"), 6),
+        "coverage": round(_num("coverage"), 6),
+        "matched_parts": _count("matched"),
+        "candidate_parts": _count("n_parts"),
+        "query_parts": _count("M"),
+        "metadata": _public_metadata(meta_by_id.get(hid)) or {"file_id": hid},
+    }
+
+
+def _assembly_self_hit(file_id: str, meta: Optional[dict[str, Any]]) -> dict[str, Any]:
+    """Build the synthetic self hit inserted when include_self is set.
+
+    An assembly is a perfect match for itself, so the scores are 1.0 and every
+    body counts as matched. The values are synthetic, never produced by the
+    matcher, because the query is excluded from scoring (see
+    :func:`search_assembly_index`).
+    """
+    public = _public_metadata(meta)
+    try:
+        bodies = int(public.get("bodies") or 0)
+    except (TypeError, ValueError):
+        bodies = 0
+    return {
+        "id": file_id,
+        "score": 1.0,
+        "geom_score": 1.0,
+        "coverage": 1.0,
+        "matched_parts": bodies,
+        "candidate_parts": bodies,
+        "query_parts": bodies,
+        "metadata": public or {"file_id": file_id},
+    }
+
+
+def search_assembly_index(
+    name: str,
+    file_id: str,
+    top_k: int,
+    candidate_k: int = 30,
+    sim_thresh: float = 0.80,
+    bop_weight: float = 0.30,
+    coverage_mode: str = "symmetric",
+    use_idf: bool = True,
+    include_self: bool = False,
+    include_image: bool = True,
+) -> dict[str, Any]:
+    """Search the named index for assemblies similar to the assembly *file_id*.
+
+    Runs the vendored ``AssemblyMatcher`` (see vendor/assembly_matcher.py) with
+    exactly the arguments hoops_ai_native_bridge uses, so both projects rank the
+    same corpus identically: a per-body Hungarian matching, blended with a
+    bag-of-parts composition score, over an index-backed candidate shortlist.
+
+    *coverage_mode* is ``"symmetric"`` (matched mass over the larger side),
+    ``"containment"`` (over the query, i.e. "which assemblies contain this
+    one?") or ``"jaccard"``. Out-of-range parameters raise ``ValueError``.
+
+    Like :func:`search_index`, the query cannot be dropped by the SDK itself --
+    ``AssemblyMatcher.search()`` discards candidates equal to the query *path*
+    while records are keyed by SHA-256 -- so the self hit is removed explicitly
+    here and only re-inserted, at the front, when *include_self* is set. One
+    extra result is requested to compensate, and the total never exceeds
+    *top_k*.
+
+    Returns ``{"hits": [...], "count": n, "image_url": str | None}``; the hits
+    carry the matcher's diagnostics (geom_score, coverage, matched_parts,
+    candidate_parts, query_parts) alongside the stored metadata. As in
+    :func:`search_index`, ``include_image`` only controls the display-only
+    contact sheet and never affects the hits.
+
+    Raises ``KeyError`` when the index does not exist.
+    """
+    _validate_index_name(name)
+    if coverage_mode not in _ASSEMBLY_COVERAGE_MODES:
+        raise ValueError(
+            f"Invalid coverage_mode '{coverage_mode}'. "
+            f"Must be one of: {sorted(_ASSEMBLY_COVERAGE_MODES)}."
+        )
+    k = int(top_k) if int(top_k) > 0 else 1
+    candidate_k = int(candidate_k)
+    if not 1 <= candidate_k <= _ASSEMBLY_CANDIDATE_K_MAX:
+        raise ValueError(
+            f"Invalid candidate_k {candidate_k}. Must be between 1 and "
+            f"{_ASSEMBLY_CANDIDATE_K_MAX}."
+        )
+    sim_thresh = float(sim_thresh)
+    if not 0.0 <= sim_thresh <= 1.0:
+        raise ValueError(f"Invalid sim_thresh {sim_thresh}. Must be between 0.0 and 1.0.")
+    bop_weight = float(bop_weight)
+    if not 0.0 <= bop_weight <= 1.0:
+        raise ValueError(f"Invalid bop_weight {bop_weight}. Must be between 0.0 and 1.0.")
+
+    index_model = _load_index_model(name)
+    lock = _get_index_lock(name)
+
+    # Phase 1 (locked): resolve the cached matcher and read the metadata map.
+    # Building the matcher is the expensive part; the search itself runs
+    # unlocked below so that indexing does not block concurrent searches.
+    with lock:
+        vs = _load_named_index(name)
+        registered_ids = set(vs.get_ids())
+        if not registered_ids:
+            return {"hits": [], "count": 0, "image_url": None}
+        meta_by_id = _assembly_metadata_by_id(vs)
+        matcher = _get_assembly_matcher(name, index_model)
+
+    query_path = find_persistent_CAD_file(file_id)
+
+    # Phase 2 (unlocked): the fixed arguments mirror hoops_ai_native_bridge.
+    results = matcher.search(
+        query_path=str(query_path),
+        top_k=k + 1,
+        candidate_k=candidate_k,
+        sim_thresh=sim_thresh,
+        method="hungarian",
+        use_idf=bool(use_idf),
+        candidate_mode="search",
+        assemblies_only=True,
+        reuse_index_vectors=True,
+        coverage_mode=coverage_mode,
+        bop_weight=bop_weight,
+        n_jobs=_assembly_search_jobs(),
+    )
+
+    hit_dicts: list[dict[str, Any]] = []
+    for result in results or []:
+        hit = _assembly_hit(result, meta_by_id)
+        if hit is not None and hit["id"] != file_id:
+            hit_dicts.append(hit)
+
+    if include_self and file_id in registered_ids:
+        # The query was filtered out above, so this cannot duplicate a hit.
+        hit_dicts.insert(0, _assembly_self_hit(file_id, meta_by_id.get(file_id)))
+    hit_dicts = hit_dicts[:k]
+
+    # Phase 3: display-only contact sheet, identical policy to search_index().
+    image_url: Optional[str] = None
+    if include_image and hit_dicts:
+        if _resolve_index_asset(name, file_id, "thumbnail") is None:
+            _generate_part_thumbnail(file_id, name)
+        image_url = _build_search_grid_image(file_id, hit_dicts, name)
+
+    return {"hits": hit_dicts, "count": len(hit_dicts), "image_url": image_url}
+
+
 def get_index_stats(name: str) -> dict[str, Any]:
     """Return body-level statistics for the named index.
 
@@ -1194,6 +1504,7 @@ def delete_index(name: str) -> dict[str, Any]:
         _named_indexes.pop(name, None)
         # Drop cached searchers so a deleted index stops holding memory.
         _evict_named_searchers(name)
+        _evict_assembly_matchers(name)
 
     # Remove the entire index directory (faiss + meta + thumbnails)
     index_dir = INDEXES_DIR / name

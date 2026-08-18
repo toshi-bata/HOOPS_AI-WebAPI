@@ -919,6 +919,23 @@ class IndexSearchResponse(BaseModel):
     image_url: Optional[str] = None
 
 
+class AssemblySearchHit(BaseModel):
+    id: str
+    score: float
+    geom_score: float
+    coverage: float
+    matched_parts: int
+    candidate_parts: int
+    query_parts: int
+    metadata: Optional[dict] = None
+
+
+class AssemblySearchResponse(BaseModel):
+    hits: list[AssemblySearchHit]
+    count: int
+    image_url: Optional[str] = None
+
+
 class IndexDeleteResponse(BaseModel):
     name: str
     deleted: bool
@@ -1181,6 +1198,118 @@ def search_named_index(
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Search failed: {exc}") from exc
+
+
+# ---------------------------------------------------------------------------
+# POST /similarity/index/{name}/search-assembly
+# ---------------------------------------------------------------------------
+
+
+@router.post("/index/{name}/search-assembly", response_model=AssemblySearchResponse)
+def search_named_index_assembly(
+    name: str,
+    request: Request,
+    file: Optional[UploadFile] = File(None),
+    file_id: Optional[str] = Query(None, description="file_id from a previous upload."),
+    top_k: int = Query(10, ge=1, description="Number of similar assemblies to return."),
+    candidate_k: int = Query(
+        30, ge=1, le=1000,
+        description="Per-body shortlist size used to gather candidate assemblies.",
+    ),
+    sim_thresh: float = Query(
+        0.80, ge=0.0, le=1.0,
+        description="Minimum body-to-body cosine similarity for a matched pair.",
+    ),
+    bop_weight: float = Query(
+        0.30, ge=0.0, le=1.0,
+        description=(
+            "Blend weight of the bag-of-parts composition score against the "
+            "geometric score. 0 = geometry only."
+        ),
+    ),
+    coverage_mode: Literal["symmetric", "containment", "jaccard"] = Query(
+        "symmetric",
+        description=(
+            "Coverage denominator: 'symmetric' (larger side), 'containment' "
+            "(query side, finds assemblies containing the query) or 'jaccard'."
+        ),
+    ),
+    use_idf: bool = Query(
+        True,
+        description="Weight parts by cluster rarity (IDF) so common fasteners count less.",
+    ),
+    include_self: bool = Query(
+        False,
+        description=(
+            "When true and the query file is registered in this index, put it "
+            "first with score 1.0. The total still respects top_k."
+        ),
+    ),
+    include_image: bool = Query(
+        True,
+        description=(
+            "When false, skip the result-grid PNG and return image_url=null. "
+            "Hits are unaffected."
+        ),
+    ),
+):
+    """Search a named index for assemblies similar to a query assembly.
+
+    Supply **either** a file upload *or* a ``file_id``.  Unlike
+    ``/index/{name}/search`` (which ranks individual parts), this matches whole
+    assemblies: query bodies are paired one-to-one with candidate bodies by
+    Hungarian assignment, and the result is blended with a bag-of-parts
+    composition score.  Same algorithm and defaults as hoops_ai_native_bridge.
+
+    Each hit reports the diagnostics behind its score: ``geom_score``,
+    ``coverage``, ``matched_parts`` (matched pairs), ``candidate_parts`` (bodies
+    in the candidate) and ``query_parts`` (bodies in the query).
+
+    Returns an empty ``hits`` list when the index contains zero entries.
+    """
+    _validate_name_or_raise(name)
+
+    try:
+        if file_id:
+            resolved_id = file_id
+        elif file:
+            resolved_id, _, _ = core.upload_CAD_file_persistent(file)
+        else:
+            raise HTTPException(status_code=422, detail="Either 'file' or 'file_id' is required.")
+
+        result = core.search_assembly_index(
+            name,
+            resolved_id,
+            top_k,
+            candidate_k=candidate_k,
+            sim_thresh=sim_thresh,
+            bop_weight=bop_weight,
+            coverage_mode=coverage_mode,
+            use_idf=use_idf,
+            include_self=include_self,
+            include_image=include_image,
+        )
+
+        # Convert the relative /out/{file} URL to an absolute one.
+        image_url = result.get("image_url")
+        if image_url:
+            image_url = str(request.url_for("out", path=image_url.split("/out/", 1)[-1]))
+
+        return AssemblySearchResponse(
+            hits=[AssemblySearchHit(**h) for h in result["hits"]],
+            count=result["count"],
+            image_url=image_url,
+        )
+    except HTTPException:
+        raise
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (core.EnvConfigError, core.PathConfigError):
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Assembly search failed: {exc}") from exc
 
 
 # ---------------------------------------------------------------------------
