@@ -1124,12 +1124,21 @@ def search_named_index(
             "first with score 1.0. The total still respects top_k."
         ),
     ),
+    include_image: bool = Query(
+        True,
+        description=(
+            "When false, skip the result-grid PNG and return image_url=null. "
+            "Hits are unaffected; use it to avoid the rendering cost when the "
+            "client draws its own gallery."
+        ),
+    ),
 ):
     """Search a named index for the most similar parts to a query shape.
 
     Supply **either** a file upload *or* a ``file_id``.  Returns an empty ``hits``
     list when the index contains zero entries (no error).  When hits are found a
-    ``image_url`` pointing to a result-grid PNG is included in the response.
+    ``image_url`` pointing to a result-grid PNG is included in the response,
+    unless ``include_image=false``.
     """
     try:
         _validate_name_or_raise(name)
@@ -1145,7 +1154,12 @@ def search_named_index(
             raise HTTPException(status_code=422, detail="Either 'file' or 'file_id' is required.")
 
         result = core.search_index(
-            name, resolved_id, top_k, kind=kind, include_self=include_self
+            name,
+            resolved_id,
+            top_k,
+            kind=kind,
+            include_self=include_self,
+            include_image=include_image,
         )
 
         # Convert relative /out/{file} URL to an absolute URL (same pattern as /similarity/search)
