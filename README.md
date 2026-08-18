@@ -1083,8 +1083,23 @@ automatically at search and add time.
 assemblies / single-part), `part` vs `assembly` classification, and per-body matching for
 future assembly-to-assembly search.  Registering a file also produces a thumbnail
 (`thumbnails/<file_id>.png`) and a stream cache (`scs/<file_id>.scs`) from the same CAD
-load.  Search transparently de-duplicates body rows so each file appears once, ranked by
-its best-matching body — the `POST /index/{name}/search` response schema is unchanged.
+load.  Search runs through `CADSearch.search_by_shape()`, which embeds the query at body
+granularity and applies the geometric reranker; the per-body ranked lists are then
+concatenated in order and de-duplicated by file so each file appears once — the
+`POST /index/{name}/search` response schema is unchanged.
+
+**Search filtering.**  `POST /index/{name}/search` accepts `kind` (`any` | `part` |
+`assembly`, default `any`) and `include_self` (default `false`).  `kind=any` passes no
+filter at all, preserving the previous behaviour for existing clients; use **`kind=part`**
+to reproduce the results of the sibling `hoops_ai_native_bridge` project, which always
+filters to parts.  A query that is itself registered in the index is returned by the SDK
+as a perfect self match; it is **removed by default** so that `top_k` hits are genuine
+neighbours.  `include_self=true` keeps it instead, pinned first with score `1.0` (useful
+for tagging a whole displayed cluster); the total still respects `top_k`.
+
+Hit `metadata` contains only the keys stored at registration time (`file_id`, `filename`,
+`registered_at`, `kind`, `bodies`, `thumbnail`, `scs`, `obb`).  Undocumented
+underscore-prefixed fields added by the SDK are stripped from the response.
 
 Legacy indexes created before this change are **schema v1** (one averaged vector per
 file).  They remain fully readable (search / list / stats), but **writes**
@@ -1225,15 +1240,24 @@ curl -X POST "http://127.0.0.1:8000/similarity/index/add?name=my-parts" -F "file
 ##### Search a named index
 
 ```
-POST /similarity/index/{name}/search?top_k=<n>
+POST /similarity/index/{name}/search?top_k=<n>&kind=<any|part|assembly>&include_self=<bool>
 ```
 
 Supply **either** a file upload or a `file_id`.  Returns an empty ``hits`` list
 when the index contains zero entries (no error).
 
+| Query param | Default | Description |
+|---|---|---|
+| `top_k` | `10` | Maximum number of hits. |
+| `kind` | `any` | Restrict hits to `part` or `assembly`. `any` passes no filter. Use `part` to match `hoops_ai_native_bridge`. Any other value is **422**. |
+| `include_self` | `false` | Keep the query itself in the results when it is registered in this index, pinned first with score `1.0`. By default the self match is dropped. Never exceeds `top_k`. |
+
 **Windows (PowerShell):**
 ```powershell
 curl.exe -X POST "http://127.0.0.1:8000/similarity/index/my-parts/search?top_k=5" -F "file=@C:\path\to\query.step"
+
+# Parts only (bridge-compatible), including the query itself
+curl.exe -X POST "http://127.0.0.1:8000/similarity/index/my-parts/search?top_k=5&kind=part&include_self=true" -F "file=@C:\path\to\query.step"
 ```
 
 **Linux:**

@@ -3,7 +3,7 @@ import os
 import pathlib
 import threading
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 import core
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Response, UploadFile
@@ -1109,6 +1109,21 @@ def search_named_index(
     file: Optional[UploadFile] = File(None),
     file_id: Optional[str] = Query(None, description="file_id from a previous upload."),
     top_k: int = Query(10, ge=1, description="Number of similar shapes to return."),
+    kind: Literal["any", "part", "assembly"] = Query(
+        "any",
+        description=(
+            "Restrict hits by part kind. 'any' (default) applies no filter and "
+            "preserves the previous behaviour; use 'part' to match "
+            "hoops_ai_native_bridge."
+        ),
+    ),
+    include_self: bool = Query(
+        False,
+        description=(
+            "When true and the query file is registered in this index, put it "
+            "first with score 1.0. The total still respects top_k."
+        ),
+    ),
 ):
     """Search a named index for the most similar parts to a query shape.
 
@@ -1129,7 +1144,9 @@ def search_named_index(
         else:
             raise HTTPException(status_code=422, detail="Either 'file' or 'file_id' is required.")
 
-        result = core.search_index(name, resolved_id, top_k)
+        result = core.search_index(
+            name, resolved_id, top_k, kind=kind, include_self=include_self
+        )
 
         # Convert relative /out/{file} URL to an absolute URL (same pattern as /similarity/search)
         image_url = result.get("image_url")

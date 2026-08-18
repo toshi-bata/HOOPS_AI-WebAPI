@@ -27,33 +27,6 @@ def _hit(id_, score):
     return SimpleNamespace(id=id_, score=score, metadata={"file_id": id_})
 
 
-class TestDedupHitsByFile(unittest.TestCase):
-    def test_collapses_to_best_score_per_id(self):
-        hits = [
-            _hit("a", 0.9),
-            _hit("b", 0.8),
-            _hit("a", 0.95),  # better duplicate of a
-            _hit("b", 0.5),
-            _hit("c", 0.1),
-        ]
-        out = core._dedup_hits_by_file(hits, top_k=10)
-        ids = [h.id for h in out]
-        self.assertEqual(ids, ["a", "b", "c"])  # sorted by best score desc
-        best_a = next(h for h in out if h.id == "a")
-        self.assertEqual(best_a.score, 0.95)
-
-    def test_truncates_to_top_k(self):
-        hits = [_hit(str(i), 1.0 - i * 0.01) for i in range(20)]
-        out = core._dedup_hits_by_file(hits, top_k=5)
-        self.assertEqual(len(out), 5)
-        self.assertEqual([h.id for h in out], ["0", "1", "2", "3", "4"])
-
-    def test_ignores_hits_without_id(self):
-        hits = [SimpleNamespace(score=0.9), _hit("a", 0.5)]
-        out = core._dedup_hits_by_file(hits, top_k=5)
-        self.assertEqual([h.id for h in out], ["a"])
-
-
 class TestObbSerializationGuard(unittest.TestCase):
     def test_small_value_kept(self):
         val = {"min": [0.0, 0.0, 0.0], "max": [1.0, 2.0, 3.0]}
@@ -359,6 +332,42 @@ class TestEmbedBodiesMissingFiles(unittest.TestCase):
         added_files = {r.id for r in records}
         self.assertEqual(len(added_files), 2)
         self.assertNotIn(self.fids[2], added_files)
+
+    def test_warns_when_errors_metadata_has_unexpected_type(self):
+        # A dict still works via the fallback, but must not degrade silently.
+        self._install_embedder({self.filenames[self.fids[2]]: "boom"})
+        with self.assertLogs(core.logger, level="WARNING") as cm:
+            core._embed_bodies_for_index(self.fids, "idx", "signal")
+        self.assertTrue(
+            any("unexpected type" in m for m in cm.output),
+            f"expected an unexpected-type warning, got: {cm.output}",
+        )
+
+    def test_warns_when_no_error_entry_matches_the_failed_file(self):
+        # Non-empty list whose entries reference some other file: the format may
+        # have changed, so the generic fallback must be announced.
+        self._install_embedder(["Failed to compute embedding for /other/file.step: boom"])
+        with self.assertLogs(core.logger, level="WARNING") as cm:
+            _records, errors = core._embed_bodies_for_index(self.fids, "idx", "signal")
+        self.assertTrue(
+            any("format may have changed" in m for m in cm.output),
+            f"expected a format-change warning, got: {cm.output}",
+        )
+        detail = next(e["detail"] for e in errors if e["file_id"] == self.fids[2])
+        self.assertEqual(detail, core._EMBED_ERROR_DEFAULT)
+
+    def test_no_degradation_warning_on_the_expected_format(self):
+        path = str(self.paths[self.fids[2]].resolve())
+        self._install_embedder(
+            ["Failed to compute embedding for {}: bad format".format(path)]
+        )
+        with self.assertLogs(core.logger, level="WARNING") as cm:
+            # Emit a sentinel so assertLogs never fails on "no logs at all".
+            core.logger.warning("sentinel")
+            core._embed_bodies_for_index(self.fids, "idx", "signal")
+        joined = " ".join(cm.output)
+        self.assertNotIn("unexpected type", joined)
+        self.assertNotIn("format may have changed", joined)
 
 
 class TestEmbedErrorDetail(unittest.TestCase):
