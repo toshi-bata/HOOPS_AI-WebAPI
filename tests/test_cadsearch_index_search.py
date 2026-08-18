@@ -477,10 +477,11 @@ class TestSearchEndpointParams(unittest.TestCase):
         self._orig = core.search_index
         self.calls = []
 
-        def _fake(name, file_id, top_k, kind="any", include_self=False):
+        def _fake(name, file_id, top_k, kind="any", include_self=False, include_image=True):
             self.calls.append(
                 {"name": name, "file_id": file_id, "top_k": top_k,
-                 "kind": kind, "include_self": include_self}
+                 "kind": kind, "include_self": include_self,
+                 "include_image": include_image}
             )
             return {"hits": [], "count": 0, "image_url": None}
 
@@ -511,6 +512,14 @@ class TestSearchEndpointParams(unittest.TestCase):
     def test_include_self_is_forwarded(self):
         self.assertEqual(self._post("include_self=true").status_code, 200)
         self.assertTrue(self.calls[0]["include_self"])
+
+    def test_include_image_defaults_to_true(self):
+        self.assertEqual(self._post("top_k=3").status_code, 200)
+        self.assertTrue(self.calls[0]["include_image"])
+
+    def test_include_image_false_is_forwarded(self):
+        self.assertEqual(self._post("include_image=false").status_code, 200)
+        self.assertFalse(self.calls[0]["include_image"])
 
 
 if __name__ == "__main__":

@@ -1240,7 +1240,7 @@ curl -X POST "http://127.0.0.1:8000/similarity/index/add?name=my-parts" -F "file
 ##### Search a named index
 
 ```
-POST /similarity/index/{name}/search?top_k=<n>&kind=<any|part|assembly>&include_self=<bool>
+POST /similarity/index/{name}/search?top_k=<n>&kind=<any|part|assembly>&include_self=<bool>&include_image=<bool>
 ```
 
 Supply **either** a file upload or a `file_id`.  Returns an empty ``hits`` list
@@ -1251,6 +1251,15 @@ when the index contains zero entries (no error).
 | `top_k` | `10` | Maximum number of hits. |
 | `kind` | `any` | Restrict hits to `part` or `assembly`. `any` passes no filter. Use `part` to match `hoops_ai_native_bridge`. Any other value is **422**. |
 | `include_self` | `false` | Keep the query itself in the results when it is registered in this index, pinned first with score `1.0`. By default the self match is dropped. Never exceeds `top_k`. |
+| `include_image` | `true` | When `false`, skip the result-grid PNG and return `image_url: null`. Hits are unaffected. |
+
+The result-grid PNG is a preview: it shows at most **12 tiles** regardless of
+`top_k`, captioned `top 12 of 300`.  The full ranking is always in `hits`.
+Rendering one tile costs a PNG decode plus a matplotlib subplot, so an uncapped
+sheet made the endpoint scale linearly with `top_k` (39 s of a 40 s request at
+`top_k=300`).  Clients that draw their own gallery should pass
+`include_image=false`, which also skips the CAD reload used to render the query
+thumbnail.
 
 **Windows (PowerShell):**
 ```powershell
@@ -1258,6 +1267,9 @@ curl.exe -X POST "http://127.0.0.1:8000/similarity/index/my-parts/search?top_k=5
 
 # Parts only (bridge-compatible), including the query itself
 curl.exe -X POST "http://127.0.0.1:8000/similarity/index/my-parts/search?top_k=5&kind=part&include_self=true" -F "file=@C:\path\to\query.step"
+
+# Large result set without the preview image (fastest)
+curl.exe -X POST "http://127.0.0.1:8000/similarity/index/my-parts/search?top_k=300&kind=part&include_image=false" -F "file=@C:\path\to\query.step"
 ```
 
 **Linux:**

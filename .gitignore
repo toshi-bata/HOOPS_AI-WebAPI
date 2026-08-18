@@ -13,3 +13,6 @@ poc_out/
 poc_body_level_index.py
 # Written to the cwd by hoops_ai when a batch item fails to embed
 error_summary.json
+
+# Throwaway tool: imports a hoops_ai_native_bridge index into indexes/
+import_bridge_index.py

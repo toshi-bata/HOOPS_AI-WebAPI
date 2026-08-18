@@ -976,6 +976,7 @@ def search_index(
     top_k: int,
     kind: str = "any",
     include_self: bool = False,
+    include_image: bool = True,
 ) -> dict[str, Any]:
     """Search the named index for the top-k most similar parts to *file_id*.
 
@@ -996,7 +997,10 @@ def search_index(
     exceeds *top_k*.
 
     Returns an empty hits list (and no image_url) when the index has no entries.
-    Generates a result-grid PNG in out/ and returns its relative URL as ``image_url``.
+    Generates a result-grid PNG in out/ and returns its relative URL as
+    ``image_url`` unless *include_image* is False, in which case ``image_url`` is
+    None and no CAD is reloaded for the query thumbnail. Hits are identical
+    either way: the image is a display-only by-product.
     """
     _validate_index_name(name)
     if kind not in _SEARCH_KINDS:
@@ -1049,11 +1053,15 @@ def search_index(
         )
     hit_dicts = hit_dicts[:k]
 
-    # Phase 3: thumbnail + grid generation (outside lock, non-fatal). Registered
-    # queries already have a thumbnail, so skip the extra CAD load in that case.
-    if _resolve_index_asset(name, file_id, "thumbnail") is None:
-        _generate_part_thumbnail(file_id, name)
-    image_url = _build_search_grid_image(file_id, hit_dicts, name) if hit_dicts else None
+    # Phase 3: thumbnail + grid generation (outside lock, non-fatal). Both are
+    # display-only, so include_image=False skips them entirely -- including the
+    # CAD reload behind _generate_part_thumbnail(). Registered queries already
+    # have a thumbnail, so skip the extra CAD load in that case too.
+    image_url: Optional[str] = None
+    if include_image and hit_dicts:
+        if _resolve_index_asset(name, file_id, "thumbnail") is None:
+            _generate_part_thumbnail(file_id, name)
+        image_url = _build_search_grid_image(file_id, hit_dicts, name)
 
     return {"hits": hit_dicts, "count": len(hit_dicts), "image_url": image_url}
 
@@ -1374,15 +1382,37 @@ def _generate_part_thumbnail(file_id: str, index_name: str) -> Optional[pathlib.
         return None
 
 
+# A contact sheet stops being readable long before it stops being expensive: each
+# tile costs one PNG decode plus one matplotlib subplot, so the image grew
+# linearly with top_k (top_k=300 produced a 1200x22840 px, 4.2 MB strip and
+# accounted for 39 s of a 40 s request). Cap the sheet so its cost is fixed and
+# small regardless of top_k -- the JSON response still carries every hit.
+_GRID_MAX_TILES = 12
+
+
+def _grid_tiles(hits: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], str]:
+    """Return the hits to draw on the contact sheet plus its caption.
+
+    The caption always states the truncation ("top 12 of 300") so a viewer can
+    tell that the image is a preview of a longer ranking.
+    """
+    shown = hits[:_GRID_MAX_TILES]
+    return shown, f"top {len(shown)} of {len(hits)}"
+
+
 def _build_search_grid_image(
     query_file_id: str,
     hits: list[dict[str, Any]],
     index_name: str,
 ) -> Optional[str]:
-    """Generate a matplotlib result-grid PNG (query + top-k hits) and save to out/.
+    """Generate a matplotlib result-grid PNG (query + top hits) and save to out/.
 
     Returns a ``/out/{uuid}.png`` relative URL, or None on failure.
     Thumbnails are looked up from the index thumbnails directory.
+
+    Only the first :data:`_GRID_MAX_TILES` hits are drawn; the caption states how
+    many of the total are shown. The JSON response always carries the full
+    ranking, so nothing is lost.
     """
     try:
         import matplotlib
@@ -1392,7 +1422,8 @@ def _build_search_grid_image(
         import matplotlib.pyplot as plt
 
         thumb_dir = _index_thumbnails_dir(index_name)
-        n_total = len(hits) + 1  # query cell + one cell per hit
+        shown, caption = _grid_tiles(hits)
+        n_total = len(shown) + 1  # query cell + one cell per drawn hit
         cols = min(4, n_total)
         rows = (n_total + cols - 1) // cols
 
@@ -1430,7 +1461,7 @@ def _build_search_grid_image(
         _show_cell(axes[0], query_thumb, f"Query\n{pathlib.Path(query_name).name}")
 
         # Hit cells
-        for i, hit in enumerate(hits):
+        for i, hit in enumerate(shown):
             if i + 1 >= len(axes):
                 break
             hit_thumb = thumb_dir / f"{hit['id']}.png"
@@ -1442,6 +1473,7 @@ def _build_search_grid_image(
         for i in range(n_total, len(axes)):
             axes[i].axis("off")
 
+        fig.text(0.5, 0.005, caption, ha="center", fontsize=8)
         plt.tight_layout(pad=0.5)
 
         image_filename = f"{uuid.uuid4()}.png"
