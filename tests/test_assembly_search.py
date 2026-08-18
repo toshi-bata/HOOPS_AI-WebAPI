@@ -99,7 +99,13 @@ class _AssemblySearchBase(unittest.TestCase):
         core._get_assembly_matcher = lambda name, model: self.matcher
         self.schema = {"model": "signal", "schema_version": core._INDEX_SCHEMA_VERSION}
         core._load_index_schema = lambda name: self.schema
-        core.find_persistent_CAD_file = lambda fid: pathlib.Path(self._tmp.name) / f"{fid}.stp"
+        self.resolve_calls = []
+
+        def _resolve_cad(fid):
+            self.resolve_calls.append(fid)
+            return pathlib.Path(self._tmp.name) / f"{fid}.stp"
+
+        core.find_persistent_CAD_file = _resolve_cad
         self.thumbnail_calls = []
         self.grid_calls = []
         core._generate_part_thumbnail = lambda fid, name: self.thumbnail_calls.append(fid)
@@ -159,6 +165,7 @@ class TestBridgeArguments(_AssemblySearchBase):
         core.search_assembly_index("idx", self.QUERY_ID, 5)
         self.assertTrue(self.matcher.calls[0]["query_path"].endswith(f"{self.QUERY_ID}.stp"))
 
+
     def test_n_jobs_comes_from_the_environment(self):
         os.environ["HOOPS_AI_ASSEMBLY_SEARCH_JOBS"] = "3"
         try:
@@ -166,6 +173,77 @@ class TestBridgeArguments(_AssemblySearchBase):
         finally:
             os.environ.pop("HOOPS_AI_ASSEMBLY_SEARCH_JOBS", None)
         self.assertEqual(self.matcher.calls[0]["n_jobs"], 3)
+
+
+class TestQueryIdentity(_AssemblySearchBase):
+    """A registered query must reach the matcher as its record id so that
+    reuse_index_vectors=True can hit the stored per-body vectors."""
+
+    def _register_query(self):
+        self.registered.add(self.QUERY_ID)
+        self.metas.append(
+            {"file_id": self.QUERY_ID, "filename": "q.stp", "kind": "assembly", "bodies": 8}
+        )
+
+    def test_registered_query_is_passed_as_its_file_id(self):
+        self._register_query()
+        core.search_assembly_index("idx", self.QUERY_ID, 5)
+        self.assertEqual(self.matcher.calls[0]["query_path"], self.QUERY_ID)
+
+    def test_registered_query_does_not_touch_the_filesystem(self):
+        self._register_query()
+        core.search_assembly_index("idx", self.QUERY_ID, 5)
+        self.assertEqual(self.resolve_calls, [])
+
+    def test_unregistered_query_is_passed_as_a_path(self):
+        core.search_assembly_index("idx", self.QUERY_ID, 5)
+        query = self.matcher.calls[0]["query_path"]
+        self.assertNotEqual(query, self.QUERY_ID)
+        self.assertTrue(query.endswith(f"{self.QUERY_ID}.stp"))
+
+    def test_unregistered_query_resolves_the_upload(self):
+        core.search_assembly_index("idx", self.QUERY_ID, 5)
+        self.assertEqual(self.resolve_calls, [self.QUERY_ID])
+
+    def test_query_path_is_always_a_string(self):
+        core.search_assembly_index("idx", self.QUERY_ID, 5)
+        self._register_query()
+        core.search_assembly_index("idx", self.QUERY_ID, 5)
+        self.assertEqual(len(self.matcher.calls), 2)
+        for call in self.matcher.calls:
+            self.assertIsInstance(call["query_path"], str)
+
+    def test_missing_upload_still_raises_for_unregistered_query(self):
+        def _boom(fid):
+            raise FileNotFoundError(fid)
+
+        core.find_persistent_CAD_file = _boom
+        with self.assertRaises(FileNotFoundError):
+            core.search_assembly_index("idx", self.QUERY_ID, 5)
+
+    def test_self_hit_handling_survives_the_id_path(self):
+        # candidates.discard(query_path) now works, but the explicit filter must
+        # still hold when the matcher returns the query anyway.
+        self._register_query()
+        self.results.insert(
+            0, _result(self.QUERY_ID, 1.0, geom=1.0, coverage=1.0, matched=8, n_parts=8, m=8)
+        )
+        out = core.search_assembly_index("idx", self.QUERY_ID, 3)
+        self.assertNotIn(self.QUERY_ID, [h["id"] for h in out["hits"]])
+        out = core.search_assembly_index("idx", self.QUERY_ID, 3, include_self=True)
+        ids = [h["id"] for h in out["hits"]]
+        self.assertEqual(ids[0], self.QUERY_ID)
+        self.assertEqual(ids.count(self.QUERY_ID), 1)
+        self.assertEqual(len(ids), 3)
+
+    def test_include_self_works_when_matcher_drops_the_query(self):
+        # With the id form the matcher discards the query itself, so the self
+        # hit has to be synthesised from the stored metadata.
+        self._register_query()
+        out = core.search_assembly_index("idx", self.QUERY_ID, 3, include_self=True)
+        ids = [h["id"] for h in out["hits"]]
+        self.assertEqual(ids, [self.QUERY_ID, self.A, self.B])
+        self.assertEqual(out["hits"][0]["score"], 1.0)
 
 
 class TestResultMapping(_AssemblySearchBase):

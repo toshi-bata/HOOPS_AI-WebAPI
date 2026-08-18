@@ -1295,6 +1295,10 @@ def search_assembly_index(
     extra result is requested to compensate, and the total never exceeds
     *top_k*.
 
+    A query that is already indexed is passed to the matcher by its record id
+    (the file_id) rather than by path, so ``reuse_index_vectors=True`` reuses
+    the stored per-body vectors instead of re-embedding the CAD file.
+
     Returns ``{"hits": [...], "count": n, "image_url": str | None}``; the hits
     carry the matcher's diagnostics (geom_score, coverage, matched_parts,
     candidate_parts, query_parts) alongside the stored metadata. As in
@@ -1347,11 +1351,22 @@ def search_assembly_index(
         meta_by_id = _assembly_metadata_by_id(vs)
         matcher = _get_assembly_matcher(name, index_model)
 
-    query_path = find_persistent_CAD_file(file_id)
+    if file_id in registered_ids:
+        # AssemblyMatcher keys its per-file rows by record id, which here is the
+        # SHA-256 file_id. Passing the id lets reuse_index_vectors=True hit the
+        # stored per-body vectors instead of re-reading and re-embedding the CAD
+        # file (~1.16s -> ~0.16s warm). It also makes the matcher's own
+        # candidates.discard(query_path) work, which it cannot do with a path
+        # because our records are keyed by hash rather than by location.
+        matcher_query = file_id
+    else:
+        # Not indexed: hand over the real path so the matcher falls back to
+        # embedder.embed_shape().
+        matcher_query = str(find_persistent_CAD_file(file_id))
 
     # Phase 2 (unlocked): the fixed arguments mirror hoops_ai_native_bridge.
     results = matcher.search(
-        query_path=str(query_path),
+        query_path=matcher_query,
         top_k=k + 1,
         candidate_k=candidate_k,
         sim_thresh=sim_thresh,

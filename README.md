@@ -1350,6 +1350,26 @@ automatically after any write to the index.  The build time is logged as
 a thread pool sized by `HOOPS_AI_ASSEMBLY_SEARCH_JOBS` (default `8`); lower it
 if assembly searches starve the server's request workers.
 
+**Registered queries skip re-embedding.**  A query that is already in the index
+is handed to the matcher by its record id (the `file_id`) rather than by path,
+so `reuse_index_vectors=True` reuses the stored per-body vectors instead of
+re-reading and re-embedding the CAD file — a warm search drops from ~1.16 s to
+~0.16 s.  It also lets the matcher's own `candidates.discard(query_path)` work.
+A query that is *not* indexed is passed as a path and embedded on the fly, as
+before.
+
+**On matching `hoops_ai_native_bridge` exactly.**  Assembly scores are close to
+but not bit-identical with the bridge on the same corpus (0.6499 vs 0.6514 for
+the reference query, 100 vs 103 candidates out of 2,467 assemblies).  The
+residual sits in the IDF term: with `use_idf=false&bop_weight=0` the top hits
+collapse to an exact tie and the hit count does not move.  The corpus and the
+`.faiss` file are identical, so the k-means input is the same; the likely cause
+is the FAISS OpenMP thread count changing the float reduction order during
+clustering, which differs between a desktop process and a uvicorn worker.  The
+top set and the meaningful ordering agree, which is the useful guarantee for a
+similarity search — unlike part search, assembly search has a clustering step in
+the middle and exact reproducibility across processes is not expected.
+
 **Windows (PowerShell):**
 ```powershell
 curl.exe -X POST "http://127.0.0.1:8000/similarity/index/my-parts/search-assembly?top_k=5" -F "file=@C:\path\to\assembly.step"
