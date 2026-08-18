@@ -1312,7 +1312,9 @@ arguments (`method="hungarian"`, `candidate_mode="search"`,
 `hoops_ai_native_bridge`, so both projects rank the same corpus identically.
 
 Supply **either** a file upload or a `file_id`.  Returns an empty `hits` list
-when the index contains zero entries.
+when the index contains zero entries.  A **schema v1** (legacy, one averaged
+vector per file) index returns **409**: it has no per-body vectors, so there is
+nothing to match one-to-one — rebuild it as v2 first.
 
 | Query param | Default | Description |
 |---|---|---|

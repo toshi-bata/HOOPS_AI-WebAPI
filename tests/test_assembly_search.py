@@ -89,7 +89,7 @@ class _AssemblySearchBase(unittest.TestCase):
         self._saved = {
             "_load_named_index": core._load_named_index,
             "_get_assembly_matcher": core._get_assembly_matcher,
-            "_load_index_model": core._load_index_model,
+            "_load_index_schema": core._load_index_schema,
             "find_persistent_CAD_file": core.find_persistent_CAD_file,
             "_generate_part_thumbnail": core._generate_part_thumbnail,
             "_build_search_grid_image": core._build_search_grid_image,
@@ -97,7 +97,8 @@ class _AssemblySearchBase(unittest.TestCase):
         }
         core._load_named_index = lambda name: vs
         core._get_assembly_matcher = lambda name, model: self.matcher
-        core._load_index_model = lambda name: "signal"
+        self.schema = {"model": "signal", "schema_version": core._INDEX_SCHEMA_VERSION}
+        core._load_index_schema = lambda name: self.schema
         core.find_persistent_CAD_file = lambda fid: pathlib.Path(self._tmp.name) / f"{fid}.stp"
         self.thumbnail_calls = []
         self.grid_calls = []
@@ -294,6 +295,21 @@ class TestValidation(_AssemblySearchBase):
     def test_non_positive_top_k_returns_one_hit(self):
         out = core.search_assembly_index("idx", self.QUERY_ID, 0)
         self.assertEqual(len(out["hits"]), 1)
+
+    def test_legacy_schema_v1_is_rejected(self):
+        # A v1 index holds one averaged vector per file, so every entry looks
+        # like a single-body part and assemblies_only would discard everything.
+        self.schema = {"model": "signal", "schema_version": 1}
+        with self.assertRaises(core.SchemaVersionError):
+            core.search_assembly_index("idx", self.QUERY_ID, 5)
+        self.assertEqual(self.matcher.calls, [])
+
+    def test_model_comes_from_the_index_schema(self):
+        self.schema = {"model": "legacy", "schema_version": core._INDEX_SCHEMA_VERSION}
+        seen = []
+        core._get_assembly_matcher = lambda name, model: (seen.append(model), self.matcher)[1]
+        core.search_assembly_index("idx", self.QUERY_ID, 5)
+        self.assertEqual(seen, ["legacy"])
 
 
 class TestIncludeImage(_AssemblySearchBase):
@@ -582,6 +598,15 @@ class TestAssemblyEndpoint(unittest.TestCase):
 
         core.search_assembly_index = _raise
         self.assertEqual(self._post().status_code, 404)
+
+    def test_legacy_schema_is_409(self):
+        def _raise(*a, **kw):
+            raise core.SchemaVersionError("Index 'idx' uses legacy schema v1")
+
+        core.search_assembly_index = _raise
+        resp = self._post()
+        self.assertEqual(resp.status_code, 409)
+        self.assertIn("legacy schema", resp.json()["detail"])
 
     def test_flags_are_forwarded(self):
         self.assertEqual(self._post("include_self=true&include_image=false&use_idf=false").status_code, 200)

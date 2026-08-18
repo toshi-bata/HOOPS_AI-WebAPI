@@ -1323,7 +1323,17 @@ def search_assembly_index(
     if not 0.0 <= bop_weight <= 1.0:
         raise ValueError(f"Invalid bop_weight {bop_weight}. Must be between 0.0 and 1.0.")
 
-    index_model = _load_index_model(name)
+    schema = _load_index_schema(name)
+    if schema["schema_version"] < _INDEX_SCHEMA_VERSION:
+        # A legacy index stores one averaged vector per file, so every entry
+        # looks like a single-body part: assemblies_only would discard the whole
+        # corpus and the search would silently return nothing useful.
+        raise SchemaVersionError(
+            f"Index '{name}' uses legacy schema v{schema['schema_version']} and "
+            f"has no per-body vectors. Rebuild it as schema v{_INDEX_SCHEMA_VERSION} "
+            f"to use assembly search."
+        )
+    index_model = schema["model"]
     lock = _get_index_lock(name)
 
     # Phase 1 (locked): resolve the cached matcher and read the metadata map.
@@ -1906,10 +1916,10 @@ class ZipFileLimitError(RuntimeError):
 
 
 class SchemaVersionError(RuntimeError):
-    """Raised when a write is attempted against a legacy (schema v1) index.
+    """Raised when a legacy (schema v1) index cannot serve the request.
 
     Mapped to HTTP 409 by the router. Legacy indexes store one averaged vector
-    per file and must be rebuilt before body-level writes are allowed.
+    per file, so body-level writes and assembly search both require a rebuild.
     """
 
 

@@ -1304,6 +1304,8 @@ def search_named_index_assembly(
         raise
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except core.SchemaVersionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (core.EnvConfigError, core.PathConfigError):
         raise
     except ValueError as exc:
