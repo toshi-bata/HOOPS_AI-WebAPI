@@ -922,6 +922,21 @@ def _get_named_searcher(name: str, model: str) -> Any:
     return searcher
 
 
+def _public_metadata(meta: Any) -> dict[str, Any]:
+    """Return a copy of *meta* without SDK-internal keys.
+
+    ``CADSearch.search_by_shape()`` decorates every hit with undocumented
+    underscore-prefixed fields (``_query_body_rep_count``,
+    ``_query_body_rep_indices``, ...). They are implementation details that may
+    change between SDK releases, so they are stripped from the public response.
+    The input dict is never mutated: hits may reference the store's own
+    metadata objects.
+    """
+    if not isinstance(meta, dict):
+        return {}
+    return {k: v for k, v in meta.items() if not str(k).startswith("_")}
+
+
 def _flatten_body_hits(results: Any, top_k: int) -> list[dict[str, Any]]:
     """Flatten ``CADSearch.search_by_shape()`` output, matching hoops_ai_native_bridge.
 
@@ -947,7 +962,7 @@ def _flatten_body_hits(results: Any, top_k: int) -> list[dict[str, Any]]:
                 {
                     "id": hid,
                     "score": round(float(getattr(h, "score", 0.0) or 0.0), 6),
-                    "metadata": getattr(h, "metadata", None) or {},
+                    "metadata": _public_metadata(getattr(h, "metadata", None)),
                 }
             )
             if len(out) >= k:
@@ -971,9 +986,14 @@ def search_index(
     file_id, cap at *top_k*) without re-sorting.
 
     *kind* is ``"any"`` (no filter), ``"part"`` or ``"assembly"``; anything else
-    raises ``ValueError``. *include_self* promotes the query itself to the front
-    with score 1.0 when it is registered in this index, without exceeding
-    *top_k*.
+    raises ``ValueError``.
+
+    ``CADSearch.search_by_shape()`` does *not* drop the query from its own
+    candidates here: records are keyed by SHA-256 while the query is passed as
+    an ``uploads/<sha256>_<name>`` path, so the ids never match. The self hit is
+    therefore removed explicitly unless *include_self* is set, in which case it
+    is promoted to the front with score 1.0 instead. Either way the result never
+    exceeds *top_k*.
 
     Returns an empty hits list (and no image_url) when the index has no entries.
     Generates a result-grid PNG in out/ and returns its relative URL as ``image_url``.
@@ -1005,23 +1025,29 @@ def search_index(
     query_path = find_persistent_CAD_file(file_id)
 
     # Phase 2 (unlocked): search_by_shape() embeds the query internally, so the
-    # embedding cannot be hoisted out of this call.
-    search_kwargs: dict[str, Any] = {"top_k": int(top_k)}
+    # embedding cannot be hoisted out of this call. Ask for one extra candidate
+    # because the query itself usually occupies a slot and is dropped below.
+    k = int(top_k) if int(top_k) > 0 else 1
+    search_kwargs: dict[str, Any] = {"top_k": k + 1}
     if kind != "any":
         search_kwargs["filters"] = {"kind": kind}
     results = searcher.search_by_shape(str(query_path), **search_kwargs)
 
-    hit_dicts = _flatten_body_hits(results, top_k)
+    hit_dicts = _flatten_body_hits(results, k + 1)
+    hit_dicts = [h for h in hit_dicts if h["id"] != file_id]
 
     if include_self and file_id in registered_ids:
-        # CADSearch drops the query from its own candidates (and a `kind` filter
-        # can exclude it entirely). Promote it to the front so clients can tag
-        # the whole displayed cluster, still respecting top_k.
-        hit_dicts = [h for h in hit_dicts if h["id"] != file_id]
+        # Put the query back at the front so clients can tag the whole displayed
+        # cluster. It was removed above, so this cannot produce a duplicate.
         hit_dicts.insert(
-            0, {"id": file_id, "score": 1.0, "metadata": self_meta or {"file_id": file_id}}
+            0,
+            {
+                "id": file_id,
+                "score": 1.0,
+                "metadata": _public_metadata(self_meta) or {"file_id": file_id},
+            },
         )
-        hit_dicts = hit_dicts[: max(1, int(top_k))]
+    hit_dicts = hit_dicts[:k]
 
     # Phase 3: thumbnail + grid generation (outside lock, non-fatal). Registered
     # queries already have a thumbnail, so skip the extra CAD load in that case.

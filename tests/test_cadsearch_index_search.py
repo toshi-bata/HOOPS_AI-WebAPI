@@ -148,7 +148,9 @@ class TestSearchIndex(unittest.TestCase):
         core.search_index("idx", self.QUERY_ID, 10, kind="any")
         _path, kwargs = self.searcher.calls[0]
         self.assertNotIn("filters", kwargs)
-        self.assertEqual(kwargs["top_k"], 10)
+        # One extra candidate is requested so that dropping the self hit does
+        # not shrink the result below top_k.
+        self.assertEqual(kwargs["top_k"], 11)
 
     def test_kind_part_passes_filters(self):
         core.search_index("idx", self.QUERY_ID, 5, kind="part")
@@ -221,6 +223,134 @@ class TestSearchIndex(unittest.TestCase):
     def test_generates_thumbnail_when_missing(self):
         core.search_index("idx", self.QUERY_ID, 5)
         self.assertEqual(self.thumbnail_calls, [self.QUERY_ID])
+
+
+class TestSelfHitAndMetadata(unittest.TestCase):
+    """include_self semantics and stripping of SDK-internal metadata keys."""
+
+    QUERY_ID = "q" * 64
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig_idx_dir = core.INDEXES_DIR
+        core.INDEXES_DIR = pathlib.Path(self._tmp.name)
+
+        # The query itself is returned by CADSearch as a perfect self match:
+        # record ids are SHA-256 while the query is an uploads/<sha>_<name>
+        # path, so the SDK cannot recognise them as the same object.
+        self.self_hit_meta = {
+            "file_id": self.QUERY_ID,
+            "filename": "1.stp",
+            "kind": "assembly",
+            "_query_body_rep_count": 1,
+            "_query_body_rep_indices": [0],
+        }
+        self.results = [
+            [
+                _vh(self.QUERY_ID, 1.0, **self.self_hit_meta),
+                _vh("a" * 64, 0.64, file_id="a" * 64, filename="100.stp",
+                    kind="assembly", _query_body_rep_count=1),
+            ],
+            [
+                _vh("b" * 64, 0.41, file_id="b" * 64, filename="10.stp",
+                    kind="assembly", _query_body_rep_indices=[0]),
+                _vh("c" * 64, 0.30, file_id="c" * 64, filename="2.stp",
+                    kind="part"),
+            ],
+        ]
+        self.searcher = _FakeSearcher(self.results)
+        self.registered = {self.QUERY_ID, "a" * 64, "b" * 64, "c" * 64}
+        self.metas = [
+            {"file_id": self.QUERY_ID, "filename": "1.stp", "kind": "assembly"},
+        ]
+
+        vs = MagicMock()
+        vs.get_ids.side_effect = lambda: list(self.registered)
+        vs.iter_metadata.side_effect = lambda: iter(self.metas)
+
+        self._saved = {
+            "_load_named_index": core._load_named_index,
+            "_get_named_searcher": core._get_named_searcher,
+            "_load_index_model": core._load_index_model,
+            "find_persistent_CAD_file": core.find_persistent_CAD_file,
+            "_generate_part_thumbnail": core._generate_part_thumbnail,
+            "_build_search_grid_image": core._build_search_grid_image,
+            "_resolve_index_asset": core._resolve_index_asset,
+        }
+        core._load_named_index = lambda name: vs
+        core._get_named_searcher = lambda name, model: self.searcher
+        core._load_index_model = lambda name: "signal"
+        core.find_persistent_CAD_file = lambda fid: pathlib.Path(self._tmp.name) / f"{fid}.stp"
+        core._generate_part_thumbnail = lambda fid, name: None
+        core._build_search_grid_image = lambda fid, hits, name: "/out/fake.png"
+        core._resolve_index_asset = lambda name, pid, asset: pathlib.Path("exists.png")
+
+    def tearDown(self):
+        for attr, val in self._saved.items():
+            setattr(core, attr, val)
+        core.INDEXES_DIR = self._orig_idx_dir
+        self._tmp.cleanup()
+
+    def test_self_hit_excluded_by_default(self):
+        out = core.search_index("idx", self.QUERY_ID, 3)
+        self.assertNotIn(self.QUERY_ID, [h["id"] for h in out["hits"]])
+
+    def test_excluding_self_still_fills_top_k(self):
+        out = core.search_index("idx", self.QUERY_ID, 3)
+        self.assertEqual(len(out["hits"]), 3)
+        self.assertEqual(
+            [h["metadata"]["filename"] for h in out["hits"]],
+            ["100.stp", "10.stp", "2.stp"],
+        )
+        # An extra candidate must be requested to compensate for the self hit.
+        self.assertEqual(self.searcher.calls[0][1]["top_k"], 4)
+
+    def test_include_self_promotes_without_duplicating(self):
+        out = core.search_index("idx", self.QUERY_ID, 3, include_self=True)
+        ids = [h["id"] for h in out["hits"]]
+        self.assertEqual(ids[0], self.QUERY_ID)
+        self.assertEqual(ids.count(self.QUERY_ID), 1)
+        self.assertEqual(out["hits"][0]["score"], 1.0)
+
+    def test_include_self_does_not_exceed_top_k(self):
+        out = core.search_index("idx", self.QUERY_ID, 3, include_self=True)
+        self.assertEqual(len(out["hits"]), 3)
+        self.assertEqual(out["count"], 3)
+
+    def test_no_underscore_keys_in_any_hit(self):
+        for include_self in (False, True):
+            out = core.search_index("idx", self.QUERY_ID, 4, include_self=include_self)
+            for hit in out["hits"]:
+                leaked = [k for k in hit["metadata"] if k.startswith("_")]
+                self.assertEqual(leaked, [], f"include_self={include_self}: {leaked}")
+
+    def test_self_hit_metadata_matches_normal_hit_shape(self):
+        out = core.search_index("idx", self.QUERY_ID, 3, include_self=True)
+        self.assertEqual(
+            set(out["hits"][0]["metadata"]),
+            {"file_id", "filename", "kind"},
+        )
+        self.assertEqual(
+            set(out["hits"][0]["metadata"]), set(out["hits"][1]["metadata"])
+        )
+
+    def test_source_metadata_is_not_mutated(self):
+        core.search_index("idx", self.QUERY_ID, 4)
+        self.assertIn("_query_body_rep_count", self.results[0][0].metadata)
+        self.assertIn("_query_body_rep_count", self.results[0][1].metadata)
+
+
+class TestPublicMetadata(unittest.TestCase):
+    def test_strips_underscore_keys_and_copies(self):
+        src = {"file_id": "x", "_internal": 1}
+        out = core._public_metadata(src)
+        self.assertEqual(out, {"file_id": "x"})
+        self.assertIsNot(out, src)
+        self.assertIn("_internal", src)
+
+    def test_non_dict_returns_empty(self):
+        self.assertEqual(core._public_metadata(None), {})
+        self.assertEqual(core._public_metadata(["a"]), {})
 
 
 class TestNamedSearcherCache(unittest.TestCase):

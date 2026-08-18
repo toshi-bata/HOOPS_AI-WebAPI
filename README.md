@@ -1092,9 +1092,14 @@ concatenated in order and de-duplicated by file so each file appears once — th
 `assembly`, default `any`) and `include_self` (default `false`).  `kind=any` passes no
 filter at all, preserving the previous behaviour for existing clients; use **`kind=part`**
 to reproduce the results of the sibling `hoops_ai_native_bridge` project, which always
-filters to parts.  `include_self=true` puts the query itself first with score `1.0` when
-it is registered in the index (useful for tagging a whole displayed cluster); the total
-still respects `top_k`.
+filters to parts.  A query that is itself registered in the index is returned by the SDK
+as a perfect self match; it is **removed by default** so that `top_k` hits are genuine
+neighbours.  `include_self=true` keeps it instead, pinned first with score `1.0` (useful
+for tagging a whole displayed cluster); the total still respects `top_k`.
+
+Hit `metadata` contains only the keys stored at registration time (`file_id`, `filename`,
+`registered_at`, `kind`, `bodies`, `thumbnail`, `scs`, `obb`).  Undocumented
+underscore-prefixed fields added by the SDK are stripped from the response.
 
 Legacy indexes created before this change are **schema v1** (one averaged vector per
 file).  They remain fully readable (search / list / stats), but **writes**
@@ -1245,7 +1250,7 @@ when the index contains zero entries (no error).
 |---|---|---|
 | `top_k` | `10` | Maximum number of hits. |
 | `kind` | `any` | Restrict hits to `part` or `assembly`. `any` passes no filter. Use `part` to match `hoops_ai_native_bridge`. Any other value is **422**. |
-| `include_self` | `false` | Put the query first with score `1.0` when it is registered in this index. Never exceeds `top_k`. |
+| `include_self` | `false` | Keep the query itself in the results when it is registered in this index, pinned first with score `1.0`. By default the self match is dropped. Never exceeds `top_k`. |
 
 **Windows (PowerShell):**
 ```powershell
