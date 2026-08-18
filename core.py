@@ -34,10 +34,26 @@ INDEXES_DIR = APP_ROOT.joinpath("indexes")
 # schema_version is recorded in indexes/<name>/index.json.
 _INDEX_SCHEMA_VERSION = 2
 
-# Allowed CAD file extensions for upload/ZIP extraction
+# Allowed CAD file extensions for upload/ZIP extraction.
+#
+# Mirrors cadNameFilters() in hoops_ai_qt_sandbox/SimilarityIndexPanel.cpp, which
+# in turn mirrors the "All Supported Files" list of HOOPS Exchange. Kept lower
+# case; every comparison lower-cases the candidate suffix first, so files saved
+# with upper-case extensions (part.SLDPRT is common with SolidWorks exports) are
+# accepted on case-sensitive filesystems too.
 CAD_ALLOWED_EXTENSIONS = frozenset({
-    ".step", ".stp", ".iges", ".igs", ".x_t", ".x_b",
-    ".sat", ".ipt", ".prt", ".sldprt", ".catpart",
+    ".3ds", ".3mf", ".3dxml", ".sat", ".sab", ".dgn",
+    ".dwg", ".dxf", ".dwf", ".dwfx", ".model", ".dlv",
+    ".exp", ".session", ".catpart", ".catproduct", ".catshape",
+    ".catdrawing", ".cgr", ".dae", ".prt", ".neu",
+    ".asm", ".xas", ".xpr", ".fbx", ".gltf", ".glb",
+    ".arc", ".unv", ".mf1", ".pkg", ".ifc", ".ifczip",
+    ".igs", ".iges", ".ipt", ".iam", ".jt", ".kmz",
+    ".nwd", ".prc", ".x_t", ".xmt", ".x_b", ".xmt_txt",
+    ".rvt", ".3dm", ".stp", ".step", ".stpz", ".stl",
+    ".par", ".pwd", ".psm", ".sldprt", ".sldasm", ".sldfpp",
+    ".u3d", ".vda", ".wrl", ".vrml", ".obj", ".xv3",
+    ".xv0", ".hsf",
 })
 MFR_LABELS_DESCRIPTION_ENV_NAMES = ("HOOPS_AI_MFR_LABELS_DESCRIPTION", "labels_description")
 
@@ -1930,6 +1946,10 @@ class ZipFileLimitError(RuntimeError):
     """Raised when a ZIP archive contains more files than the configured limit."""
 
 
+class UploadSizeLimitError(RuntimeError):
+    """Raised when a single uploaded file exceeds the configured size limit."""
+
+
 class SchemaVersionError(RuntimeError):
     """Raised when a legacy (schema v1) index cannot serve the request.
 
@@ -3064,6 +3084,31 @@ def get_MFR_table_of_contents() -> dict[str, Any]:
     return response
 
 
+def _env_int(name: str, default: int, minimum: int = 1, maximum: Optional[int] = None) -> int:
+    """Read a positive integer setting from the environment.
+
+    Read on every call so limits can be tuned without a restart. A missing,
+    malformed or out-of-range value falls back to *default* with a warning
+    rather than failing the request: an operator typo must not take the server
+    down, but it must not be silent either.
+    """
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using default %d.", name, raw, default)
+        return default
+    if value < minimum or (maximum is not None and value > maximum):
+        logger.warning(
+            "%s=%d is out of range [%s, %s]; using default %d.",
+            name, value, minimum, maximum if maximum is not None else "inf", default,
+        )
+        return default
+    return value
+
+
 def save_uploaded_CAD_file(upload_file: UploadFile) -> pathlib.Path:
     if not upload_file.filename:
         raise RuntimeError("Uploaded CAD file must have a filename.")
@@ -3077,25 +3122,118 @@ def save_uploaded_CAD_file(upload_file: UploadFile) -> pathlib.Path:
     return cad_file_path
 
 
+_UPLOAD_CHUNK_BYTES = 1024 * 1024
+_MAX_UPLOAD_BYTES_DEFAULT = 4 * 1024 * 1024 * 1024  # 4 GB
+_FILE_ID_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+_EXISTS_MAX_IDS_DEFAULT = 1000
+
+
+def _max_upload_bytes() -> int:
+    """Per-file upload cap, from HOOPS_AI_MAX_UPLOAD_BYTES."""
+    return _env_int("HOOPS_AI_MAX_UPLOAD_BYTES", _MAX_UPLOAD_BYTES_DEFAULT, minimum=1)
+
+
+def exists_max_ids() -> int:
+    """Maximum number of ids accepted by a single existence check."""
+    return _env_int("HOOPS_AI_EXISTS_MAX_IDS", _EXISTS_MAX_IDS_DEFAULT, minimum=1)
+
+
 def upload_CAD_file_persistent(upload_file: UploadFile) -> tuple[str, pathlib.Path, bool]:
     """Upload a CAD file and store it persistently using SHA-256 content hash as file_id.
 
-    Returns (file_id, path, already_existed). Uploading the same file twice is idempotent.
+    Returns (file_id, path, already_existed). Uploading the same file twice is
+    idempotent.
+
+    The body is streamed to disk in chunks and hashed as it goes, so a large
+    assembly never has to fit in memory and is read only once. The bytes land in
+    a temporary ``.part`` file that is renamed into place only after the whole
+    stream has been consumed, so an aborted upload can never leave a truncated
+    file that would later be served under a hash it does not match.
+
+    Raises ``UploadSizeLimitError`` when the body exceeds
+    HOOPS_AI_MAX_UPLOAD_BYTES, and ``RuntimeError`` when the filename is missing.
     """
     if not upload_file.filename:
         raise RuntimeError("Uploaded CAD file must have a filename.")
 
-    data = upload_file.file.read()
-    file_id = hashlib.sha256(data).hexdigest()
     safe_filename = pathlib.PurePath(upload_file.filename).name
-
     CAD_shared_dir = get_CAD_shared_dir()
     CAD_shared_dir.mkdir(parents=True, exist_ok=True)
-    dest_path = CAD_shared_dir / f"{file_id}_{safe_filename}"
-    existed = dest_path.exists()
-    if not existed:
-        dest_path.write_bytes(data)
-    return file_id, dest_path, existed
+
+    max_bytes = _max_upload_bytes()
+    digest = hashlib.sha256()
+    total = 0
+    tmp_path = CAD_shared_dir / f".upload_{uuid.uuid4().hex}.part"
+    try:
+        with tmp_path.open("wb") as handle:
+            while True:
+                chunk = upload_file.file.read(_UPLOAD_CHUNK_BYTES)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise UploadSizeLimitError(
+                        f"Uploaded file '{safe_filename}' exceeds the "
+                        f"{max_bytes // (1024 * 1024)} MB per-file limit."
+                    )
+                digest.update(chunk)
+                handle.write(chunk)
+
+        file_id = digest.hexdigest()
+        dest_path = CAD_shared_dir / f"{file_id}_{safe_filename}"
+        existed = dest_path.exists()
+        if not existed:
+            os.replace(tmp_path, dest_path)
+        return file_id, dest_path, existed
+    finally:
+        # No-op once the rename succeeded; cleans up on error or duplicate.
+        tmp_path.unlink(missing_ok=True)
+
+
+def known_persistent_CAD_file_ids() -> set[str]:
+    """Return the set of file_ids currently held in the CAD store.
+
+    Scans the directory once. Callers checking many ids must use this rather
+    than calling find_persistent_CAD_file() in a loop, which globs per id.
+    """
+    CAD_shared_dir = get_CAD_shared_dir()
+    if not CAD_shared_dir.exists():
+        return set()
+    known: set[str] = set()
+    for path in CAD_shared_dir.iterdir():
+        if not path.is_file():
+            continue
+        head, sep, _ = path.name.partition("_")
+        if sep and _FILE_ID_RE.match(head):
+            known.add(head)
+    return known
+
+
+def check_persistent_CAD_files(file_ids: list[str]) -> dict[str, list[str]]:
+    """Split *file_ids* into known / unknown / invalid, preserving input order.
+
+    Lets a client skip uploading files the server already has. Malformed ids are
+    reported separately instead of being lumped in with "unknown", so a client
+    that hashes incorrectly sees a distinct signal rather than silently
+    re-uploading everything on every run.
+    """
+    known_ids = known_persistent_CAD_file_ids()
+    known: list[str] = []
+    unknown: list[str] = []
+    invalid: list[str] = []
+    seen: set[str] = set()
+    for raw in file_ids:
+        candidate = str(raw).strip()
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if not _FILE_ID_RE.match(candidate.lower()) or candidate != candidate.lower():
+            invalid.append(candidate)
+        elif candidate in known_ids:
+            known.append(candidate)
+        else:
+            unknown.append(candidate)
+    return {"known": known, "unknown": unknown, "invalid": invalid}
 
 
 def find_persistent_CAD_file(file_id: str) -> pathlib.Path:
@@ -3143,9 +3281,23 @@ def list_persistent_CAD_files() -> list[dict[str, Any]]:
     return result
 
 
-# Limits for ZIP extraction (also used by routers)
+# Default limits for ZIP extraction (also used by routers). Both can be raised
+# for bulk registration via HOOPS_AI_ZIP_MAX_TOTAL_BYTES / HOOPS_AI_ZIP_MAX_FILES;
+# the module-level values stay as the defaults so existing callers that pass
+# nothing keep the historical behaviour.
 ZIP_MAX_TOTAL_BYTES = 500 * 1024 * 1024  # 500 MB uncompressed
 ZIP_MAX_FILES = 50
+
+
+def zip_max_total_bytes() -> int:
+    """Uncompressed-size cap for a ZIP archive, from HOOPS_AI_ZIP_MAX_TOTAL_BYTES."""
+    return _env_int("HOOPS_AI_ZIP_MAX_TOTAL_BYTES", ZIP_MAX_TOTAL_BYTES, minimum=1)
+
+
+def zip_max_files() -> int:
+    """CAD-file-count cap for a ZIP archive, from HOOPS_AI_ZIP_MAX_FILES."""
+    return _env_int("HOOPS_AI_ZIP_MAX_FILES", ZIP_MAX_FILES, minimum=1)
+
 
 
 class _BytesUploadFile:
@@ -3158,8 +3310,8 @@ class _BytesUploadFile:
 
 def extract_zip_cad_files(
     zip_data: bytes,
-    max_total_bytes: int = ZIP_MAX_TOTAL_BYTES,
-    max_files: int = ZIP_MAX_FILES,
+    max_total_bytes: Optional[int] = None,
+    max_files: Optional[int] = None,
 ) -> tuple[list[tuple[str, str]], list[dict]]:
     """Extract a ZIP archive and upload each valid CAD file persistently.
 
@@ -3173,6 +3325,11 @@ def extract_zip_cad_files(
         ZipSizeLimitError: if the total uncompressed size exceeds *max_total_bytes*.
         ZipFileLimitError: if the number of CAD files exceeds *max_files*.
     """
+    if max_total_bytes is None:
+        max_total_bytes = zip_max_total_bytes()
+    if max_files is None:
+        max_files = zip_max_files()
+
     resolved: list[tuple[str, str]] = []
     errors: list[dict] = []
 
