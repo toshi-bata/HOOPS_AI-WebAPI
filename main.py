@@ -1,5 +1,7 @@
 from contextlib import asynccontextmanager
+import logging
 import mimetypes
+import os
 import pathlib
 
 mimetypes.init()
@@ -10,6 +12,29 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from routers import brep, cad, context_layer, files, mfr, part_classification, similarity
+
+
+def _configure_logging() -> None:
+    """Give the application's own loggers a handler and a level.
+
+    uvicorn only configures its own ``uvicorn.*`` loggers, so without this the
+    root logger keeps its WARNING default and every ``logger.info()`` in core
+    and the routers is silently dropped -- including the diagnostics that report
+    how long expensive one-off work took. ``force=True`` so we win even when an
+    embedded runner (or a library import) has already installed a root handler.
+    """
+    core.load_env_file()
+    level = os.environ.get("HOOPS_AI_LOG_LEVEL", "INFO").strip().upper()
+    if not isinstance(logging.getLevelName(level), int):
+        level = "INFO"
+    logging.basicConfig(
+        level=level,
+        format="%(levelname)s:%(name)s:%(message)s",
+        force=True,
+    )
+
+
+_configure_logging()
 
 
 @asynccontextmanager

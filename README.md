@@ -110,6 +110,7 @@ cp .env.example .env
 | `HOOPS_AI_PART_CLASS_LABEL_KEY` | optional | Label array key for dataset queries (default: `part_label`; use `task_A` for custom ETL) |
 | `HOOPS_AI_ENABLE_DEMO_FEATURES` | optional | Set to `true` to expose the demo-only endpoints listed below. Defaults to `false` (disabled) so a public deployment never serves them by accident. |
 | `HOOPS_AI_ASSEMBLY_SEARCH_JOBS` | optional | Thread-pool size for assembly-to-assembly scoring (`POST /similarity/index/{name}/search-assembly`). Defaults to `8`, matching `hoops_ai_native_bridge`. Lower it when assembly searches starve the server's request workers. |
+| `HOOPS_AI_LOG_LEVEL` | optional | Root log level applied at startup (`DEBUG`, `INFO`, `WARNING`, ...). Defaults to `INFO`; an unrecognised value falls back to `INFO`. uvicorn configures only its own loggers, so without this the application's `logger.info()` diagnostics — such as the assembly matcher build time — are dropped. |
 
 > **Note:** `HOOPS_AI_LICENSE` is read **only** from the `.env` file, not from system environment variables.
 
@@ -1343,12 +1344,18 @@ ranking explainable:
 
 **Cost.**  The first request against an index builds an `AssemblyMatcher`,
 which runs a FAISS k-means over *every* body vector in the corpus to derive the
-rarity weights.  The instance is cached by (index path, mtime) — a single entry,
-because it holds a normalised copy of the whole corpus — and is rebuilt
-automatically after any write to the index.  The build time is logged as
-`[ASSEMBLY] built matcher for index '<name>' in <n>s`.  Stage-2 scoring runs on
-a thread pool sized by `HOOPS_AI_ASSEMBLY_SEARCH_JOBS` (default `8`); lower it
-if assembly searches starve the server's request workers.
+rarity weights.  Measured at **19.3 s** for 42,098 bodies clustered into 4,096
+centroids (`k = min(max(64, N/8), 4096)`); the build time is logged as
+`[ASSEMBLY] built matcher for index '<name>' in <n>s`.  The instance is cached
+by (index path, mtime) — a single entry, because it holds a normalised copy of
+the whole corpus — and is rebuilt automatically after any write to the index.
+
+That cost is paid by whichever request arrives first after a restart or an
+index write, so **the first assembly search on a large index takes ~20 s while
+later ones take well under a second**.  Warm it deliberately after indexing if
+that latency is user-visible.  Stage-2 scoring runs on a thread pool sized by
+`HOOPS_AI_ASSEMBLY_SEARCH_JOBS` (default `8`); lower it if assembly searches
+starve the server's request workers.
 
 **Registered queries skip re-embedding.**  A query that is already in the index
 is handed to the matcher by its record id (the `file_id`) rather than by path,
