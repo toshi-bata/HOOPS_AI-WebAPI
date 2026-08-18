@@ -110,6 +110,7 @@ cp .env.example .env
 | `HOOPS_AI_PART_CLASS_LABEL_KEY` | optional | Label array key for dataset queries (default: `part_label`; use `task_A` for custom ETL) |
 | `HOOPS_AI_ENABLE_DEMO_FEATURES` | optional | Set to `true` to expose the demo-only endpoints listed below. Defaults to `false` (disabled) so a public deployment never serves them by accident. |
 | `HOOPS_AI_ASSEMBLY_SEARCH_JOBS` | optional | Thread-pool size for assembly-to-assembly scoring (`POST /similarity/index/{name}/search-assembly`). Defaults to `8`, matching `hoops_ai_native_bridge`. Lower it when assembly searches starve the server's request workers. |
+| `HOOPS_AI_LOG_LEVEL` | optional | Root log level applied at startup (`DEBUG`, `INFO`, `WARNING`, ...). Defaults to `INFO`; an unrecognised value falls back to `INFO`. uvicorn configures only its own loggers, so without this the application's `logger.info()` diagnostics — such as the assembly matcher build time — are dropped. |
 
 > **Note:** `HOOPS_AI_LICENSE` is read **only** from the `.env` file, not from system environment variables.
 
