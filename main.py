@@ -39,14 +39,14 @@ _configure_logging()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    import shutil
+    # Process-local caches only. The on-disk directories are NOT wiped here:
+    # uploads/ is the CAD store backing every registered index, and deleting
+    # out/ or embeddings_cache/ would also clobber a second instance running
+    # on another port. Transient directories are TTL-swept instead.
     core._embedding_memory_cache.clear()
     core.CAD_viewers.clear()
     core.CAD_face_colors.clear()
-    for folder in (core.CAD_UPLOAD_DIR, core.CAD_VIEWER_OUTPUT_DIR, core.EMBEDDINGS_CACHE_DIR):
-        if folder.exists():
-            shutil.rmtree(folder, ignore_errors=True)
-        folder.mkdir(parents=True, exist_ok=True)
+    core.run_startup_maintenance()
     core.init_hoops_license()
     yield
     if core.MFR_dataset_explorer is not None and hasattr(core.MFR_dataset_explorer, "close"):
