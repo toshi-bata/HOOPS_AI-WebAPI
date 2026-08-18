@@ -12,6 +12,7 @@ import tempfile
 import threading
 import uuid
 import zipfile
+from collections import OrderedDict
 from contextlib import redirect_stdout
 from typing import Any, Optional
 
@@ -137,7 +138,19 @@ _RESERVED_INDEX_NAMES = frozenset({"default"})
 # name -> FaissVectorStore (in-memory cache, updated on every write)
 _named_indexes: dict[str, Any] = {}
 
-# per-index write lock; also held during searches to prevent torn reads
+# Cache of CADSearch instances for named indexes, keyed by (faiss path, mtime_ns).
+# The mtime is part of the key so a rebuilt index is picked up automatically on
+# the next request. Each instance loads the whole index into its own memory, so
+# the cache is deliberately tiny; two entries let one index be searched while a
+# second one is in use, without holding several copies of large indexes.
+_NAMED_SEARCHER_CACHE_MAX = 2
+_named_searchers: "OrderedDict[tuple[str, int], Any]" = OrderedDict()
+
+# Accepted values for the named-index search `kind` filter. "any" means no
+# filter is passed to CADSearch at all (preserves pre-filter behaviour).
+_SEARCH_KINDS = frozenset({"any", "part", "assembly"})
+
+# per-index write lock; also held while resolving the cached searcher
 _index_locks: dict[str, threading.Lock] = {}
 _index_locks_mutex = threading.Lock()
 
@@ -330,6 +343,9 @@ def list_indexes() -> list[dict[str, Any]]:
     return result
 
 
+_EMBED_ERROR_DEFAULT = "embedding produced no rows (file skipped by embed_shape_batch)"
+
+
 def _embed_error_detail(
     embed_errors: Any,
     fid: str,
@@ -347,7 +363,7 @@ def _embed_error_detail(
     named ``0.stp`` never picks up the error belonging to ``100.stp``. Matched
     messages are returned verbatim -- they are short and already name the file.
     """
-    default = "embedding produced no rows (file skipped by embed_shape_batch)"
+    default = _EMBED_ERROR_DEFAULT
 
     def _norm(p: str) -> str:
         try:
@@ -524,16 +540,48 @@ def _embed_bodies_for_index(
             except Exception:
                 pass
 
+        # A later phase routes retries on the reason text (e.g. "Timeout"), so a
+        # silent fallback to the generic message must never go unnoticed. Warn
+        # at most once per batch when the metadata stops matching the observed
+        # contract (list[str] as of hoops_ai 1.1.0).
+        if embed_errors is not None and not isinstance(embed_errors, list):
+            logger.warning(
+                "index '%s': batch metadata['errors'] has unexpected type %s "
+                "(expected list[str]); embedding failure reasons may be unreliable",
+                index_name,
+                type(embed_errors).__name__,
+            )
+
         submitted_fids = set(fid_by_norm_path.values())
-        for fid in file_ids:
-            if fid in submitted_fids and fid not in rows_by_fid:
-                detail = _embed_error_detail(
-                    embed_errors,
-                    fid,
-                    filename_by_fid.get(fid, ""),
-                    norm_by_fid.get(fid, ""),
-                )
-                errors.append({"file_id": fid, "detail": detail})
+        missing_fids = [
+            fid for fid in file_ids if fid in submitted_fids and fid not in rows_by_fid
+        ]
+        matched_any_reason = False
+        for fid in missing_fids:
+            detail = _embed_error_detail(
+                embed_errors,
+                fid,
+                filename_by_fid.get(fid, ""),
+                norm_by_fid.get(fid, ""),
+            )
+            if detail != _EMBED_ERROR_DEFAULT:
+                matched_any_reason = True
+            errors.append({"file_id": fid, "detail": detail})
+
+        if (
+            missing_fids
+            and isinstance(embed_errors, list)
+            and embed_errors
+            and not matched_any_reason
+        ):
+            logger.warning(
+                "index '%s': %d file(s) produced no rows but none matched any of "
+                "the %d entries in batch metadata['errors']; its format may have "
+                "changed and embedding failure reasons may be unreliable",
+                index_name,
+                len(missing_fids),
+                len(embed_errors),
+            )
 
         failed_count = meta.get("failed_count") if hasattr(meta, "get") else None
         logger.info(
@@ -808,42 +856,177 @@ def remove_from_index(name: str, part_ids: list[str]) -> dict[str, Any]:
     return {"name": name, "removed": len(part_ids), "index_count": len(vs.get_ids())}
 
 
-def search_index(name: str, file_id: str, top_k: int) -> dict[str, Any]:
+def _load_shape_index_pickle_compat(searcher: Any, faiss_index_path: pathlib.Path) -> Any:
+    """Call ``searcher.load_shape_index()`` with cross-OS pickle compatibility.
+
+    Index sidecars pickled on Windows contain WindowsPath objects (and vice
+    versa), which fail to unpickle on the other platform. Temporarily aliasing
+    the path classes lets the same index file be read anywhere.
+    """
+    if not hasattr(pathlib, "WindowsPath") or not issubclass(pathlib.WindowsPath, pathlib.Path):
+        pathlib.WindowsPath = pathlib.PurePosixPath  # type: ignore[attr-defined]
+        return searcher.load_shape_index(path=str(faiss_index_path))
+    _orig = pathlib.PosixPath
+    try:
+        pathlib.PosixPath = pathlib.WindowsPath  # type: ignore[misc]
+        return searcher.load_shape_index(path=str(faiss_index_path))
+    finally:
+        pathlib.PosixPath = _orig
+
+
+def _evict_named_searchers(name: str) -> None:
+    """Drop every cached CADSearch instance belonging to *name*."""
+    path_key = str(_index_faiss_path(name))
+    for stale in [k for k in _named_searchers if k[0] == path_key]:
+        _named_searchers.pop(stale, None)
+
+
+def _get_named_searcher(name: str, model: str) -> Any:
+    """Return a CADSearch instance with the named index loaded, from cache.
+
+    Creating a CADSearch and calling ``load_shape_index()`` is expensive, so
+    instances are cached by (faiss path, mtime). A write to the index changes
+    the mtime, which invalidates the entry automatically.
+
+    Must be called while holding the per-index lock. The returned instance is
+    safe to use *outside* the lock: ``load_shape_index()`` reads the index into
+    the instance's own memory, so a concurrent ``_save_named_index_atomic()``
+    replacing the file on disk cannot corrupt an already-loaded searcher.
+
+    Raises ``KeyError`` when the index does not exist.
+    """
+    faiss_path = _index_faiss_path(name)
+    if not faiss_path.exists():
+        raise KeyError(f"Index '{name}' does not exist.")
+
+    path_key = str(faiss_path)
+    key = (path_key, faiss_path.stat().st_mtime_ns)
+    cached = _named_searchers.get(key)
+    if cached is not None:
+        _named_searchers.move_to_end(key)
+        return cached
+
+    try:
+        from hoops_ai.ml.embeddings import CADSearch
+    except ImportError:  # older/newer layouts re-export it one level up
+        from hoops_ai.ml import CADSearch
+
+    searcher = CADSearch(shape_model=get_embedder(model))
+    _load_shape_index_pickle_compat(searcher, faiss_path)
+
+    # Drop the previous generation of this index before inserting the new one.
+    _evict_named_searchers(name)
+    _named_searchers[key] = searcher
+    while len(_named_searchers) > _NAMED_SEARCHER_CACHE_MAX:
+        _named_searchers.popitem(last=False)
+    return searcher
+
+
+def _flatten_body_hits(results: Any, top_k: int) -> list[dict[str, Any]]:
+    """Flatten ``CADSearch.search_by_shape()`` output, matching hoops_ai_native_bridge.
+
+    *results* is ``List[List[VectorHit]]``: one already-ranked list per unique
+    query body. Body lists are concatenated in order, de-duplicated by hit id,
+    and capped at *top_k*.
+
+    Scores are deliberately **not** re-sorted. The per-body ranking produced by
+    CADSearch (embedding score blended with the geometric reranker) is
+    authoritative, and re-sorting on the raw score would diverge from the
+    bridge implementation.
+    """
+    k = int(top_k) if int(top_k) > 0 else 1
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for body_hits in results or []:
+        for h in body_hits or []:
+            hid = str(getattr(h, "id", "") or "")
+            if not hid or hid in seen:
+                continue
+            seen.add(hid)
+            out.append(
+                {
+                    "id": hid,
+                    "score": round(float(getattr(h, "score", 0.0) or 0.0), 6),
+                    "metadata": getattr(h, "metadata", None) or {},
+                }
+            )
+            if len(out) >= k:
+                return out
+    return out
+
+
+def search_index(
+    name: str,
+    file_id: str,
+    top_k: int,
+    kind: str = "any",
+    include_self: bool = False,
+) -> dict[str, Any]:
     """Search the named index for the top-k most similar parts to *file_id*.
 
-    The query embedding is computed using the same model that was selected when
-    the index was created (recorded in ``index.json``).
+    Runs through ``CADSearch.search_by_shape()`` so that queries are handled at
+    body granularity and benefit from the geometric reranker, matching both the
+    preset search and hoops_ai_native_bridge. Results are flattened with
+    :func:`_flatten_body_hits` (concatenate per-body rankings, de-duplicate by
+    file_id, cap at *top_k*) without re-sorting.
 
-    Body-level indexes store multiple rows per file_id, so the raw query is
-    over-fetched and collapsed to one hit per file_id (best score) before being
-    truncated to *top_k*. The response schema is unchanged.
+    *kind* is ``"any"`` (no filter), ``"part"`` or ``"assembly"``; anything else
+    raises ``ValueError``. *include_self* promotes the query itself to the front
+    with score 1.0 when it is registered in this index, without exceeding
+    *top_k*.
 
     Returns an empty hits list (and no image_url) when the index has no entries.
     Generates a result-grid PNG in out/ and returns its relative URL as ``image_url``.
     """
     _validate_index_name(name)
+    if kind not in _SEARCH_KINDS:
+        raise ValueError(
+            f"Invalid kind '{kind}'. Must be one of: {sorted(_SEARCH_KINDS)}."
+        )
     index_model = _load_index_model(name)
     lock = _get_index_lock(name)
 
-    # Over-fetch so that, after per-file dedup, at least top_k distinct files remain.
-    over_k = max(top_k * 8, 50)
-
-    # Phase 1: vector store operations (locked)
+    # Phase 1 (locked): resolve the cached searcher only. The expensive part --
+    # embedding the query and searching -- runs unlocked below so that indexing
+    # a batch no longer blocks every search against the same index.
     with lock:
         vs = _load_named_index(name)
-        if len(vs.get_ids()) == 0:
+        registered_ids = set(vs.get_ids())
+        if not registered_ids:
             return {"hits": [], "count": 0, "image_url": None}
-        emb_result = compute_embedding(file_id, model=index_model)
-        raw_hits = vs.query(emb_result["vector"], top_k=over_k)
+        self_meta: Optional[dict[str, Any]] = None
+        if include_self and file_id in registered_ids:
+            for meta in vs.iter_metadata():
+                if meta.get("file_id") == file_id:
+                    self_meta = dict(meta)
+                    break
+        searcher = _get_named_searcher(name, index_model)
 
-    deduped = _dedup_hits_by_file(raw_hits, top_k)
-    hit_dicts = [
-        {"id": h.id, "score": round(float(h.score), 6), "metadata": h.metadata}
-        for h in deduped
-    ]
+    query_path = find_persistent_CAD_file(file_id)
 
-    # Phase 2: thumbnail + grid generation (outside lock, non-fatal)
-    _generate_part_thumbnail(file_id, name)
+    # Phase 2 (unlocked): search_by_shape() embeds the query internally, so the
+    # embedding cannot be hoisted out of this call.
+    search_kwargs: dict[str, Any] = {"top_k": int(top_k)}
+    if kind != "any":
+        search_kwargs["filters"] = {"kind": kind}
+    results = searcher.search_by_shape(str(query_path), **search_kwargs)
+
+    hit_dicts = _flatten_body_hits(results, top_k)
+
+    if include_self and file_id in registered_ids:
+        # CADSearch drops the query from its own candidates (and a `kind` filter
+        # can exclude it entirely). Promote it to the front so clients can tag
+        # the whole displayed cluster, still respecting top_k.
+        hit_dicts = [h for h in hit_dicts if h["id"] != file_id]
+        hit_dicts.insert(
+            0, {"id": file_id, "score": 1.0, "metadata": self_meta or {"file_id": file_id}}
+        )
+        hit_dicts = hit_dicts[: max(1, int(top_k))]
+
+    # Phase 3: thumbnail + grid generation (outside lock, non-fatal). Registered
+    # queries already have a thumbnail, so skip the extra CAD load in that case.
+    if _resolve_index_asset(name, file_id, "thumbnail") is None:
+        _generate_part_thumbnail(file_id, name)
     image_url = _build_search_grid_image(file_id, hit_dicts, name) if hit_dicts else None
 
     return {"hits": hit_dicts, "count": len(hit_dicts), "image_url": image_url}
@@ -975,6 +1158,8 @@ def delete_index(name: str) -> dict[str, Any]:
         if not faiss_file.exists():
             raise KeyError(f"Index '{name}' does not exist.")
         _named_indexes.pop(name, None)
+        # Drop cached searchers so a deleted index stops holding memory.
+        _evict_named_searchers(name)
 
     # Remove the entire index directory (faiss + meta + thumbnails)
     index_dir = INDEXES_DIR / name
@@ -1073,25 +1258,6 @@ def _obb_meta_value(value: Any) -> Optional[str]:
     if len(serialized.encode("utf-8")) > 512:
         return None
     return serialized
-
-
-def _dedup_hits_by_file(hits: list, top_k: int) -> list:
-    """Collapse body-level hits to one entry per file_id, keeping the best score.
-
-    *hits* is an iterable of objects exposing ``.id`` and ``.score``. The best
-    (highest) score per id is kept; the result is sorted by score descending and
-    truncated to *top_k* entries.
-    """
-    best: dict[str, Any] = {}
-    for h in hits:
-        hid = getattr(h, "id", None)
-        if hid is None:
-            continue
-        score = float(getattr(h, "score", 0.0))
-        if hid not in best or score > float(getattr(best[hid], "score", 0.0)):
-            best[hid] = h
-    ranked = sorted(best.values(), key=lambda h: float(getattr(h, "score", 0.0)), reverse=True)
-    return ranked[: max(0, int(top_k))]
 
 
 def _resolve_index_asset(name: str, part_id: str, asset: str) -> Optional[pathlib.Path]:
@@ -1691,19 +1857,8 @@ def create_cad_searcher_for(preset: str):
 def load_shape_index_for(preset: str):
     """Load the FAISS index for *preset* into its CADSearch searcher."""
     paths = _resolve_default_index_paths(preset)
-    faiss_index_path = paths["faiss_path"]
     searcher = get_cad_searcher_for(preset)
-    # Cross-OS pickle compatibility: Windows-pickled files contain WindowsPath objects.
-    if not hasattr(pathlib, "WindowsPath") or not issubclass(pathlib.WindowsPath, pathlib.Path):
-        pathlib.WindowsPath = pathlib.PurePosixPath  # type: ignore[attr-defined]
-        return searcher.load_shape_index(path=str(faiss_index_path))
-    else:
-        _orig = pathlib.PosixPath
-        try:
-            pathlib.PosixPath = pathlib.WindowsPath  # type: ignore[misc]
-            return searcher.load_shape_index(path=str(faiss_index_path))
-        finally:
-            pathlib.PosixPath = _orig
+    return _load_shape_index_pickle_compat(searcher, paths["faiss_path"])
 
 
 def search_by_shape(cad_file_path: pathlib.Path, top_k: int = 10) -> dict[str, Any]:
