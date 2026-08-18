@@ -115,6 +115,9 @@ cp .env.example .env
 | `HOOPS_AI_EXISTS_MAX_IDS` | optional | Maximum ids per `POST /files/exists` request (default `1000`). Exceeding it returns **422**. |
 | `HOOPS_AI_ZIP_MAX_TOTAL_BYTES` | optional | Uncompressed-size cap for a ZIP archive (default `524288000`, i.e. 500 MB). |
 | `HOOPS_AI_ZIP_MAX_FILES` | optional | CAD-file-count cap for a ZIP archive (default `50`). |
+| `HOOPS_AI_CAD_SHARED_DIR` | optional | Location of the **CAD store** (default: `uploads/`). This directory holds the only copy of the payload behind every registered index and is never cleared by the server. |
+| `HOOPS_AI_OUT_TTL_HOURS` | optional | Age at which files under `out/` (viewer streams, result images, shape maps) are swept at startup (default `24`). `0` disables the sweep. |
+| `HOOPS_AI_EMBEDDINGS_CACHE_TTL_DAYS` | optional | Age at which cached embeddings under `embeddings_cache/` are swept at startup (default `0`, i.e. keep forever). Recomputing one entry costs a full CAD load. |
 
 > **Note:** `HOOPS_AI_LICENSE` is read **only** from the `.env` file, not from system environment variables.
 
@@ -377,7 +380,11 @@ curl -X POST "http://127.0.0.1:8000/CAD/viewer" -F "file=@/path/to/model.stp"
 
 Open the returned `viewer_url` in your browser to view the model. `image_url` is a PNG preview of the model.
 
-> **Note:** The `out/` and `uploads/` folders are automatically cleared on server startup.
+> **Note:** `uploads/` is the persistent CAD store and is **never** cleared —
+> index records hold only the SHA-256 `file_id`, so deleting it would destroy the
+> payload of every registered index. `out/` is transient: files older than
+> `HOOPS_AI_OUT_TTL_HOURS` (default 24 h) are swept at startup, so a `image_url`
+> or `viewer_url` handed out earlier is not guaranteed to stay valid forever.
 
 #### Launch viewer  EShared folder path
 

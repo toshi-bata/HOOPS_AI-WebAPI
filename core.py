@@ -2147,6 +2147,15 @@ def get_MFR_face_labels(feature_name: str) -> int:
 
 
 def get_CAD_shared_dir() -> pathlib.Path:
+    """Return the CAD store: the single permanent home of every uploaded file.
+
+    Index records carry only the SHA-256 file_id, so this directory holds the
+    only copy of the CAD payload behind every registered index. It ranks with
+    ``indexes/`` as permanent data and is never cleared by the server.
+    ``CAD_UPLOAD_DIR`` is merely the default location; HOOPS_AI_CAD_SHARED_DIR
+    overrides it. Every reader and writer must go through this function so the
+    configured location and the location actually used can never diverge.
+    """
     value = os.environ.get("HOOPS_AI_CAD_SHARED_DIR") or read_env_file().get(
         "HOOPS_AI_CAD_SHARED_DIR"
     )
@@ -3279,6 +3288,114 @@ def list_persistent_CAD_files() -> list[dict[str, Any]]:
                 }
             )
     return result
+
+
+# --- Runtime directory lifecycle --------------------------------------------
+#
+# The CAD store (``uploads/``, or HOOPS_AI_CAD_SHARED_DIR when set) holds the
+# only copy of every file registered in an index: index records store the
+# SHA-256 file_id, never the bytes. It is therefore a permanent data directory
+# on the same footing as ``indexes/`` and is never swept here.
+#
+# ``out/`` is the opposite: throw-away viewer artefacts (SCS streams, result
+# images, shape maps) served over ``/out/`` and referenced only by URLs handed
+# to a client moments earlier. It grows without bound, so it gets a TTL sweep.
+# ``embeddings_cache/`` is a cache, but recomputing one entry costs a full CAD
+# load, so it is kept indefinitely unless an operator opts into a TTL.
+#
+# Nothing is wiped at startup any more. The previous rmtree destroyed the CAD
+# store -- taking the payload of every registered index with it -- and, when a
+# second instance was started on another port, deleted the working files of the
+# instance already running.
+
+_OUT_TTL_HOURS_DEFAULT = 24
+_EMBEDDINGS_CACHE_TTL_DAYS_DEFAULT = 0  # 0 = keep forever
+
+
+def viewer_output_ttl_seconds() -> int:
+    """TTL for ``out/``, from HOOPS_AI_OUT_TTL_HOURS. 0 disables the sweep."""
+    return _env_int("HOOPS_AI_OUT_TTL_HOURS", _OUT_TTL_HOURS_DEFAULT, minimum=0) * 3600
+
+
+def embeddings_cache_ttl_seconds() -> int:
+    """TTL for ``embeddings_cache/``, from HOOPS_AI_EMBEDDINGS_CACHE_TTL_DAYS.
+
+    0 (the default) disables the sweep.
+    """
+    return _env_int(
+        "HOOPS_AI_EMBEDDINGS_CACHE_TTL_DAYS",
+        _EMBEDDINGS_CACHE_TTL_DAYS_DEFAULT,
+        minimum=0,
+    ) * 86400
+
+
+def sweep_directory(
+    directory: pathlib.Path,
+    max_age_seconds: int,
+    now: Optional[float] = None,
+) -> dict[str, int]:
+    """Delete files under *directory* whose mtime is older than *max_age_seconds*.
+
+    Returns ``{"removed": n, "kept": n, "failed": n}``. A *max_age_seconds* of 0
+    or less disables the sweep and reports zeroes. Individual failures are
+    logged and counted but never raised: a file another request is still
+    streaming must not be able to take startup down.
+    """
+    stats = {"removed": 0, "kept": 0, "failed": 0}
+    if max_age_seconds <= 0 or not directory.exists():
+        return stats
+
+    cutoff = (time.time() if now is None else now) - max_age_seconds
+    for path in directory.rglob("*"):
+        try:
+            if not path.is_file():
+                continue
+            if path.stat().st_mtime >= cutoff:
+                stats["kept"] += 1
+                continue
+            path.unlink()
+            stats["removed"] += 1
+        except OSError as exc:
+            stats["failed"] += 1
+            logger.warning("Failed to sweep %s: %s", path, exc)
+
+    # Drop directories the sweep emptied, deepest first. Best effort only.
+    for path in sorted(directory.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+        try:
+            if path.is_dir() and not any(path.iterdir()):
+                path.rmdir()
+        except OSError:
+            pass
+    return stats
+
+
+def ensure_runtime_dirs() -> None:
+    """Create the directories the server writes to, without deleting anything."""
+    for folder in (
+        get_CAD_shared_dir(),
+        CAD_VIEWER_OUTPUT_DIR,
+        EMBEDDINGS_CACHE_DIR,
+        INDEXES_DIR,
+    ):
+        folder.mkdir(parents=True, exist_ok=True)
+
+
+def run_startup_maintenance() -> dict[str, dict[str, int]]:
+    """Create runtime directories and TTL-sweep the transient ones."""
+    ensure_runtime_dirs()
+    results = {
+        "out": sweep_directory(CAD_VIEWER_OUTPUT_DIR, viewer_output_ttl_seconds()),
+        "embeddings_cache": sweep_directory(
+            EMBEDDINGS_CACHE_DIR, embeddings_cache_ttl_seconds()
+        ),
+    }
+    for label, stats in results.items():
+        if stats["removed"] or stats["failed"]:
+            logger.info(
+                "[GC] %s: removed %d, kept %d, failed %d",
+                label, stats["removed"], stats["kept"], stats["failed"],
+            )
+    return results
 
 
 # Default limits for ZIP extraction (also used by routers). Both can be raised
