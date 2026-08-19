@@ -338,17 +338,23 @@ class TestRunIndexAddJob(unittest.TestCase):
         self._orig = core.add_to_index
         self._orig_store = core.get_index_job_store
         self._orig_heavy = core.read_too_heavy_files
+        self._orig_prewarm = core.prewarm_assembly_matcher
         self._tmp = tempfile.TemporaryDirectory()
         core.get_index_job_store = lambda: _FakeStore(self._tmp.name)
         # The SDK's side-effect log lands next to the job; never read the
         # developer's leftovers from the working directory.
         core.read_too_heavy_files = lambda *a, **k: []
+        self.prewarmed = []
+        core.prewarm_assembly_matcher = lambda name: (
+            self.prewarmed.append(name) or True
+        )
         self.calls = []
 
     def tearDown(self):
         core.add_to_index = self._orig
         core.get_index_job_store = self._orig_store
         core.read_too_heavy_files = self._orig_heavy
+        core.prewarm_assembly_matcher = self._orig_prewarm
         self._tmp.cleanup()
 
     def _fake(self, errors_for=(), detail="boom", progress=()):
@@ -556,6 +562,51 @@ class TestLiveProgress(TestRunIndexAddJob):
         ctx = _FakeCtx()
         core.run_index_add_job(ctx, "idx", ["0", "1"])
         self.assertEqual(ctx.total, 2)
+
+
+class TestMatcherPrewarm(TestRunIndexAddJob):
+    """A finished job hands the assembly matcher rebuild to the background.
+
+    The job writes the index, which invalidates the cached matcher; rebuilding
+    it costs a k-means over every body vector, and on a shared server that cost
+    would land on whoever searches next rather than on whoever indexed.
+    """
+
+    def test_a_successful_job_asks_for_a_rebuild(self):
+        self._fake()
+        core.run_index_add_job(_FakeCtx(), "idx", ["0", "1"])
+        self.assertEqual(self.prewarmed, ["idx"])
+
+    def test_it_runs_after_the_job_is_marked_done(self):
+        # The rebuild must not delay the job's own completion.
+        seen = []
+        self._fake()
+        core.prewarm_assembly_matcher = lambda name: seen.append(list(ctx.phases))
+        ctx = _FakeCtx()
+        core.run_index_add_job(ctx, "idx", ["0"])
+        self.assertEqual(seen[0][-1], "done")
+
+    def test_a_job_that_changed_nothing_asks_for_no_rebuild(self):
+        # Every file failed, so the index is untouched and the cached matcher
+        # is still valid.
+        self._fake(errors_for={"0", "1"})
+        core.run_index_add_job(_FakeCtx(), "idx", ["0", "1"])
+        self.assertEqual(self.prewarmed, [])
+
+    def test_empty_input_asks_for_no_rebuild(self):
+        self._fake()
+        core.run_index_add_job(_FakeCtx(), "idx", [])
+        self.assertEqual(self.prewarmed, [])
+
+    def test_a_prewarm_failure_does_not_fail_the_job(self):
+        self._fake()
+        core.prewarm_assembly_matcher = lambda name: (_ for _ in ()).throw(
+            RuntimeError("boom")
+        )
+        ctx = _FakeCtx()
+        core.run_index_add_job(ctx, "idx", ["0"])
+        self.assertEqual(ctx.summary["added"], 1)
+        self.assertEqual(ctx.phases[-1], "done")
 
 
 class TestFailureClassification(unittest.TestCase):

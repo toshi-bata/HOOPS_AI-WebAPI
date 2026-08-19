@@ -175,6 +175,56 @@ class TestBridgeArguments(_AssemblySearchBase):
         self.assertEqual(self.matcher.calls[0]["n_jobs"], 3)
 
 
+class TestSearchLocking(_AssemblySearchBase):
+    """Neither resolving the matcher nor matching may hold the index lock.
+
+    Building a matcher takes ~20 s, so a cold assembly search holding the index
+    lock across it would stall part search on the same index. The lock is for
+    the metadata read only.
+    """
+
+    def _index_lock_is_free(self):
+        lock = core._get_index_lock("idx")
+        free = lock.acquire(blocking=False)
+        if free:
+            lock.release()
+        return free
+
+    def test_matcher_is_resolved_outside_the_index_lock(self):
+        seen = []
+        core._get_assembly_matcher = lambda name, model: (
+            seen.append(self._index_lock_is_free()) or self.matcher
+        )
+        core.search_assembly_index("idx", self.QUERY_ID, 5)
+        self.assertEqual(seen, [True])
+
+    def test_matching_runs_outside_the_index_lock(self):
+        seen = []
+        real_search = self.matcher.search
+
+        def search(**kwargs):
+            seen.append(self._index_lock_is_free())
+            return real_search(**kwargs)
+
+        self.matcher.search = search
+        core.search_assembly_index("idx", self.QUERY_ID, 5)
+        self.assertEqual(seen, [True])
+
+    def test_the_metadata_read_is_still_locked(self):
+        seen = []
+        vs = MagicMock()
+        vs.get_ids.side_effect = lambda: list(self.registered)
+
+        def iter_metadata():
+            seen.append(self._index_lock_is_free())
+            return iter(self.metas)
+
+        vs.iter_metadata.side_effect = iter_metadata
+        core._load_named_index = lambda name: vs
+        core.search_assembly_index("idx", self.QUERY_ID, 5)
+        self.assertEqual(seen, [False])
+
+
 class TestQueryIdentity(_AssemblySearchBase):
     """A registered query must reach the matcher as its record id so that
     reuse_index_vectors=True can hit the stored per-body vectors."""
@@ -438,9 +488,8 @@ class TestAssemblySearchJobs(unittest.TestCase):
             self.assertEqual(core._assembly_search_jobs(), 8, bad)
 
 
-class TestAssemblyMatcherCache(unittest.TestCase):
-    """The matcher is expensive (FAISS k-means over every body), so it is
-    cached by (faiss path, mtime) and only one instance is kept."""
+class _MatcherCacheBase(unittest.TestCase):
+    """Fakes for CADSearch / AssemblyMatcher plus a scratch INDEXES_DIR."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -515,6 +564,11 @@ class TestAssemblyMatcherCache(unittest.TestCase):
         (d / "index.faiss").write_bytes(b"faiss")
         return d / "index.faiss"
 
+
+class TestAssemblyMatcherCache(_MatcherCacheBase):
+    """The matcher is expensive (FAISS k-means over every body), so it is
+    cached by (faiss path, mtime) and only one instance is kept."""
+
     def test_missing_index_raises_key_error(self):
         with self.assertRaises(KeyError):
             core._get_assembly_matcher("nope", "signal")
@@ -558,6 +612,254 @@ class TestAssemblyMatcherCache(unittest.TestCase):
         core._get_assembly_matcher("a", "signal")
         core._evict_assembly_matchers("a")
         self.assertEqual(len(core._assembly_matchers), 0)
+
+
+class TestAssemblyPrewarm(_MatcherCacheBase):
+    """Rebuilding the matcher in the background after a registration job.
+
+    Inherits the SDK fakes from _MatcherCacheBase. The rebuild is exercised
+    synchronously via _rebuild_assembly_matcher(); the threading wrapper is
+    covered separately by joining the spawned thread.
+    """
+
+    def setUp(self):
+        super().setUp()
+        core._assembly_prewarm_in_flight.clear()
+        self._orig_prewarm_env = os.environ.get("HOOPS_AI_ASSEMBLY_PREWARM")
+        os.environ.pop("HOOPS_AI_ASSEMBLY_PREWARM", None)
+
+    def tearDown(self):
+        core._assembly_prewarm_in_flight.clear()
+        if self._orig_prewarm_env is None:
+            os.environ.pop("HOOPS_AI_ASSEMBLY_PREWARM", None)
+        else:
+            os.environ["HOOPS_AI_ASSEMBLY_PREWARM"] = self._orig_prewarm_env
+        super().tearDown()
+
+    def _mk_index(self, name, schema_version=None):
+        path = super()._mk_index(name)
+        import json
+
+        version = (
+            core._INDEX_SCHEMA_VERSION if schema_version is None else schema_version
+        )
+        with open(core._index_json_path(name), "w", encoding="utf-8") as fh:
+            json.dump({"model": "signal", "schema_version": version}, fh)
+        return path
+
+    def _touch(self, path):
+        st = path.stat()
+        os.utime(path, ns=(st.st_atime_ns + 10**9, st.st_mtime_ns + 10**9))
+
+    # --- when a rebuild is worth starting ---------------------------------
+
+    def test_skipped_when_assembly_search_never_used(self):
+        self._mk_index("a")
+        self.assertFalse(core.prewarm_assembly_matcher("a"))
+        self.assertEqual(self.AssemblyMatcher.instances, 0)
+
+    def test_started_when_a_matcher_is_cached(self):
+        path = self._mk_index("a")
+        core._get_assembly_matcher("a", "signal")
+        self._touch(path)
+        self.assertTrue(core.prewarm_assembly_matcher("a"))
+        self._join_prewarm()
+        self.assertEqual(self.AssemblyMatcher.instances, 2)
+
+    def test_stale_entry_still_counts_as_used(self):
+        """The job has just invalidated the entry; that is exactly the case
+        worth rebuilding, so a non-matching mtime must not disqualify it."""
+        path = self._mk_index("a")
+        core._get_assembly_matcher("a", "signal")
+        self._touch(path)
+        self.assertTrue(core._has_cached_assembly_matcher("a"))
+
+    def test_other_index_does_not_count(self):
+        self._mk_index("a")
+        self._mk_index("b")
+        core._get_assembly_matcher("b", "signal")
+        self.assertFalse(core._has_cached_assembly_matcher("a"))
+        self.assertFalse(core.prewarm_assembly_matcher("a"))
+
+    def test_env_switch_disables_it(self):
+        path = self._mk_index("a")
+        core._get_assembly_matcher("a", "signal")
+        self._touch(path)
+        os.environ["HOOPS_AI_ASSEMBLY_PREWARM"] = "false"
+        self.assertFalse(core.prewarm_assembly_matcher("a"))
+        self.assertEqual(self.AssemblyMatcher.instances, 1)
+
+    def test_enabled_by_default(self):
+        self.assertTrue(core.assembly_prewarm_enabled())
+
+    def test_only_one_rebuild_per_index_in_flight(self):
+        self._mk_index("a")
+        core._get_assembly_matcher("a", "signal")
+        core._assembly_prewarm_in_flight.add("a")
+        self.assertFalse(core.prewarm_assembly_matcher("a"))
+
+    # --- the rebuild itself ------------------------------------------------
+
+    def test_rebuild_replaces_the_stale_entry(self):
+        path = self._mk_index("a")
+        first = core._get_assembly_matcher("a", "signal")
+        self._touch(path)
+        core._rebuild_assembly_matcher("a")
+        self.assertEqual(len(core._assembly_matchers), 1)
+        cached = next(iter(core._assembly_matchers.values()))
+        self.assertIsNot(cached, first)
+        self.assertEqual(cached.weights_built, 1)
+
+    def test_rebuild_makes_the_next_search_warm(self):
+        path = self._mk_index("a")
+        core._get_assembly_matcher("a", "signal")
+        self._touch(path)
+        core._rebuild_assembly_matcher("a")
+        built = self.AssemblyMatcher.instances
+        core._get_assembly_matcher("a", "signal")
+        self.assertEqual(self.AssemblyMatcher.instances, built)
+
+    def test_rebuild_skips_legacy_schema(self):
+        """Assembly search rejects schema v1, so a matcher would never be used."""
+        self._mk_index("a", schema_version=1)
+        core._rebuild_assembly_matcher("a")
+        self.assertEqual(self.AssemblyMatcher.instances, 0)
+
+    def test_rebuild_survives_a_deleted_index(self):
+        self._mk_index("a")
+        core._get_assembly_matcher("a", "signal")
+        (core.INDEXES_DIR / "a" / "index.faiss").unlink()
+        core._rebuild_assembly_matcher("a")  # must not raise
+
+    def test_rebuild_clears_the_in_flight_flag_on_failure(self):
+        self._mk_index("a")
+        core._assembly_prewarm_in_flight.add("a")
+        orig = core._get_assembly_matcher
+        core._get_assembly_matcher = lambda *a, **k: (_ for _ in ()).throw(
+            RuntimeError("boom")
+        )
+        try:
+            core._rebuild_assembly_matcher("a")
+        finally:
+            core._get_assembly_matcher = orig
+        self.assertNotIn("a", core._assembly_prewarm_in_flight)
+
+    def test_in_flight_flag_is_cleared_after_success(self):
+        path = self._mk_index("a")
+        core._get_assembly_matcher("a", "signal")
+        self._touch(path)
+        core.prewarm_assembly_matcher("a")
+        self._join_prewarm()
+        self.assertNotIn("a", core._assembly_prewarm_in_flight)
+
+    def _join_prewarm(self):
+        import threading
+
+        for thread in threading.enumerate():
+            if thread.name.startswith("assembly-prewarm-"):
+                thread.join(timeout=10)
+                self.assertFalse(thread.is_alive())
+
+
+class TestMatcherBuildLocking(_MatcherCacheBase):
+    """The build must not hold the index lock across the k-means.
+
+    Holding it would stall part search on the same index for ~20 s, which is
+    exactly what PR #5 moved out of the locked section. Only the disk read is
+    locked; the k-means afterwards touches nothing but the copy it loaded.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._events = []
+        matcher_cls = self.AssemblyMatcher
+        test = self
+
+        def build_part_rarity_weights(inner_self):
+            # The expensive phase: record whether the index lock is free here.
+            lock = core._get_index_lock("a")
+            acquired = lock.acquire(blocking=False)
+            test._events.append(("kmeans_index_lock_free", acquired))
+            if acquired:
+                lock.release()
+            inner_self.weights_built += 1
+
+        matcher_cls.build_part_rarity_weights = build_part_rarity_weights
+
+    def _mk_index(self, name):
+        path = super()._mk_index(name)
+        import json
+
+        with open(core._index_json_path(name), "w", encoding="utf-8") as fh:
+            json.dump(
+                {"model": "signal", "schema_version": core._INDEX_SCHEMA_VERSION}, fh
+            )
+        return path
+
+    def test_index_lock_is_free_during_the_kmeans(self):
+        self._mk_index("a")
+        core._get_assembly_matcher("a", "signal")
+        self.assertEqual(self._events, [("kmeans_index_lock_free", True)])
+
+    def test_the_disk_read_happens_under_the_index_lock(self):
+        # .faiss and .meta are replaced in two steps, so the load must be
+        # paired with a save rather than racing it.
+        seen = {}
+        self._mk_index("a")
+        orig = core._load_shape_index_pickle_compat
+
+        def load(searcher, path):
+            seen["locked"] = not core._get_index_lock("a").acquire(blocking=False)
+            if not seen["locked"]:
+                core._get_index_lock("a").release()
+            return orig(searcher, path)
+
+        core._load_shape_index_pickle_compat = load
+        try:
+            core._get_assembly_matcher("a", "signal")
+        finally:
+            core._load_shape_index_pickle_compat = orig
+        self.assertTrue(seen["locked"])
+
+    def test_concurrent_callers_build_once(self):
+        import threading
+
+        self._mk_index("a")
+        results = []
+        barrier = threading.Barrier(3)
+
+        def run():
+            barrier.wait(timeout=10)
+            results.append(core._get_assembly_matcher("a", "signal"))
+
+        threads = [threading.Thread(target=run) for _ in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+            self.assertFalse(t.is_alive())
+        self.assertEqual(self.AssemblyMatcher.instances, 1)
+        self.assertEqual(len(results), 3)
+        self.assertIs(results[0], results[1])
+        self.assertIs(results[1], results[2])
+
+    def test_an_index_written_during_the_build_is_not_served(self):
+        """A matcher is keyed by the mtime it was loaded at, so one built from
+        vectors that have since been replaced is born stale, never handed out."""
+        path = self._mk_index("a")
+        matcher_cls = self.AssemblyMatcher
+        orig_build = matcher_cls.build_part_rarity_weights
+
+        def build(inner_self):
+            st = path.stat()
+            os.utime(path, ns=(st.st_atime_ns + 10**9, st.st_mtime_ns + 10**9))
+            orig_build(inner_self)
+
+        matcher_cls.build_part_rarity_weights = build
+        first = core._get_assembly_matcher("a", "signal")
+        matcher_cls.build_part_rarity_weights = orig_build
+        second = core._get_assembly_matcher("a", "signal")
+        self.assertIsNot(first, second)
 
 
 class TestAssemblyEndpoint(unittest.TestCase):
