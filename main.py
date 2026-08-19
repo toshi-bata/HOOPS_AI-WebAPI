@@ -11,7 +11,7 @@ import core
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from routers import brep, cad, context_layer, files, mfr, part_classification, similarity
+from routers import brep, cad, context_layer, files, index_jobs, mfr, part_classification, similarity
 
 
 def _configure_logging() -> None:
@@ -49,6 +49,10 @@ async def lifespan(app: FastAPI):
     core.run_startup_maintenance()
     core.init_hoops_license()
     yield
+    # Stop accepting new jobs. Work already inside embed_shape_batch cannot be
+    # interrupted, so we do not wait for it; the next startup marks whatever
+    # was still in progress as interrupted.
+    core.get_index_job_store().shutdown(wait=False)
     if core.MFR_dataset_explorer is not None and hasattr(core.MFR_dataset_explorer, "close"):
         core.MFR_dataset_explorer.close()
     if core.PART_CLASS_dataset_explorer is not None and hasattr(core.PART_CLASS_dataset_explorer, "close"):
@@ -82,6 +86,7 @@ app.include_router(mfr.router)
 app.include_router(cad.router)
 app.include_router(brep.router)
 app.include_router(similarity.router)
+app.include_router(index_jobs.router)
 app.include_router(part_classification.router)
 app.include_router(context_layer.router)
 

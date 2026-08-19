@@ -266,7 +266,7 @@ class TestEmbedBodiesMissingFiles(unittest.TestCase):
         """
         import numpy as np
 
-        def _embed_shape_batch(paths, show_progress=False, specifications=None):
+        def _embed_shape_batch(paths, show_progress=False, specifications=None, **kwargs):
             # paths[0] -> 2 rows, paths[1] -> 1 row; paths[2] is skipped.
             ids = [paths[0], paths[0], paths[1]]
             values = np.ones((3, 4), dtype=np.float32)

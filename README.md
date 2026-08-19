@@ -118,6 +118,14 @@ cp .env.example .env
 | `HOOPS_AI_CAD_SHARED_DIR` | optional | Location of the **CAD store** (default: `uploads/`). This directory holds the only copy of the payload behind every registered index and is never cleared by the server. |
 | `HOOPS_AI_OUT_TTL_HOURS` | optional | Age at which files under `out/` (viewer streams, result images, shape maps) are swept at startup (default `24`). `0` disables the sweep. |
 | `HOOPS_AI_EMBEDDINGS_CACHE_TTL_DAYS` | optional | Age at which cached embeddings under `embeddings_cache/` are swept at startup (default `0`, i.e. keep forever). Recomputing one entry costs a full CAD load. |
+| `HOOPS_AI_JOB_MAX_CONCURRENCY` | optional | How many registration jobs run at once (default `1`). Serialised because hoops_ai writes `error_summary.json` to the process working directory with no way to redirect it. |
+| `HOOPS_AI_JOB_TTL_DAYS` | optional | Retention of finished job records under `jobs/` (default `7`). `0` keeps them until the record cap evicts them. |
+| `HOOPS_AI_JOB_MAX_RECORDS` | optional | Hard cap on retained job records (default `1000`). |
+| `HOOPS_AI_MAX_WORKERS` | optional | Cap used **only when `workers` is omitted** (default `8`). Each worker is a spawned interpreter holding its own ~2 GB copy of the checkpoint, so peak RSS grows roughly linearly with this value. An explicit `workers` in the request is passed to the SDK unchanged. |
+| `HOOPS_AI_MODEL_FOOTPRINT_MB` | optional | Assumed per-worker memory footprint used to bound the automatic worker count by free RAM (default `2048`). |
+| `HOOPS_AI_MIN_FILES_PARALLEL` | optional | Force a single worker below this many files. Defaults to `1`, i.e. disabled: a file-count threshold ignores how heavy each file is, and a few heavy assemblies are faster on several workers. Set it if your corpus is uniformly light. |
+| `HOOPS_AI_EMBED_TIME_LIMIT` | optional | Per-file embedding budget in seconds. Unset (the default) leaves the SDK's own 120 s. Raise it to let heavy assemblies finish instead of failing with `Timeout`. |
+| `HOOPS_AI_ALLOW_SERVER_PATHS` | optional | Set to `true` to let jobs read CAD from `server_paths` on the server machine. Defaults to `false`: it reads any file the server process can read and bypasses the upload size and extension checks. |
 
 > **Note:** `HOOPS_AI_LICENSE` is read **only** from the `.env` file, not from system environment variables.
 
@@ -130,8 +138,7 @@ unless `HOOPS_AI_ENABLE_DEMO_FEATURES=true`:
 - `GET`/`PUT /similarity/default-model/setting` (embedding-model switch)
 - `GET`/`PUT /similarity/default-index/setting` (default FAISS index preset switch)
 - `POST /similarity/index/create`, `GET /similarity/index/list`, `POST /similarity/index/add`,
-  `DELETE /similarity/index/{name}/parts`, `DELETE /similarity/index/{name}` (named index management)
-- `POST /similarity/map`, `GET /similarity/map/job/{job_id}`, `POST /similarity/map/{map_id}/query`,
+  `DELETE /similarity/index/{name}/parts`, `DELETE /similarity/index/{name}` (named index management)- `POST /similarity/map`, `GET /similarity/map/job/{job_id}`, `POST /similarity/map/{map_id}/query`,
   `POST /similarity/map/{map_id}/add-to-index` (Shape Space Map)
 - `GET /MFR/dataset/table-of-contents`, `GET /MFR/labels/description`, `GET /MFR/files/search`,
   `GET /MFR/files/{file_id}/thumbnail` (MFR dataset browsing)
@@ -145,8 +152,9 @@ All other endpoints (upload, viewer, B-Rep analysis, MFR/Part-Classification inf
 `POST /similarity/index/{name}/search-assembly`, and the read-only named-index
 reporting/asset endpoints `GET /similarity/index/{name}/stats`,
 `GET /similarity/index/{name}/parts`,
-`GET /similarity/index/{name}/parts/{part_id}/thumbnail`, `.../scs`) remain available
-regardless of this flag.
+`GET /similarity/index/{name}/parts/{part_id}/thumbnail`, `.../scs`, and the bulk
+registration job endpoints `POST`/`GET`/`DELETE /similarity/index/{name}/jobs[...]`)
+remain available regardless of this flag.
 
 Example `.env`:
 
@@ -1312,6 +1320,105 @@ curl -X POST "http://127.0.0.1:8000/similarity/index/add?name=my-parts" -F "file
 ```json
 { "name": "my-parts", "added": 1, "updated": 0, "index_count": 4, "errors": [] }
 ```
+
+---
+
+##### Bulk registration as a background job
+
+`POST /similarity/index/add` above is synchronous: the client holds a connection
+open for the whole run and gets no progress and no way to stop. For hundreds or
+thousands of files, use the job form instead.
+
+```
+POST   /similarity/index/{name}/jobs/add       → 202 {"job_id": ...}
+GET    /similarity/index/{name}/jobs/{job_id}  → status + progress + summary
+GET    /similarity/index/{name}/jobs           → list, newest first (paginated)
+DELETE /similarity/index/{name}/jobs/{job_id}  → request cancellation
+```
+
+Request body (supply at least one input):
+
+| Field | Meaning |
+|---|---|
+| `file_ids` | `file_id`s already in the CAD store. **The standard route** — upload with `POST /files/upload-batch` and skip what `POST /files/exists` already knows. |
+| `zip_file_id` | `file_id` of an uploaded ZIP archive, expanded server-side. |
+| `server_paths` | Paths on the server machine. Disabled by default; returns **403** unless `HOOPS_AI_ALLOW_SERVER_PATHS=true`. Administrator seeding only, since it reads any file the server process can read and bypasses the upload checks. |
+| `workers` | Parallel embedding workers. Omit to size automatically from CPU cores and free RAM. |
+| `time_limit` | Per-file embedding budget in seconds. Omit to use `HOOPS_AI_EMBED_TIME_LIMIT`, or the SDK's 120 s when that is unset. |
+
+Job records are JSON files under `jobs/`, so they survive a restart. Finished
+records are swept after `HOOPS_AI_JOB_TTL_DAYS` (default 7) and capped at
+`HOOPS_AI_JOB_MAX_RECORDS` (default 1000). Duplicate `file_id`s in one request
+are collapsed; every rejected input is reported in `errors` rather than dropped.
+A job that was still `queued` or `running` when the server stopped is marked
+`failed` at the next startup — nothing resumes it, but everything it had already
+registered is kept, so resubmitting the remainder is safe.
+
+> **Jobs run one at a time by default.** hoops_ai writes `error_summary.json`
+> into the process working directory and offers no way to redirect it, so two
+> concurrent registration jobs would read each other's failure report. Raise
+> `HOOPS_AI_JOB_MAX_CONCURRENCY` only if you accept that.
+
+> **Cancellation only takes effect before a job starts embedding.** The whole
+> input goes to a single `embed_shape_batch` call, which cannot be interrupted,
+> so cancelling a running job leaves it to finish. Split a large corpus across
+> several jobs to keep the commit and cancellation granularity under your
+> control.
+
+> **One SDK call per job, deliberately.** Chunking a job into fixed-size batches
+> was measured to cost ~55-60 s per chunk, because every chunk builds a fresh
+> spawn-based worker pool in which each worker reloads the ~2 GB checkpoint. At
+> 100 files per chunk that was about 30% of total runtime.
+
+### Tuning bulk registration
+
+Both knobs matter more than anything else here, and the right values depend on
+the machine and on how heavy the CAD is.
+
+`workers` — every worker keeps its own copy of the model, so peak memory grows
+roughly linearly with the count while throughput reaches a plateau and then
+declines once RAM-bound. Measured on `hoops_ai_native_bridge`: light single-body
+parts plateau near the physical core count, heavy assemblies plateau lower (on a
+16-core machine 12 was the peak, and 16/20/24 were each slower than 8). Aim for
+the plateau, not a single "best" value — run-to-run noise exceeds the difference
+between neighbouring counts. **An explicit `workers` is sent to the SDK
+unchanged**; `HOOPS_AI_MAX_WORKERS` bounds only the automatic choice, which is
+`min(HOOPS_AI_MAX_WORKERS, logical_cpus / 2, usable_RAM / HOOPS_AI_MODEL_FOOTPRINT_MB, file_count)`.
+
+`time_limit` — a file that exceeds the budget is dropped with `Timeout` and
+reported in `errors`. The default of 120 s is right for the many light files and
+too short for heavy assemblies, so the effective strategy is two jobs: one over
+everything at the default, then a second over just the timed-out `file_id`s with
+a much larger `time_limit` and a small `workers` (a single heavy file is not
+made faster by more workers; only across-file parallelism helps).
+
+**Windows (PowerShell):**
+```powershell
+$body = @{ file_ids = @("a3f8c2...", "b71e94...") } | ConvertTo-Json
+$job = curl.exe -s -X POST "http://127.0.0.1:8000/similarity/index/my-parts/jobs/add" `
+  -H "Content-Type: application/json" -d $body | ConvertFrom-Json
+
+# Poll until the job settles
+do {
+  Start-Sleep -Seconds 2
+  $s = curl.exe -s "http://127.0.0.1:8000/similarity/index/my-parts/jobs/$($job.job_id)" | ConvertFrom-Json
+  "{0} {1}/{2} errors={3}" -f $s.status, $s.progress.done, $s.progress.total, $s.progress.errors
+} while ($s.status -in @("queued", "running"))
+```
+
+**Response (status):**
+```json
+{
+  "job_id": "…", "kind": "index_add", "index_name": "my-parts", "status": "done",
+  "progress": {"phase": "done", "done": 240, "total": 240, "errors": 3},
+  "summary": {"added": 235, "updated": 2, "failed": 3, "skipped": 0, "index_count": 1042},
+  "errors": [{"file_id": "…", "detail": "Timeout"}],
+  "timings": {"embed_seconds": 812.4, "total_seconds": 815.1}
+}
+```
+
+`timings` is recorded so tuning decisions can be based on this server's own
+measurements rather than guesswork.
 
 ---
 
