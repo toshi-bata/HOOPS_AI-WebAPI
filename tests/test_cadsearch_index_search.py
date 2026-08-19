@@ -477,11 +477,13 @@ class TestSearchEndpointParams(unittest.TestCase):
         self._orig = core.search_index
         self.calls = []
 
-        def _fake(name, file_id, top_k, kind="any", include_self=False, include_image=True):
+        def _fake(name, file_id, top_k, kind="any", include_self=False,
+                  include_image=True, tags=None, tag_mode="any", tagged=None):
             self.calls.append(
                 {"name": name, "file_id": file_id, "top_k": top_k,
                  "kind": kind, "include_self": include_self,
-                 "include_image": include_image}
+                 "include_image": include_image,
+                 "tags": tags, "tag_mode": tag_mode, "tagged": tagged}
             )
             return {"hits": [], "count": 0, "image_url": None}
 

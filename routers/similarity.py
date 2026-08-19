@@ -6,7 +6,7 @@ import uuid
 from typing import Any, Dict, List, Literal, Optional
 
 import core
-from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Response, UploadFile
+from fastapi import APIRouter, Body, Depends, File, Header, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 
@@ -961,6 +961,46 @@ class IndexPartItem(BaseModel):
     thumbnail_url: Optional[str] = None
     scs_url: Optional[str] = None
     registered_at: Optional[str] = None
+    tags: list[str] = []
+
+
+class TagCount(BaseModel):
+    tag: str
+    count: int
+
+
+class IndexTagsResponse(BaseModel):
+    tags: list[TagCount]
+    total: int
+
+
+class PartTagsResponse(BaseModel):
+    part_id: str
+    tags: list[str]
+
+
+class PartTagsUpdate(BaseModel):
+    tags: list[str]
+
+
+class BulkTagUpdate(BaseModel):
+    part_ids: list[str]
+
+
+class SkippedPart(BaseModel):
+    part_id: str
+    reason: str
+
+
+class BulkTagResponse(BaseModel):
+    tag: str
+    updated: int
+    skipped: list[SkippedPart] = []
+
+
+class TagDeleteResponse(BaseModel):
+    tag: str
+    removed_from: int
 
 
 class IndexPartsResponse(BaseModel):
@@ -1149,6 +1189,19 @@ def search_named_index(
             "client draws its own gallery."
         ),
     ),
+    tags: Optional[str] = Query(
+        None,
+        description=(
+            "Comma-separated tags. Hits are filtered after ranking, so scores "
+            "and order are unchanged; the count can fall below top_k."
+        ),
+    ),
+    tag_mode: Literal["any", "all"] = Query(
+        "any", description="'any' matches at least one tag, 'all' requires every tag."
+    ),
+    tagged: Optional[bool] = Query(
+        None, description="true = only tagged hits, false = only untagged."
+    ),
 ):
     """Search a named index for the most similar parts to a query shape.
 
@@ -1177,6 +1230,9 @@ def search_named_index(
             kind=kind,
             include_self=include_self,
             include_image=include_image,
+            tags=_split_tags(tags),
+            tag_mode=tag_mode,
+            tagged=tagged,
         )
 
         # Convert relative /out/{file} URL to an absolute URL (same pattern as /similarity/search)
@@ -1194,6 +1250,8 @@ def search_named_index(
         raise
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except (core.EnvConfigError, core.PathConfigError):
         raise
     except Exception as exc:
@@ -1252,6 +1310,19 @@ def search_named_index_assembly(
             "Hits are unaffected."
         ),
     ),
+    tags: Optional[str] = Query(
+        None,
+        description=(
+            "Comma-separated tags. Hits are filtered after ranking, so scores "
+            "and order are unchanged; the count can fall below top_k."
+        ),
+    ),
+    tag_mode: Literal["any", "all"] = Query(
+        "any", description="'any' matches at least one tag, 'all' requires every tag."
+    ),
+    tagged: Optional[bool] = Query(
+        None, description="true = only tagged hits, false = only untagged."
+    ),
 ):
     """Search a named index for assemblies similar to a query assembly.
 
@@ -1288,6 +1359,9 @@ def search_named_index_assembly(
             use_idf=use_idf,
             include_self=include_self,
             include_image=include_image,
+            tags=_split_tags(tags),
+            tag_mode=tag_mode,
+            tagged=tagged,
         )
 
         # Convert the relative /out/{file} URL to an absolute one.
@@ -1355,11 +1429,21 @@ def list_index_parts(
     kind: Optional[str] = Query(
         None, description="Filter by kind: 'part' or 'assembly'. Omit for all."
     ),
+    tags: Optional[str] = Query(
+        None, description="Comma-separated tags to filter by. Omit for no tag filter."
+    ),
+    tag_mode: Literal["any", "all"] = Query(
+        "any", description="'any' matches parts carrying at least one tag, 'all' requires every tag."
+    ),
+    tagged: Optional[bool] = Query(
+        None, description="true = only tagged parts, false = only untagged. Omit for both."
+    ),
 ):
     """Return a paginated, file-level listing of a named index.
 
     ``thumbnail_url`` / ``scs_url`` are absolute URLs to the per-part asset
-    endpoints, or ``null`` when the asset does not exist on disk.
+    endpoints, or ``null`` when the asset does not exist on disk. Tag filters
+    are applied before pagination, so ``total`` reflects the filter.
     """
     try:
         _validate_name_or_raise(name)
@@ -1369,8 +1453,19 @@ def list_index_parts(
         raise HTTPException(
             status_code=422, detail="kind must be 'part' or 'assembly' when supplied."
         )
+    tag_list = _split_tags(tags)
     try:
-        result = core.list_index_parts(name, offset=offset, limit=limit, kind=kind)
+        result = core.list_index_parts(
+            name,
+            offset=offset,
+            limit=limit,
+            kind=kind,
+            tags=tag_list,
+            tag_mode=tag_mode,
+            tagged=tagged,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except (core.EnvConfigError, core.PathConfigError):
@@ -1401,6 +1496,7 @@ def list_index_parts(
                 thumbnail_url=thumbnail_url,
                 scs_url=scs_url,
                 registered_at=it.get("registered_at"),
+                tags=it.get("tags") or [],
             )
         )
     return IndexPartsResponse(
@@ -1443,6 +1539,196 @@ def get_index_part_scs(name: str, part_id: str):
     if path is None:
         raise HTTPException(status_code=404, detail="SCS file not found.")
     return FileResponse(str(path), media_type="application/octet-stream")
+
+
+# ---------------------------------------------------------------------------
+# Index tags
+# ---------------------------------------------------------------------------
+#
+# Not gated by require_demo_enabled: tags are a production feature of the
+# shared server, not a demo. Every response carries an ETag, and every mutation
+# accepts If-Match so two people editing the same index cannot silently
+# overwrite one another.
+
+
+def _raise_tag_error(exc: Exception) -> None:
+    """Map core tag errors onto HTTP status codes."""
+    if isinstance(exc, core.TagsPreconditionFailed):
+        raise HTTPException(status_code=412, detail=str(exc)) from exc
+    if isinstance(exc, KeyError):
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if isinstance(exc, PermissionError):
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    if isinstance(exc, ValueError):
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if isinstance(exc, core.TagsFileError):
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    raise HTTPException(status_code=500, detail=f"Tag operation failed: {exc}") from exc
+
+
+@router.get("/index/{name}/tags", response_model=IndexTagsResponse)
+def list_index_tags(name: str, response: Response):
+    """List every tag used in the index with the number of parts carrying it.
+
+    Ordered by descending count, then by tag name. The ``ETag`` header is the
+    value to send back as ``If-Match`` when updating.
+    """
+    _validate_name_or_raise(name)
+    try:
+        result, etag = core.get_index_tags(name)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_tag_error(exc)
+    response.headers["ETag"] = etag
+    return IndexTagsResponse(
+        tags=[TagCount(**t) for t in result["tags"]], total=result["total"]
+    )
+
+
+@router.get("/index/{name}/parts/{part_id}/tags", response_model=PartTagsResponse)
+def get_index_part_tags(name: str, part_id: str, response: Response):
+    """Return the tags of one part (an empty list when it has none)."""
+    _validate_name_or_raise(name)
+    try:
+        result, etag = core.get_part_tags(name, part_id)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_tag_error(exc)
+    response.headers["ETag"] = etag
+    return PartTagsResponse(**result)
+
+
+@router.put("/index/{name}/parts/{part_id}/tags", response_model=PartTagsResponse)
+def put_index_part_tags(
+    name: str,
+    part_id: str,
+    response: Response,
+    payload: PartTagsUpdate,
+    if_match: Optional[str] = Header(
+        None,
+        alias="If-Match",
+        description=(
+            "ETag from a previous read. Returns 412 when the tags have changed "
+            "since. Omitting it skips the check (last write wins)."
+        ),
+    ),
+    client_id: Optional[str] = Header(
+        None, alias="X-Client-Id", description="Recorded as updated_by."
+    ),
+):
+    """Replace the entire tag set of a part. An empty list removes all tags."""
+    _validate_name_or_raise(name)
+    try:
+        result, etag = core.set_part_tags(
+            name, part_id, payload.tags, if_match=if_match, client_id=client_id
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_tag_error(exc)
+    response.headers["ETag"] = etag
+    return PartTagsResponse(**result)
+
+
+@router.post("/index/{name}/tags/{tag}/parts", response_model=BulkTagResponse)
+def assign_index_tag(
+    name: str,
+    tag: str,
+    response: Response,
+    payload: BulkTagUpdate,
+    if_match: Optional[str] = Header(None, alias="If-Match"),
+    client_id: Optional[str] = Header(None, alias="X-Client-Id"),
+):
+    """Add *tag* to several parts at once.
+
+    Ids that are not registered in this index are reported in ``skipped``
+    rather than failing the request, so one stale id cannot discard the rest.
+    """
+    _validate_name_or_raise(name)
+    if not payload.part_ids:
+        raise HTTPException(status_code=422, detail="No part_ids supplied.")
+    try:
+        result, etag = core.assign_tag(
+            name, tag, payload.part_ids, if_match=if_match, client_id=client_id
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_tag_error(exc)
+    response.headers["ETag"] = etag
+    return BulkTagResponse(
+        tag=result["tag"],
+        updated=result["updated"],
+        skipped=[SkippedPart(**s) for s in result["skipped"]],
+    )
+
+
+@router.delete("/index/{name}/tags/{tag}/parts", response_model=BulkTagResponse)
+def unassign_index_tag(
+    name: str,
+    tag: str,
+    response: Response,
+    payload: BulkTagUpdate,
+    if_match: Optional[str] = Header(None, alias="If-Match"),
+    client_id: Optional[str] = Header(None, alias="X-Client-Id"),
+):
+    """Remove *tag* from several parts at once. Same skip policy as assignment."""
+    _validate_name_or_raise(name)
+    if not payload.part_ids:
+        raise HTTPException(status_code=422, detail="No part_ids supplied.")
+    try:
+        result, etag = core.unassign_tag(
+            name, tag, payload.part_ids, if_match=if_match, client_id=client_id
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_tag_error(exc)
+    response.headers["ETag"] = etag
+    return BulkTagResponse(
+        tag=result["tag"],
+        updated=result["updated"],
+        skipped=[SkippedPart(**s) for s in result["skipped"]],
+    )
+
+
+@router.delete("/index/{name}/tags/{tag}", response_model=TagDeleteResponse)
+def delete_index_tag(
+    name: str,
+    tag: str,
+    response: Response,
+    confirm: bool = Query(
+        False, description="Must be ``true``: this removes the tag from every part."
+    ),
+    if_match: Optional[str] = Header(None, alias="If-Match"),
+    client_id: Optional[str] = Header(None, alias="X-Client-Id"),
+):
+    """Delete a tag from the whole index.
+
+    Requires ``?confirm=true`` (409 without it), following the same rule as
+    ``DELETE /similarity/index/{name}``.
+    """
+    _validate_name_or_raise(name)
+    if not confirm:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Removing tag '{tag}' from every part of index '{name}' cannot "
+                "be undone. Re-send this request with ?confirm=true to proceed."
+            ),
+        )
+    try:
+        result, etag = core.delete_tag(
+            name, tag, if_match=if_match, client_id=client_id
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_tag_error(exc)
+    response.headers["ETag"] = etag
+    return TagDeleteResponse(**result)
 
 
 # ---------------------------------------------------------------------------
@@ -1528,6 +1814,19 @@ def delete_index(
 # ---------------------------------------------------------------------------
 # Internal helper – validate index name at router boundary
 # ---------------------------------------------------------------------------
+
+
+def _split_tags(tags: Optional[str]) -> Optional[list[str]]:
+    """Split a comma-separated tag query parameter, or return None if absent.
+
+    An empty or whitespace-only value means "no tag filter" rather than "match
+    the empty tag", so a client can send tags= unconditionally.
+    """
+    if tags is None:
+        return None
+    parts = [t.strip() for t in tags.split(",")]
+    parts = [t for t in parts if t]
+    return parts or None
 
 
 def _validate_name_or_raise(name: str) -> None:

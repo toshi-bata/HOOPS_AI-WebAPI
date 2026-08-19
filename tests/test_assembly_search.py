@@ -579,13 +579,15 @@ class TestAssemblyEndpoint(unittest.TestCase):
 
         def _fake(name, file_id, top_k, candidate_k=30, sim_thresh=0.80,
                   bop_weight=0.30, coverage_mode="symmetric", use_idf=True,
-                  include_self=False, include_image=True):
+                  include_self=False, include_image=True, tags=None,
+                  tag_mode="any", tagged=None):
             self.calls.append(
                 {"name": name, "file_id": file_id, "top_k": top_k,
                  "candidate_k": candidate_k, "sim_thresh": sim_thresh,
                  "bop_weight": bop_weight, "coverage_mode": coverage_mode,
                  "use_idf": use_idf, "include_self": include_self,
-                 "include_image": include_image}
+                 "include_image": include_image,
+                 "tags": tags, "tag_mode": tag_mode, "tagged": tagged}
             )
             return {
                 "hits": [{

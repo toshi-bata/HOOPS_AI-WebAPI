@@ -20,3 +20,6 @@ import_bridge_index.py
 
 # Throwaway probe: measures the CADSearch cold-start cost of a named index
 poc_searcher_coldstart.py
+
+# Throwaway probe: decides whether index tags can live in record metadata
+poc_tag_metadata.py

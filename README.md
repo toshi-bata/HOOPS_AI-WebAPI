@@ -121,6 +121,7 @@ cp .env.example .env
 | `HOOPS_AI_JOB_MAX_CONCURRENCY` | optional | How many registration jobs run at once (default `1`). Serialised because of worker memory, because hoops_ai's `error_summary.json` is per-process, and because the live-progress shim replaces the process-wide `sys.stderr`. |
 | `HOOPS_AI_JOB_TTL_DAYS` | optional | Retention of finished job records under `jobs/` (default `7`). `0` keeps them until the record cap evicts them. |
 | `HOOPS_AI_JOB_MAX_RECORDS` | optional | Hard cap on retained job records (default `1000`). |
+| `HOOPS_AI_MAX_TAGS_PER_PART` | optional | Maximum number of index tags one part may carry (default `32`). |
 | `HOOPS_AI_MAX_WORKERS` | optional | Cap used **only when `workers` is omitted** (default `8`). Each worker is a spawned interpreter holding its own ~2 GB copy of the checkpoint, so peak RSS grows roughly linearly with this value. An explicit `workers` in the request is passed to the SDK unchanged. |
 | `HOOPS_AI_MODEL_FOOTPRINT_MB` | optional | Assumed per-worker memory footprint used to bound the automatic worker count by free RAM (default `2048`). |
 | `HOOPS_AI_MIN_FILES_PARALLEL` | optional | Force a single worker below this many files. Defaults to `1`, i.e. disabled: a file-count threshold ignores how heavy each file is, and a few heavy assemblies are faster on several workers. Set it if your corpus is uniformly light. |
@@ -1497,7 +1498,7 @@ measurements rather than guesswork.
 ##### Search a named index
 
 ```
-POST /similarity/index/{name}/search?top_k=<n>&kind=<any|part|assembly>&include_self=<bool>&include_image=<bool>
+POST /similarity/index/{name}/search?top_k=<n>&kind=<any|part|assembly>&include_self=<bool>&include_image=<bool>&tags=<a,b>&tag_mode=<any|all>&tagged=<bool>
 ```
 
 Supply **either** a file upload or a `file_id`.  Returns an empty ``hits`` list
@@ -1509,6 +1510,7 @@ when the index contains zero entries (no error).
 | `kind` | `any` | Restrict hits to `part` or `assembly`. `any` passes no filter. Use `part` to match `hoops_ai_native_bridge`. Any other value is **422**. |
 | `include_self` | `false` | Keep the query itself in the results when it is registered in this index, pinned first with score `1.0`. By default the self match is dropped. Never exceeds `top_k`. |
 | `include_image` | `true` | When `false`, skip the result-grid PNG and return `image_url: null`. Hits are unaffected. |
+| `tags` / `tag_mode` / `tagged` | — | Keep only hits carrying the given tags. See [Filtering searches and listings by tag](#filtering-searches-and-listings-by-tag) — a filtered search may return fewer than `top_k` hits. |
 
 The result-grid PNG is a preview: it shows at most **12 tiles** regardless of
 `top_k`, captioned `top 12 of 300`.  The full ranking is always in `hits`.
@@ -1549,7 +1551,7 @@ curl -X POST "http://127.0.0.1:8000/similarity/index/my-parts/search?top_k=5" -F
 ##### Assembly-to-assembly search
 
 ```
-POST /similarity/index/{name}/search-assembly?top_k=<n>&coverage_mode=<symmetric|containment|jaccard>
+POST /similarity/index/{name}/search-assembly?top_k=<n>&coverage_mode=<symmetric|containment|jaccard>&tags=<a,b>&tag_mode=<any|all>&tagged=<bool>
 ```
 
 Finds **assemblies similar to a query assembly**, as opposed to
@@ -1579,6 +1581,7 @@ nothing to match one-to-one — rebuild it as v2 first.
 | `use_idf` | `true` | Weight parts by cluster rarity so common fasteners contribute less. |
 | `include_self` | `false` | Keep the query itself, pinned first with score `1.0`. Dropped by default. Never exceeds `top_k`. |
 | `include_image` | `true` | When `false`, skip the result-grid PNG and return `image_url: null`. Hits are unaffected. |
+| `tags` / `tag_mode` / `tagged` | — | Keep only hits carrying the given tags. See [Filtering searches and listings by tag](#filtering-searches-and-listings-by-tag) — a filtered search may return fewer than `top_k` hits. |
 
 Out-of-range values return **422**.
 
@@ -1772,12 +1775,15 @@ curl "http://127.0.0.1:8000/similarity/index/my-parts/stats"
 ##### List registered parts (paginated)
 
 ```
-GET /similarity/index/{name}/parts?offset=0&limit=100&kind=part|assembly
+GET /similarity/index/{name}/parts?offset=0&limit=100&kind=part|assembly&tags=a,b&tag_mode=any|all&tagged=true|false
 ```
 
 One item per file.  `limit` is clamped to `1..2000` (default `100`); `offset` is `>= 0`.
 Omit `kind` for all items, or filter by `part` / `assembly`.  `thumbnail_url` / `scs_url`
 are absolute URLs to the asset endpoints below, or `null` when the asset is missing.
+Every item carries its `tags` (an empty list when untagged); the tag filters are
+described under [Index tags](#index-tags) and are applied **before** paging, so
+`total` is the size of the filtered set.
 
 **Linux:**
 ```bash
@@ -1798,11 +1804,141 @@ curl "http://127.0.0.1:8000/similarity/index/my-parts/parts?limit=50&kind=assemb
       "bodies": 12,
       "thumbnail_url": "http://127.0.0.1:8000/similarity/index/my-parts/parts/<file_id>/thumbnail",
       "scs_url": "http://127.0.0.1:8000/similarity/index/my-parts/parts/<file_id>/scs",
-      "registered_at": "2026-08-17T06:00:00Z"
+      "registered_at": "2026-08-17T06:00:00Z",
+      "tags": ["bracket", "revision-b"]
     }
   ]
 }
 ```
+
+##### Index tags
+
+Free-form labels attached to registered parts, so a shared index can be
+organised by hand: `bracket`, `revision-b`, `do-not-reuse`.  Tags are metadata
+only — they never change an embedding, a score or a ranking, they only decide
+which results you are shown.
+
+```
+GET    /similarity/index/{name}/tags                     → every tag with its part count
+GET    /similarity/index/{name}/tags/{tag}/parts         → the part ids carrying one tag
+GET    /similarity/index/{name}/parts/{part_id}/tags     → the tags of one part
+PUT    /similarity/index/{name}/parts/{part_id}/tags     → replace the tags of one part
+POST   /similarity/index/{name}/tags/{tag}/parts         → add one tag to many parts
+DELETE /similarity/index/{name}/tags/{tag}/parts         → remove one tag from many parts
+DELETE /similarity/index/{name}/tags/{tag}?confirm=true  → remove one tag from every part
+```
+
+Tags live in `indexes/<name>/tags.json`, beside the index rather than inside it.
+That is a measured decision, not a preference: `FaissVectorStore` does accept an
+arbitrary metadata key and does keep it across `save()`/`load()`, but persisting
+one costs a **full rewrite of `.faiss`** (0.22 s / 84 MB at 42 k rows) and moves
+its mtime.  Both the part searcher and the assembly matcher are cached on
+`(path, mtime)`, so storing tags in the index would force a **19.3 s matcher
+rebuild after every single tag edit** — unusable for an interactive "tag the
+whole cluster" gesture.  The sidecar costs a few kB per write and touches
+neither cache.
+
+Because the key is the `file_id` — the SHA-256 of the CAD file's contents — tags
+survive rebuilding the index from scratch, and the same file re-registered under
+a different name keeps its tags.  Removing a part from the index prunes its
+entry, so the sidecar cannot outgrow the index.
+
+**Rules.** A tag is trimmed, must be non-empty, at most 64 characters, must not
+contain control characters, and must not contain `/` or `\` because it appears
+as a URL path segment.  Tags are case-sensitive (`Bracket` and `bracket` are two
+tags); a case-only collision within an index is logged as a warning rather than
+merged, since guessing which spelling was meant would silently lose one of them.
+A part may carry `HOOPS_AI_MAX_TAGS_PER_PART` tags (default 32).  A violation is
+**422**, an unknown index is **404**, and an unregistered `part_id` is rejected
+rather than tagged.
+
+**Concurrent edits.** Every read returns an `ETag` for the whole tag document.
+Send it back as `If-Match` on a write and a **412** tells you someone edited the
+file since you read it; re-read and retry.  Sending no `If-Match` is allowed and
+means last-write-wins, which will discard a colleague's concurrent edit without
+saying so — pass it whenever a human is driving.  `X-Client-Id` is recorded as
+`updated_by` so the audit trail names a workstation instead of nobody.  Bulk
+calls report every id they could not apply in `skipped`, with a reason, instead
+of failing the whole request.
+
+**Windows (PowerShell):**
+```powershell
+$base = "http://127.0.0.1:8000/similarity/index/my-parts"
+
+# Read the current tags and the ETag that goes with them
+$r = curl.exe -s -D - "$base/tags" -o "$env:TEMP\tags.json"
+$etag = ($r | Select-String '^ETag:').Line.Split(' ')[1].Trim()
+
+# Replace one part's tags, refusing to clobber a concurrent edit
+'{"tags":["bracket","revision-b"]}' | Set-Content "$env:TEMP\t.json" -Encoding utf8
+curl.exe -s -X PUT "$base/parts/<file_id>/tags" -H "Content-Type: application/json" `
+  -H "If-Match: $etag" -H "X-Client-Id: $env:COMPUTERNAME" --data-binary "@$env:TEMP\t.json"
+
+# Tag a whole cluster at once
+'{"part_ids":["<id1>","<id2>","<id3>"]}' | Set-Content "$env:TEMP\b.json" -Encoding utf8
+curl.exe -s -X POST "$base/tags/bracket/parts" -H "Content-Type: application/json" `
+  --data-binary "@$env:TEMP\b.json"
+
+# Retire a tag everywhere (409 without confirm=true)
+curl.exe -s -X DELETE "$base/tags/bracket?confirm=true"
+```
+
+**Linux:**
+```bash
+curl "http://127.0.0.1:8000/similarity/index/my-parts/tags"
+curl -X POST "http://127.0.0.1:8000/similarity/index/my-parts/tags/bracket/parts" \
+  -H "Content-Type: application/json" -d '{"part_ids":["<id1>","<id2>"]}'
+```
+
+**Response (`GET /tags`):**
+```json
+{ "tags": [ { "tag": "bracket", "count": 42 }, { "tag": "revision-b", "count": 7 } ] }
+```
+
+##### Filtering searches and listings by tag
+
+The same three parameters work on `GET .../parts`, `POST .../search` and
+`POST .../search-assembly`:
+
+| Query param | Default | Description |
+|---|---|---|
+| `tags` | — | Comma-separated tag list. |
+| `tag_mode` | `any` | `any` keeps a part carrying at least one of them, `all` requires every one. Any other value is **422**. |
+| `tagged` | — | `true` keeps only tagged parts, `false` only untagged. Combines with `tags`. |
+
+> **A tag-filtered search can return fewer than `top_k` hits.** CADSearch knows
+> nothing about tags, so the filter is applied **after** it has ranked — the
+> alternative, re-ranking a tag-restricted subset, would change the scores and
+> break parity with `hoops_ai_native_bridge`. To compensate, a filtered request
+> asks the index for `top_k × 5` candidates (capped at 200) and keeps the ones
+> that match. When a tag is rare, that pool can still run out. Ask for a larger
+> `top_k`, or list by tag with `GET .../parts?tags=…` when you want completeness
+> rather than ranking. The self hit added by `include_self` is filtered too, so
+> a response never contains a part that fails your filter.
+
+```powershell
+curl.exe -X POST "$base/search?top_k=5&tags=bracket,revision-b&tag_mode=all" -F "file=@C:\path\to\query.step"
+curl.exe "$base/parts?tags=bracket&limit=500"
+curl.exe "$base/parts?tagged=false&limit=500"    # what still needs organising
+```
+
+##### Importing tags from the Qt sandbox
+
+`tools/import_qt_tags.py` converts a `hoops_ai_qt_sandbox` tag sidecar into this
+server's `tags.json`.  The Qt file keys parts by **absolute path**, this server
+by content hash, so the tool re-hashes every referenced CAD file — the files
+must still be reachable at the recorded paths.
+
+```powershell
+C:\SDK\HOOPS_AI\V1.1\.venv\Scripts\python.exe tools\import_qt_tags.py `
+  C:\path\to\qt_index.json --index my-parts --dry-run
+```
+
+`--dry-run` prints what would change and writes nothing.  Add `--merge` to keep
+existing tags instead of replacing them, and `--client-id` to stamp `updated_by`.
+Files that are missing, unregistered in the target index, or carrying an invalid
+tag are skipped with a reason rather than aborting the import; without `--force`
+the tool refuses to overwrite a non-empty `tags.json`.
 
 ##### Part thumbnail / stream cache
 

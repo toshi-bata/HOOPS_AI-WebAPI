@@ -1,4 +1,5 @@
 ﻿import ast
+import copy
 import datetime
 import hashlib
 import io
@@ -1347,6 +1348,14 @@ def remove_from_index(name: str, part_ids: list[str]) -> dict[str, Any]:
         (thumb_dir / f"{pid}.png").unlink(missing_ok=True)
         (scs_dir / f"{pid}.scs").unlink(missing_ok=True)
 
+    # Tags are keyed by file_id, so entries for removed parts would otherwise
+    # linger forever and keep inflating tag counts. Non-fatal: the parts are
+    # already gone from the index either way.
+    try:
+        prune_tags(name, part_ids)
+    except Exception as exc:
+        logger.warning("[TAGS] could not prune tags for index '%s': %s", name, exc)
+
     return {"name": name, "removed": len(part_ids), "index_count": len(vs.get_ids())}
 
 
@@ -1464,6 +1473,22 @@ def _flatten_body_hits(results: Any, top_k: int) -> list[dict[str, Any]]:
     return out
 
 
+# Tag filtering happens after the SDK has ranked, so a filtered search asks for
+# more candidates than it needs. The multiplier is a compromise: high enough
+# that a moderately common tag still fills top_k, low enough that the extra
+# candidates cost little. The cap stops a large top_k from asking the SDK for
+# an unbounded shortlist.
+_TAG_FILTER_OVERFETCH = 5
+_TAG_FILTER_OVERFETCH_MAX = 200
+
+
+def _tag_filtered_fetch_k(k: int, tag_filter: Optional[dict[str, Any]]) -> int:
+    """Return how many candidates to request for a *k*-hit tag-filtered search."""
+    if not tag_filter:
+        return k
+    return min(max(k, k * _TAG_FILTER_OVERFETCH), _TAG_FILTER_OVERFETCH_MAX)
+
+
 def search_index(
     name: str,
     file_id: str,
@@ -1471,6 +1496,9 @@ def search_index(
     kind: str = "any",
     include_self: bool = False,
     include_image: bool = True,
+    tags: Optional[list[str]] = None,
+    tag_mode: str = "any",
+    tagged: Optional[bool] = None,
 ) -> dict[str, Any]:
     """Search the named index for the top-k most similar parts to *file_id*.
 
@@ -1482,6 +1510,15 @@ def search_index(
 
     *kind* is ``"any"`` (no filter), ``"part"`` or ``"assembly"``; anything else
     raises ``ValueError``.
+
+    *tags* / *tag_mode* / *tagged* narrow the hits by the tag sidecar. The
+    filter is applied **after** the SDK has ranked, because CADSearch has no
+    knowledge of tags; scores and relative order are therefore untouched. To
+    compensate, a tag-filtered search asks the SDK for several times *top_k*
+    candidates (see ``_TAG_FILTER_OVERFETCH``). That makes a short result
+    unlikely but not impossible: if fewer than *top_k* of the over-fetched
+    candidates carry the tag, fewer than *top_k* hits are returned. Raising the
+    over-fetch further would start to cost more than it buys.
 
     ``CADSearch.search_by_shape()`` does *not* drop the query from its own
     candidates here: records are keyed by SHA-256 while the query is passed as
@@ -1501,6 +1538,7 @@ def search_index(
         raise ValueError(
             f"Invalid kind '{kind}'. Must be one of: {sorted(_SEARCH_KINDS)}."
         )
+    tag_filter = normalize_tag_filter(tags, tag_mode, tagged)
     index_model = _load_index_model(name)
     lock = _get_index_lock(name)
 
@@ -1526,25 +1564,32 @@ def search_index(
     # embedding cannot be hoisted out of this call. Ask for one extra candidate
     # because the query itself usually occupies a slot and is dropped below.
     k = int(top_k) if int(top_k) > 0 else 1
-    search_kwargs: dict[str, Any] = {"top_k": k + 1}
+    fetch_k = _tag_filtered_fetch_k(k, tag_filter)
+    search_kwargs: dict[str, Any] = {"top_k": fetch_k + 1}
     if kind != "any":
         search_kwargs["filters"] = {"kind": kind}
     results = searcher.search_by_shape(str(query_path), **search_kwargs)
 
-    hit_dicts = _flatten_body_hits(results, k + 1)
+    hit_dicts = _flatten_body_hits(results, fetch_k + 1)
     hit_dicts = [h for h in hit_dicts if h["id"] != file_id]
+    if tag_filter:
+        matches = tag_filter_predicate(name, tag_filter)
+        hit_dicts = [h for h in hit_dicts if matches(h["id"])]
 
     if include_self and file_id in registered_ids:
         # Put the query back at the front so clients can tag the whole displayed
-        # cluster. It was removed above, so this cannot produce a duplicate.
-        hit_dicts.insert(
-            0,
-            {
-                "id": file_id,
-                "score": 1.0,
-                "metadata": _public_metadata(self_meta) or {"file_id": file_id},
-            },
-        )
+        # cluster. It was removed above, so this cannot produce a duplicate. The
+        # tag filter applies to it as well: a response must not contain a part
+        # that fails the filter the caller asked for.
+        if not tag_filter or tag_filter_predicate(name, tag_filter)(file_id):
+            hit_dicts.insert(
+                0,
+                {
+                    "id": file_id,
+                    "score": 1.0,
+                    "metadata": _public_metadata(self_meta) or {"file_id": file_id},
+                },
+            )
     hit_dicts = hit_dicts[:k]
 
     # Phase 3: thumbnail + grid generation (outside lock, non-fatal). Both are
@@ -1744,6 +1789,9 @@ def search_assembly_index(
     use_idf: bool = True,
     include_self: bool = False,
     include_image: bool = True,
+    tags: Optional[list[str]] = None,
+    tag_mode: str = "any",
+    tagged: Optional[bool] = None,
 ) -> dict[str, Any]:
     """Search the named index for assemblies similar to the assembly *file_id*.
 
@@ -1773,6 +1821,10 @@ def search_assembly_index(
     :func:`search_index`, ``include_image`` only controls the display-only
     contact sheet and never affects the hits.
 
+    *tags* / *tag_mode* / *tagged* narrow the hits by the tag sidecar, applied
+    after the matcher has ranked and with the same over-fetch policy and the
+    same caveat as :func:`search_index`: the result can fall short of *top_k*.
+
     Raises ``KeyError`` when the index does not exist.
     """
     _validate_index_name(name)
@@ -1794,6 +1846,8 @@ def search_assembly_index(
     bop_weight = float(bop_weight)
     if not 0.0 <= bop_weight <= 1.0:
         raise ValueError(f"Invalid bop_weight {bop_weight}. Must be between 0.0 and 1.0.")
+    tag_filter = normalize_tag_filter(tags, tag_mode, tagged)
+    fetch_k = _tag_filtered_fetch_k(k, tag_filter)
 
     schema = _load_index_schema(name)
     if schema["schema_version"] < _INDEX_SCHEMA_VERSION:
@@ -1835,7 +1889,7 @@ def search_assembly_index(
     # Phase 2 (unlocked): the fixed arguments mirror hoops_ai_native_bridge.
     results = matcher.search(
         query_path=matcher_query,
-        top_k=k + 1,
+        top_k=fetch_k + 1,
         candidate_k=candidate_k,
         sim_thresh=sim_thresh,
         method="hungarian",
@@ -1854,9 +1908,15 @@ def search_assembly_index(
         if hit is not None and hit["id"] != file_id:
             hit_dicts.append(hit)
 
+    if tag_filter:
+        matches = tag_filter_predicate(name, tag_filter)
+        hit_dicts = [h for h in hit_dicts if matches(h["id"])]
+
     if include_self and file_id in registered_ids:
-        # The query was filtered out above, so this cannot duplicate a hit.
-        hit_dicts.insert(0, _assembly_self_hit(file_id, meta_by_id.get(file_id)))
+        # The query was filtered out above, so this cannot duplicate a hit. It
+        # is subject to the tag filter for the same reason as in search_index().
+        if not tag_filter or tag_filter_predicate(name, tag_filter)(file_id):
+            hit_dicts.insert(0, _assembly_self_hit(file_id, meta_by_id.get(file_id)))
     hit_dicts = hit_dicts[:k]
 
     # Phase 3: display-only contact sheet, identical policy to search_index().
@@ -1913,6 +1973,9 @@ def list_index_parts(
     offset: int = 0,
     limit: int = 100,
     kind: Optional[str] = None,
+    tags: Optional[list[str]] = None,
+    tag_mode: str = "any",
+    tagged: Optional[bool] = None,
 ) -> dict[str, Any]:
     """Return a paginated, file-level listing of the named index.
 
@@ -1920,14 +1983,19 @@ def list_index_parts(
     file_id. *limit* is clamped to ``[1, 2000]`` (default 100) and *offset* to
     ``>= 0``. *kind* (``"part"``/``"assembly"``) filters when supplied.
 
+    *tags* / *tag_mode* / *tagged* filter on the tag sidecar. Filtering happens
+    before pagination, so ``total`` counts what matched rather than what the
+    index holds.
+
     Each item: ``id, filename, kind, bodies, registered_at, has_thumbnail,
-    has_scs`` (the router turns the boolean flags into absolute URLs).
+    has_scs, tags`` (the router turns the boolean flags into absolute URLs).
 
     Raises ``KeyError`` when the index does not exist.
     """
     _validate_index_name(name)
     limit = max(1, min(int(limit), 2000))
     offset = max(0, int(offset))
+    tag_filter = normalize_tag_filter(tags, tag_mode, tagged)
 
     lock = _get_index_lock(name)
     with lock:
@@ -1954,6 +2022,12 @@ def list_index_parts(
     items = [by_fid[f] for f in order]
     if kind:
         items = [it for it in items if it["kind"] == kind]
+    # Read the sidecar once, outside the index lock, and reuse it for both the
+    # filter and the per-item tag lists.
+    by_part = tags_by_part(name)
+    if tag_filter:
+        matches = tag_filter_predicate(name, tag_filter)
+        items = [it for it in items if matches(it["id"])]
     total = len(items)
     page = items[offset : offset + limit]
 
@@ -1977,10 +2051,647 @@ def list_index_parts(
                 "registered_at": it["registered_at"],
                 "has_thumbnail": has_thumbnail,
                 "has_scs": has_scs,
+                "tags": by_part.get(it["id"], []),
             }
         )
 
     return {"total": total, "offset": offset, "limit": limit, "items": result_items}
+
+
+# ---------------------------------------------------------------------------
+# Index tags (indexes/<name>/tags.json)
+# ---------------------------------------------------------------------------
+#
+# Tags live in a sidecar rather than in the record metadata. FaissVectorStore
+# does expose update_record_metadata(), and a probe confirmed that an arbitrary
+# key is accepted, survives save()/load(), and -- because the store keeps one
+# metadata dict per record id rather than per vector row -- covers every body
+# of a file in a single call. It was still rejected, for one measured reason:
+# the only way to persist it is save(), which always rewrites the .faiss file.
+# That moves its mtime, and both the searcher cache and the assembly matcher
+# cache are keyed by (path, mtime_ns). A single tag edit would therefore cost a
+# 19.3 s matcher rebuild (measured at 42,098 bodies) plus an 84 MB rewrite held
+# under the index lock, for a change that does not touch a single vector.
+#
+# The sidecar is keyed by file_id, which is the SHA-256 of the CAD contents, so
+# tags survive a full rebuild of the index: the ids do not change.
+
+_TAGS_SCHEMA_VERSION = 1
+
+# Tag text rules. Case is significant ("Bracket" != "bracket") to match the Qt
+# application; a case-only collision is logged rather than merged, because
+# silently folding them would lose a distinction the user may have meant.
+_TAG_MAX_LENGTH = 64
+_TAGS_PER_PART_DEFAULT = 32
+
+# Parsed tags.json per index, keyed by name and validated against the file's
+# (mtime_ns, size) so an edit made outside the server is picked up. Bounded
+# because a server may host many indexes.
+_TAGS_CACHE_MAX = 8
+_tags_cache: "OrderedDict[str, tuple[tuple[int, int], dict[str, Any], str]]" = OrderedDict()
+_tags_cache_mutex = threading.Lock()
+
+# Per-index lock held across the read-modify-write of tags.json. It is separate
+# from the index lock on purpose: a tag edit touches no vectors, so it must not
+# block searches. Reads take no lock at all -- the file is swapped in with
+# os.replace, so a reader either sees the whole old file or the whole new one.
+#
+# Lock order: tags lock -> (nothing). Registered ids are resolved *before* the
+# tags lock is taken, so the index lock is never acquired while holding it.
+_tags_locks: dict[str, threading.Lock] = {}
+_tags_locks_mutex = threading.Lock()
+
+
+class TagsFileError(RuntimeError):
+    """Raised when tags.json exists but cannot be read as a v1 document."""
+
+
+class TagsPreconditionFailed(RuntimeError):
+    """Raised when an If-Match header does not match the current ETag."""
+
+
+def _get_tags_lock(name: str) -> threading.Lock:
+    with _tags_locks_mutex:
+        if name not in _tags_locks:
+            _tags_locks[name] = threading.Lock()
+        return _tags_locks[name]
+
+
+def _index_tags_path(name: str) -> pathlib.Path:
+    """Return the per-index tag sidecar path (indexes/{name}/tags.json)."""
+    return INDEXES_DIR / name / "tags.json"
+
+
+def max_tags_per_part() -> int:
+    """Upper bound on tags for one part (``HOOPS_AI_MAX_TAGS_PER_PART``)."""
+    return _env_int(
+        "HOOPS_AI_MAX_TAGS_PER_PART", _TAGS_PER_PART_DEFAULT, minimum=1, maximum=1000
+    )
+
+
+def normalize_tag(tag: Any) -> str:
+    """Return the stored form of *tag*, or raise ``ValueError``.
+
+    Surrounding whitespace is trimmed; the result must be non-empty, free of
+    control characters, and at most 64 characters. Case is preserved.
+    """
+    if not isinstance(tag, str):
+        raise ValueError(f"Tag must be a string, got {type(tag).__name__}.")
+    cleaned = tag.strip()
+    if not cleaned:
+        raise ValueError("Tag must not be empty or whitespace only.")
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in cleaned):
+        raise ValueError(f"Tag '{tag}' contains control characters.")
+    if len(cleaned) > _TAG_MAX_LENGTH:
+        raise ValueError(
+            f"Tag is {len(cleaned)} characters; the maximum is {_TAG_MAX_LENGTH}."
+        )
+    # Tags appear as a path segment in /index/{name}/tags/{tag}/parts. Allowing
+    # a separator would route those requests somewhere else and surface as a
+    # confusing 404, so it is rejected at the point of entry instead.
+    if "/" in cleaned or "\\" in cleaned:
+        raise ValueError(f"Tag '{cleaned}' must not contain '/' or '\\'.")
+    return cleaned
+
+
+def _normalize_tag_list(tags: Any) -> list[str]:
+    """Validate a list of tags, de-duplicating while preserving order."""
+    if isinstance(tags, str) or not isinstance(tags, (list, tuple)):
+        raise ValueError("tags must be a list of strings.")
+    out: list[str] = []
+    for tag in tags:
+        cleaned = normalize_tag(tag)
+        if cleaned not in out:
+            out.append(cleaned)
+    limit = max_tags_per_part()
+    if len(out) > limit:
+        raise ValueError(
+            f"{len(out)} tags supplied; the maximum per part is {limit} "
+            f"(HOOPS_AI_MAX_TAGS_PER_PART)."
+        )
+    return out
+
+
+def _warn_on_case_collision(doc: dict[str, Any], tag: str) -> None:
+    """Log when *tag* differs from an existing tag only by case.
+
+    Tags are case-sensitive by design, so this is not an error -- but it is
+    almost always a typo, and it is invisible in a tag list sorted by count.
+    """
+    lowered = tag.lower()
+    for existing in _iter_all_tags(doc):
+        if existing != tag and existing.lower() == lowered:
+            logger.warning(
+                "[TAGS] '%s' differs from the existing tag '%s' only by case; "
+                "they are kept as separate tags",
+                tag,
+                existing,
+            )
+            return
+
+
+def _iter_all_tags(doc: dict[str, Any]):
+    seen: set[str] = set()
+    for entry in doc.get("parts", {}).values():
+        for tag in entry.get("tags", ()):
+            if tag not in seen:
+                seen.add(tag)
+                yield tag
+
+
+def _empty_tags_document() -> dict[str, Any]:
+    return {"version": _TAGS_SCHEMA_VERSION, "updated_at": None, "parts": {}}
+
+
+def _serialize_tags_document(doc: dict[str, Any]) -> bytes:
+    """Serialize deterministically so the ETag depends only on the content."""
+    import json
+
+    return json.dumps(doc, ensure_ascii=False, sort_keys=True).encode("utf-8")
+
+
+def _tags_etag(payload: bytes) -> str:
+    """Return a strong ETag for the serialized document."""
+    return '"' + hashlib.sha256(payload).hexdigest()[:32] + '"'
+
+
+def _parse_tags_document(raw: Any, path: pathlib.Path) -> dict[str, Any]:
+    """Validate a decoded tags.json and drop entries that cannot be used.
+
+    Anything structurally wrong raises rather than being silently discarded:
+    quietly returning an empty document would make the next write erase every
+    tag in the file.
+    """
+    if not isinstance(raw, dict):
+        raise TagsFileError(f"{path} is not a JSON object.")
+    version = raw.get("version")
+    if version != _TAGS_SCHEMA_VERSION:
+        raise TagsFileError(
+            f"{path} has version {version!r}; this server understands "
+            f"version {_TAGS_SCHEMA_VERSION}."
+        )
+    parts = raw.get("parts")
+    if parts is None:
+        parts = {}
+    if not isinstance(parts, dict):
+        raise TagsFileError(f"{path} has a 'parts' member that is not an object.")
+
+    cleaned: dict[str, Any] = {}
+    for part_id, entry in parts.items():
+        if not isinstance(entry, dict):
+            raise TagsFileError(f"{path}: entry for '{part_id}' is not an object.")
+        tags = entry.get("tags")
+        if not isinstance(tags, list):
+            raise TagsFileError(f"{path}: 'tags' for '{part_id}' is not a list.")
+        kept = [t for t in tags if isinstance(t, str) and t.strip()]
+        if not kept:
+            continue
+        record = {"tags": kept}
+        if entry.get("updated_at"):
+            record["updated_at"] = entry["updated_at"]
+        if entry.get("updated_by"):
+            record["updated_by"] = entry["updated_by"]
+        cleaned[str(part_id)] = record
+
+    return {
+        "version": _TAGS_SCHEMA_VERSION,
+        "updated_at": raw.get("updated_at"),
+        "parts": cleaned,
+    }
+
+
+def _read_tags_document(name: str) -> tuple[dict[str, Any], str]:
+    """Return ``(document, etag)`` for the named index.
+
+    Takes no lock: writers swap the file in with ``os.replace``, so a reader
+    sees either the whole previous file or the whole new one. A missing file is
+    an empty document, not an error -- an index simply has no tags yet.
+    """
+    import json
+
+    path = _index_tags_path(name)
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        doc = _empty_tags_document()
+        return doc, _tags_etag(_serialize_tags_document(doc))
+
+    key = (st.st_mtime_ns, st.st_size)
+    with _tags_cache_mutex:
+        cached = _tags_cache.get(name)
+        if cached is not None and cached[0] == key:
+            _tags_cache.move_to_end(name)
+            return copy.deepcopy(cached[1]), cached[2]
+
+    try:
+        payload = path.read_bytes()
+        raw = json.loads(payload.decode("utf-8"))
+    except TagsFileError:
+        raise
+    except Exception as exc:
+        raise TagsFileError(f"Could not read {path}: {exc}") from exc
+
+    doc = _parse_tags_document(raw, path)
+    etag = _tags_etag(_serialize_tags_document(doc))
+
+    with _tags_cache_mutex:
+        _tags_cache[name] = (key, copy.deepcopy(doc), etag)
+        _tags_cache.move_to_end(name)
+        while len(_tags_cache) > _TAGS_CACHE_MAX:
+            _tags_cache.popitem(last=False)
+
+    return doc, etag
+
+
+def _write_tags_document(name: str, doc: dict[str, Any]) -> str:
+    """Persist *doc* atomically and return its new ETag.
+
+    Must be called while holding the tags lock for *name*.
+    """
+    doc["version"] = _TAGS_SCHEMA_VERSION
+    doc["updated_at"] = datetime.datetime.now(datetime.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    payload = _serialize_tags_document(doc)
+    etag = _tags_etag(payload)
+
+    path = _index_tags_path(name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"_tmp_tags_{uuid.uuid4().hex}.json")
+    try:
+        tmp.write_bytes(payload)
+        tmp.replace(path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+    try:
+        st = path.stat()
+        with _tags_cache_mutex:
+            _tags_cache[name] = ((st.st_mtime_ns, st.st_size), copy.deepcopy(doc), etag)
+            _tags_cache.move_to_end(name)
+            while len(_tags_cache) > _TAGS_CACHE_MAX:
+                _tags_cache.popitem(last=False)
+    except OSError:
+        # The file is written; only the cache priming failed. Drop the entry so
+        # the next read goes to disk rather than serving something stale.
+        _evict_tags_cache(name)
+
+    return etag
+
+
+def _evict_tags_cache(name: str) -> None:
+    with _tags_cache_mutex:
+        _tags_cache.pop(name, None)
+
+
+def _require_index_exists(name: str) -> None:
+    """Raise ``KeyError`` when the named index has no FAISS file on disk."""
+    if not _index_faiss_path(name).exists():
+        raise KeyError(f"Index '{name}' does not exist.")
+
+
+def _registered_index_ids(name: str) -> set[str]:
+    """Return the distinct file ids in the named index."""
+    lock = _get_index_lock(name)
+    with lock:
+        vs = _load_named_index(name)
+        return set(vs.get_ids())
+
+
+def etag_matches(if_match: Optional[str], current: str) -> bool:
+    """Return True when *if_match* permits a write against *current*.
+
+    A missing header always passes (documented as the backwards-compatible
+    default). ``*`` matches anything. Otherwise the comma-separated list is
+    compared after stripping the weak-validator prefix.
+    """
+    if if_match is None:
+        return True
+    candidate = if_match.strip()
+    if not candidate:
+        return True
+    if candidate == "*":
+        return True
+    current_value = current.strip('"')
+    for token in candidate.split(","):
+        token = token.strip()
+        if token.startswith("W/"):
+            token = token[2:].strip()
+        if token.strip('"') == current_value:
+            return True
+    return False
+
+
+def _mutate_tags(
+    name: str,
+    if_match: Optional[str],
+    mutator,
+) -> tuple[Any, str]:
+    """Run *mutator* against tags.json under the tags lock.
+
+    *mutator* receives the document and returns ``(result, changed)``. The
+    If-Match check happens inside the lock, so a concurrent writer cannot slip
+    between the check and the write.
+    """
+    _validate_index_name(name)
+    _require_index_exists(name)
+    with _get_tags_lock(name):
+        doc, etag = _read_tags_document(name)
+        if not etag_matches(if_match, etag):
+            raise TagsPreconditionFailed(
+                "The index tags have changed since they were read "
+                f"(current ETag {etag}). Re-read and retry."
+            )
+        result, changed = mutator(doc)
+        if changed:
+            etag = _write_tags_document(name, doc)
+        return result, etag
+
+
+def _stamp(entry: dict[str, Any], client_id: Optional[str]) -> None:
+    entry["updated_at"] = datetime.datetime.now(datetime.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    if client_id:
+        entry["updated_by"] = client_id
+    else:
+        entry.pop("updated_by", None)
+
+
+def get_index_tags(name: str) -> tuple[dict[str, Any], str]:
+    """Return ``({"tags": [{"tag", "count"}], "total": n}, etag)``.
+
+    Ordered by descending count, then by tag name ascending.
+    """
+    _validate_index_name(name)
+    _require_index_exists(name)
+    doc, etag = _read_tags_document(name)
+    counts: dict[str, int] = {}
+    for entry in doc["parts"].values():
+        for tag in entry["tags"]:
+            counts[tag] = counts.get(tag, 0) + 1
+    items = [
+        {"tag": tag, "count": count}
+        for tag, count in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    ]
+    return {"tags": items, "total": len(items)}, etag
+
+
+def get_part_tags(name: str, part_id: str) -> tuple[dict[str, Any], str]:
+    """Return ``({"part_id", "tags"}, etag)`` for one part.
+
+    A part with no tags returns an empty list rather than 404: the caller is
+    asking what is tagged, and "nothing" is a valid answer for any registered
+    id. Whether the id exists in the index is not checked here, so that a
+    client can read tags for an id it is about to register.
+    """
+    _validate_index_name(name)
+    _require_index_exists(name)
+    doc, etag = _read_tags_document(name)
+    entry = doc["parts"].get(part_id)
+    return {"part_id": part_id, "tags": list(entry["tags"]) if entry else []}, etag
+
+
+def set_part_tags(
+    name: str,
+    part_id: str,
+    tags: list[str],
+    if_match: Optional[str] = None,
+    client_id: Optional[str] = None,
+) -> tuple[dict[str, Any], str]:
+    """Replace the whole tag set of *part_id*. An empty list clears it.
+
+    Raises ``ValueError`` for invalid tag text or an unregistered part_id,
+    ``KeyError`` when the index does not exist, and ``TagsPreconditionFailed``
+    on an If-Match mismatch.
+    """
+    _validate_index_name(name)
+    _require_index_exists(name)
+    cleaned = _normalize_tag_list(tags)
+    if part_id not in _registered_index_ids(name):
+        raise ValueError(f"Part '{part_id}' is not registered in index '{name}'.")
+
+    def mutator(doc: dict[str, Any]):
+        for tag in cleaned:
+            _warn_on_case_collision(doc, tag)
+        previous = doc["parts"].get(part_id, {}).get("tags", [])
+        if previous == cleaned:
+            return {"part_id": part_id, "tags": list(cleaned)}, False
+        if cleaned:
+            entry = doc["parts"].setdefault(part_id, {})
+            entry["tags"] = list(cleaned)
+            _stamp(entry, client_id)
+        else:
+            doc["parts"].pop(part_id, None)
+        return {"part_id": part_id, "tags": list(cleaned)}, True
+
+    return _mutate_tags(name, if_match, mutator)
+
+
+def _bulk_tag_update(
+    name: str,
+    tag: str,
+    part_ids: list[str],
+    if_match: Optional[str],
+    client_id: Optional[str],
+    *,
+    assign: bool,
+) -> tuple[dict[str, Any], str]:
+    """Shared body of assign/unassign: apply *tag* to every valid part id.
+
+    Ids that are not registered are skipped and listed with a reason instead of
+    failing the whole request, so one stale id in a gallery selection cannot
+    discard the rest of the work.
+    """
+    _validate_index_name(name)
+    _require_index_exists(name)
+    cleaned_tag = normalize_tag(tag)
+    limit = max_tags_per_part()
+    registered = _registered_index_ids(name)
+
+    def mutator(doc: dict[str, Any]):
+        if assign:
+            _warn_on_case_collision(doc, cleaned_tag)
+        updated = 0
+        skipped: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for part_id in part_ids:
+            pid = str(part_id).strip()
+            if not pid or pid in seen:
+                continue
+            seen.add(pid)
+            if pid not in registered:
+                skipped.append({"part_id": pid, "reason": "not_registered"})
+                continue
+            entry = doc["parts"].get(pid)
+            current = list(entry["tags"]) if entry else []
+            if assign:
+                if cleaned_tag in current:
+                    continue
+                if len(current) >= limit:
+                    skipped.append({"part_id": pid, "reason": "tag_limit_reached"})
+                    continue
+                current.append(cleaned_tag)
+                entry = doc["parts"].setdefault(pid, {})
+                entry["tags"] = current
+                _stamp(entry, client_id)
+            else:
+                if cleaned_tag not in current:
+                    continue
+                current.remove(cleaned_tag)
+                if current:
+                    entry = doc["parts"][pid]
+                    entry["tags"] = current
+                    _stamp(entry, client_id)
+                else:
+                    doc["parts"].pop(pid, None)
+            updated += 1
+        result = {"tag": cleaned_tag, "updated": updated, "skipped": skipped}
+        return result, updated > 0
+
+    return _mutate_tags(name, if_match, mutator)
+
+
+def assign_tag(
+    name: str,
+    tag: str,
+    part_ids: list[str],
+    if_match: Optional[str] = None,
+    client_id: Optional[str] = None,
+) -> tuple[dict[str, Any], str]:
+    """Add *tag* to every registered id in *part_ids*."""
+    return _bulk_tag_update(
+        name, tag, part_ids, if_match, client_id, assign=True
+    )
+
+
+def unassign_tag(
+    name: str,
+    tag: str,
+    part_ids: list[str],
+    if_match: Optional[str] = None,
+    client_id: Optional[str] = None,
+) -> tuple[dict[str, Any], str]:
+    """Remove *tag* from every registered id in *part_ids*."""
+    return _bulk_tag_update(
+        name, tag, part_ids, if_match, client_id, assign=False
+    )
+
+
+def delete_tag(
+    name: str,
+    tag: str,
+    if_match: Optional[str] = None,
+    client_id: Optional[str] = None,
+) -> tuple[dict[str, Any], str]:
+    """Remove *tag* from every part in the index."""
+    _validate_index_name(name)
+    _require_index_exists(name)
+    cleaned_tag = normalize_tag(tag)
+
+    def mutator(doc: dict[str, Any]):
+        removed = 0
+        for part_id in list(doc["parts"].keys()):
+            entry = doc["parts"][part_id]
+            if cleaned_tag not in entry["tags"]:
+                continue
+            remaining = [t for t in entry["tags"] if t != cleaned_tag]
+            if remaining:
+                entry["tags"] = remaining
+                _stamp(entry, client_id)
+            else:
+                doc["parts"].pop(part_id, None)
+            removed += 1
+        return {"tag": cleaned_tag, "removed_from": removed}, removed > 0
+
+    return _mutate_tags(name, if_match, mutator)
+
+
+def prune_tags(name: str, part_ids: list[str]) -> int:
+    """Drop tag entries for ids that are no longer registered.
+
+    Called after parts are removed from an index. Without it the sidecar would
+    grow forever: an id removed from the index would keep its tags, count
+    towards every tag total, and never be reachable again.
+    """
+    try:
+        _validate_index_name(name)
+        _require_index_exists(name)
+    except (ValueError, PermissionError, KeyError):
+        return 0
+
+    targets = {str(p).strip() for p in part_ids if str(p).strip()}
+    if not targets:
+        return 0
+
+    def mutator(doc: dict[str, Any]):
+        removed = 0
+        for part_id in targets:
+            if doc["parts"].pop(part_id, None) is not None:
+                removed += 1
+        return removed, removed > 0
+
+    removed, _ = _mutate_tags(name, None, mutator)
+    if removed:
+        logger.info("[TAGS] dropped %d tag entries removed from index '%s'", removed, name)
+    return removed
+
+
+def tags_by_part(name: str) -> dict[str, list[str]]:
+    """Return ``{part_id: [tag, ...]}`` for the named index (empty when none)."""
+    try:
+        doc, _ = _read_tags_document(name)
+    except TagsFileError as exc:
+        # Filtering and listing must not fail because the sidecar is unreadable;
+        # they degrade to "no tags", but loudly.
+        logger.warning("[TAGS] ignoring unreadable sidecar for index '%s': %s", name, exc)
+        return {}
+    return {pid: list(entry["tags"]) for pid, entry in doc["parts"].items()}
+
+
+def normalize_tag_filter(
+    tags: Optional[list[str]],
+    tag_mode: str = "any",
+    tagged: Optional[bool] = None,
+) -> Optional[dict[str, Any]]:
+    """Validate a tag filter, returning None when no filtering was requested."""
+    if tag_mode not in ("any", "all"):
+        raise ValueError(f"Invalid tag_mode '{tag_mode}'. Must be 'any' or 'all'.")
+    cleaned = [normalize_tag(t) for t in tags] if tags else []
+    if not cleaned and tagged is None:
+        return None
+    return {"tags": cleaned, "tag_mode": tag_mode, "tagged": tagged}
+
+
+def tag_filter_predicate(name: str, tag_filter: Optional[dict[str, Any]]):
+    """Return a callable ``(part_id) -> bool`` implementing *tag_filter*.
+
+    The sidecar is read once and captured, so a filter applied to a long list
+    of hits does not re-read the file per item.
+    """
+    if not tag_filter:
+        return lambda _part_id: True
+
+    by_part = tags_by_part(name)
+    wanted = tag_filter["tags"]
+    mode = tag_filter["tag_mode"]
+    tagged = tag_filter["tagged"]
+    wanted_set = set(wanted)
+
+    def predicate(part_id: str) -> bool:
+        current = by_part.get(part_id) or []
+        if tagged is True and not current:
+            return False
+        if tagged is False and current:
+            return False
+        if not wanted_set:
+            return True
+        if mode == "all":
+            return wanted_set.issubset(current)
+        return bool(wanted_set.intersection(current))
+
+    return predicate
 
 
 def delete_index(name: str) -> dict[str, Any]:
@@ -1998,6 +2709,7 @@ def delete_index(name: str) -> dict[str, Any]:
         # Drop cached searchers so a deleted index stops holding memory.
         _evict_named_searchers(name)
         _evict_assembly_matchers(name)
+    _evict_tags_cache(name)
 
     # Remove the entire index directory (faiss + meta + thumbnails)
     index_dir = INDEXES_DIR / name
