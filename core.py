@@ -186,6 +186,24 @@ _MIN_BODIES_FOR_ASSEMBLY = 2
 _ASSEMBLY_MATCHER_CACHE_MAX = 1
 _assembly_matchers: "OrderedDict[tuple[str, int], Any]" = OrderedDict()
 
+# Guards _assembly_matchers itself. Always the innermost lock: never acquire
+# anything else while holding it.
+_assembly_matchers_mutex = threading.Lock()
+
+# Per-index lock held for the whole of a matcher build, so two callers wanting
+# the same matcher produce one build rather than two. Distinct from the index
+# lock on purpose: building takes ~20 s, and holding the index lock that long
+# would stall part search on an index that is only being read.
+# Lock order is build lock -> index lock -> _assembly_matchers_mutex; nothing
+# acquires them the other way round.
+_assembly_build_locks: dict[str, threading.Lock] = {}
+_assembly_build_locks_mutex = threading.Lock()
+
+# Index names whose matcher is being rebuilt in the background, so a burst of
+# jobs on one index cannot stack rebuilds of the same corpus.
+_assembly_prewarm_in_flight: set[str] = set()
+_assembly_prewarm_mutex = threading.Lock()
+
 # Thread-pool size for the matcher's stage-2 scoring. The bridge hard-codes 8;
 # here it is configurable because those threads compete with the server's own
 # request workers.
@@ -1592,11 +1610,34 @@ def _assembly_search_jobs() -> int:
     return jobs
 
 
-def _evict_assembly_matchers(name: str) -> None:
-    """Drop every cached AssemblyMatcher belonging to *name*."""
+def _evict_assembly_matchers_locked(name: str) -> None:
+    """Drop every cached AssemblyMatcher for *name*. Caller holds the mutex."""
     path_key = str(_index_faiss_path(name))
     for stale in [k for k in _assembly_matchers if k[0] == path_key]:
         _assembly_matchers.pop(stale, None)
+
+
+def _evict_assembly_matchers(name: str) -> None:
+    """Drop every cached AssemblyMatcher belonging to *name*."""
+    with _assembly_matchers_mutex:
+        _evict_assembly_matchers_locked(name)
+
+
+def _get_assembly_build_lock(name: str) -> threading.Lock:
+    with _assembly_build_locks_mutex:
+        if name not in _assembly_build_locks:
+            _assembly_build_locks[name] = threading.Lock()
+        return _assembly_build_locks[name]
+
+
+def _lookup_assembly_matcher(faiss_path: "pathlib.Path") -> tuple[Any, tuple[str, int]]:
+    """Return ``(matcher_or_None, cache_key)`` for the index's current mtime."""
+    key = (str(faiss_path), faiss_path.stat().st_mtime_ns)
+    with _assembly_matchers_mutex:
+        cached = _assembly_matchers.get(key)
+        if cached is not None:
+            _assembly_matchers.move_to_end(key)
+    return cached, key
 
 
 def _get_assembly_matcher(name: str, model: str) -> Any:
@@ -1604,14 +1645,23 @@ def _get_assembly_matcher(name: str, model: str) -> Any:
 
     Building one is far more expensive than a plain searcher: on top of loading
     the index it runs ``build_part_rarity_weights()``, a FAISS k-means over
-    every body vector in the corpus. The construction time is logged so the
-    real cost stays visible.
+    every body vector in the corpus -- 19.3 s at 42,098 bodies. The construction
+    time is logged so the real cost stays visible.
 
-    Must be called while holding the per-index lock. The returned instance is
-    safe to use *outside* the lock for the same reason as
-    :func:`_get_named_searcher`: it holds its own copy of the corpus, so a
-    concurrent ``_save_named_index_atomic()`` cannot disturb an in-flight
-    search. The next request sees a new mtime and rebuilds.
+    **Must not be called while holding the per-index lock**; this function takes
+    that lock itself, for the disk read only. Splitting it that way is the point:
+    ``_save_named_index_atomic()`` replaces ``.faiss`` and ``.meta`` in two
+    steps, so a reader outside the lock could pair a new index with an old
+    metadata file (and on Windows the replace can fail outright against an open
+    handle) -- but the k-means afterwards touches nothing but memory, and holding
+    the index lock across it would stall part search on an index nobody is
+    writing to.
+
+    Concurrent callers are serialised on a per-index build lock, so they produce
+    one build rather than one each. The returned instance is safe to use outside
+    every lock for the same reason as :func:`_get_named_searcher`: it holds its
+    own copy of the corpus, so a later save cannot disturb an in-flight search.
+    The next request sees a new mtime and rebuilds.
 
     Raises ``KeyError`` when the index does not exist.
     """
@@ -1619,38 +1669,157 @@ def _get_assembly_matcher(name: str, model: str) -> Any:
     if not faiss_path.exists():
         raise KeyError(f"Index '{name}' does not exist.")
 
-    key = (str(faiss_path), faiss_path.stat().st_mtime_ns)
-    cached = _assembly_matchers.get(key)
+    cached, _ = _lookup_assembly_matcher(faiss_path)
     if cached is not None:
-        _assembly_matchers.move_to_end(key)
         return cached
 
+    with _get_assembly_build_lock(name):
+        # Re-check: whoever held the build lock has just published a matcher,
+        # and it is current unless the index changed again in the meantime.
+        if not faiss_path.exists():
+            raise KeyError(f"Index '{name}' does not exist.")
+        cached, _ = _lookup_assembly_matcher(faiss_path)
+        if cached is not None:
+            return cached
+
+        try:
+            from hoops_ai.ml.embeddings import CADSearch
+        except ImportError:  # older/newer layouts re-export it one level up
+            from hoops_ai.ml import CADSearch
+
+        from vendor.assembly_matcher import AssemblyMatcher
+
+        started = time.perf_counter()
+
+        # Phase 1 (index lock): read the index off disk, paired with its meta.
+        with _get_index_lock(name):
+            if not faiss_path.exists():
+                raise KeyError(f"Index '{name}' does not exist.")
+            key = (str(faiss_path), faiss_path.stat().st_mtime_ns)
+            searcher = CADSearch(shape_model=get_embedder(model))
+            batch = _load_shape_index_pickle_compat(searcher, faiss_path)
+
+        # Phase 2 (unlocked): the k-means, which is the expensive part and works
+        # only on the copy loaded above.
+        matcher = AssemblyMatcher(
+            searcher=searcher,
+            embedding_batch=batch,
+            min_bodies_for_assembly=_MIN_BODIES_FOR_ASSEMBLY,
+        )
+        matcher.build_part_rarity_weights()
+        logger.info(
+            "[ASSEMBLY] built matcher for index '%s' in %.2fs",
+            name, time.perf_counter() - started,
+        )
+
+        # Keyed by the mtime read at load time: if the index was written while
+        # the k-means ran, this entry is born stale and is simply never served.
+        with _assembly_matchers_mutex:
+            _evict_assembly_matchers_locked(name)
+            _assembly_matchers[key] = matcher
+            while len(_assembly_matchers) > _ASSEMBLY_MATCHER_CACHE_MAX:
+                _assembly_matchers.popitem(last=False)
+        return matcher
+
+
+def _has_cached_assembly_matcher(name: str) -> bool:
+    """Whether a matcher for *name* is held, current or stale.
+
+    Presence is the signal that assembly search has actually been used on this
+    index: nothing else puts an entry here. A stale entry (one whose mtime no
+    longer matches) counts, because it is exactly what a registration job has
+    just invalidated.
+    """
+    path_key = str(_index_faiss_path(name))
+    with _assembly_matchers_mutex:
+        return any(k[0] == path_key for k in _assembly_matchers)
+
+
+def assembly_prewarm_enabled() -> bool:
+    """Whether to rebuild the assembly matcher after a registration job.
+
+    From HOOPS_AI_ASSEMBLY_PREWARM, default on. Turning it off costs the first
+    searcher after each job the full build time instead.
+    """
+    raw = os.getenv("HOOPS_AI_ASSEMBLY_PREWARM", "").strip().lower()
+    if not raw:
+        return True
+    return raw in ("1", "true", "yes", "on")
+
+
+def _rebuild_assembly_matcher(name: str) -> None:
+    """Body of the background rebuild. Never raises."""
     try:
-        from hoops_ai.ml.embeddings import CADSearch
-    except ImportError:  # older/newer layouts re-export it one level up
-        from hoops_ai.ml import CADSearch
+        schema = _load_index_schema(name)
+        if schema["schema_version"] < _INDEX_SCHEMA_VERSION:
+            # Assembly search rejects legacy indexes, so a matcher would never
+            # be used.
+            return
+        started = time.perf_counter()
+        # No index lock here: _get_assembly_matcher takes it itself, for the
+        # disk read only, so part search is not stalled for the k-means.
+        _get_assembly_matcher(name, schema["model"])
+        logger.info(
+            "[ASSEMBLY] prewarmed matcher for index '%s' in %.2fs",
+            name, time.perf_counter() - started,
+        )
+    except KeyError:
+        # Index deleted between the job finishing and this thread running.
+        logger.info("[ASSEMBLY] prewarm skipped: index '%s' no longer exists", name)
+    except Exception as exc:
+        # A failed prewarm only means the next searcher pays the build cost.
+        logger.warning("[ASSEMBLY] prewarm failed for index '%s': %s", name, exc)
+    finally:
+        with _assembly_prewarm_mutex:
+            _assembly_prewarm_in_flight.discard(name)
 
-    from vendor.assembly_matcher import AssemblyMatcher
 
-    started = time.perf_counter()
-    searcher = CADSearch(shape_model=get_embedder(model))
-    batch = _load_shape_index_pickle_compat(searcher, faiss_path)
-    matcher = AssemblyMatcher(
-        searcher=searcher,
-        embedding_batch=batch,
-        min_bodies_for_assembly=_MIN_BODIES_FOR_ASSEMBLY,
+def prewarm_assembly_matcher(name: str) -> bool:
+    """Rebuild the assembly matcher for *name* in the background.
+
+    A registration job changes the ``.faiss`` mtime, which invalidates the
+    cached matcher; rebuilding it costs a FAISS k-means over every body vector
+    in the corpus -- 24 s at 42,098 bodies -- and that cost would otherwise land
+    on whoever searches next. On a shared server that is a different person from
+    the one who indexed, which is the whole reason to move it here.
+
+    Only indexes that already had a matcher are rebuilt (see
+    :func:`_has_cached_assembly_matcher`), so a deployment that never runs
+    assembly search never pays for one. Only one rebuild per index is in flight
+    at a time. Returns whether a rebuild was started.
+
+    A searcher arriving mid-rebuild waits on the same per-index build lock and
+    then finds the matcher cached, rather than starting a second build of the
+    same corpus. No stale matcher can be served while it runs, because the cache
+    is keyed by the index's mtime.
+
+    **Only registration jobs call this, not the synchronous ``add_to_index``.**
+    That path is used one file at a time (the MCP server adds singly), so
+    rebuilding on every call would put a ~20 s k-means behind a one-file add and
+    let prewarming dominate the cost of registering. Warming the synchronous
+    path would need a debounce -- one rebuild once the adds have stopped -- not
+    this hook.
+    """
+    if not assembly_prewarm_enabled():
+        return False
+    if not _has_cached_assembly_matcher(name):
+        logger.debug(
+            "[ASSEMBLY] prewarm skipped for index '%s': assembly search unused",
+            name,
+        )
+        return False
+    with _assembly_prewarm_mutex:
+        if name in _assembly_prewarm_in_flight:
+            return False
+        _assembly_prewarm_in_flight.add(name)
+    thread = threading.Thread(
+        target=_rebuild_assembly_matcher,
+        args=(name,),
+        name=f"assembly-prewarm-{name}",
+        daemon=True,
     )
-    matcher.build_part_rarity_weights()
-    logger.info(
-        "[ASSEMBLY] built matcher for index '%s' in %.2fs",
-        name, time.perf_counter() - started,
-    )
-
-    _evict_assembly_matchers(name)
-    _assembly_matchers[key] = matcher
-    while len(_assembly_matchers) > _ASSEMBLY_MATCHER_CACHE_MAX:
-        _assembly_matchers.popitem(last=False)
-    return matcher
+    thread.start()
+    return True
 
 
 def _assembly_metadata_by_id(vs: Any) -> dict[str, dict[str, Any]]:
@@ -1808,16 +1977,17 @@ def search_assembly_index(
     index_model = schema["model"]
     lock = _get_index_lock(name)
 
-    # Phase 1 (locked): resolve the cached matcher and read the metadata map.
-    # Building the matcher is the expensive part; the search itself runs
-    # unlocked below so that indexing does not block concurrent searches.
+    # Phase 1 (locked): read the metadata map. Resolving the matcher is left
+    # outside the lock deliberately -- it takes the index lock itself for its
+    # disk read, then runs the expensive k-means unlocked -- so a cold assembly
+    # search does not stall part search on the same index for ~20 s.
     with lock:
         vs = _load_named_index(name)
         registered_ids = set(vs.get_ids())
         if not registered_ids:
             return {"hits": [], "count": 0, "image_url": None}
         meta_by_id = _assembly_metadata_by_id(vs)
-        matcher = _get_assembly_matcher(name, index_model)
+    matcher = _get_assembly_matcher(name, index_model)
 
     if file_id in registered_ids:
         # AssemblyMatcher keys its per-file rows by record id, which here is the
@@ -4217,6 +4387,15 @@ def run_index_add_job(
         logger.warning("[JOB] could not write report for job %s: %s", ctx.job_id, exc)
 
     ctx.set_phase("done")
+
+    # The job has just changed the .faiss mtime, invalidating any cached
+    # assembly matcher. Rebuild it off the job thread so the job is reported
+    # done immediately and the next searcher does not pay for the k-means.
+    if added or updated:
+        try:
+            prewarm_assembly_matcher(name)
+        except Exception as exc:  # never fail a completed job over a warm-up
+            logger.warning("[JOB] could not start matcher prewarm: %s", exc)
 
 
 # Default limits for ZIP extraction (also used by routers). Both can be raised
