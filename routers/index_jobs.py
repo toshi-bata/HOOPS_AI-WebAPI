@@ -60,6 +60,9 @@ class IndexAddJobRequest(BaseModel):
 
 
 class JobProgress(BaseModel):
+    # phase is "embedding" while the batch runs, "heavy" while the SDK works
+    # through its single-worker RAM fallback, then "done". done/errors/heavy
+    # advance live: they are parsed from the SDK's own progress bar.
     phase: str
     done: int
     total: int

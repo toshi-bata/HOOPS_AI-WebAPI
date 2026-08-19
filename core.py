@@ -8,13 +8,14 @@ import pathlib
 import re
 import shutil
 import ssl
+import sys
 import tempfile
 import threading
 import time
 import uuid
 import zipfile
 from collections import OrderedDict
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stdout
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -603,6 +604,90 @@ def read_too_heavy_files(
     return []
 
 
+def read_error_summary_reasons(
+    directory: Optional["pathlib.Path"] = None,
+    newer_than: Optional[float] = None,
+) -> dict[str, str]:
+    """Per-file failure reasons from the SDK's ``error_summary.json``.
+
+    This is the same source ``hoops_ai_qt_sandbox`` reads
+    (``readErrorSummaryReasons`` in SimilarityIndexPanel.cpp): a JSON array of
+    ``{"item_index", "item", "error"}`` objects where ``item`` is the absolute
+    input path. Only the first line of ``error`` is kept.
+
+    It is needed because ``batch.metadata['errors']`` is not always attributable.
+    Measured on hoops_ai 1.1.0: a parallel run that times out reports bare reason
+    strings with no path in them, so there is nothing to match a file against --
+    and the list is in completion order, which is not the submission order, so
+    zipping it positionally would mis-attribute reasons. ``error_summary.json``
+    carries the path explicitly, so it is exact.
+
+    The SDK logs ``Undefined flowdir ... Using path [.]`` and writes the file to
+    the process working directory, overwriting it on every ``embed_shape_batch``
+    call. *directory* is tried first in case a future SDK honours ``log_dir``.
+    *newer_than* is a ``time.time()`` stamp taken before the batch started: an
+    older file belongs to a previous run and is ignored rather than reported as
+    if it described this one.
+
+    Returns ``{normalised path: reason}``; empty when the file is absent,
+    unreadable, stale or not in the expected shape.
+    """
+    import json
+
+    candidates: list[pathlib.Path] = []
+    if directory is not None:
+        candidates.append(pathlib.Path(directory))
+    candidates.append(pathlib.Path.cwd())
+
+    for base in candidates:
+        path = base / "error_summary.json"
+        try:
+            if newer_than is not None and path.stat().st_mtime < newer_than:
+                logger.info(
+                    "ignoring stale %s (written before this batch started)", path
+                )
+                continue
+            with path.open("r", encoding="utf-8", errors="replace") as fh:
+                doc = json.load(fh)
+        except FileNotFoundError:
+            continue
+        except Exception as exc:
+            logger.warning("Could not read %s: %s", path, exc)
+            continue
+
+        if not isinstance(doc, list):
+            logger.warning(
+                "%s has unexpected shape %s (expected a list)",
+                path,
+                type(doc).__name__,
+            )
+            continue
+
+        reasons: dict[str, str] = {}
+        for entry in doc:
+            if not isinstance(entry, dict):
+                continue
+            item = entry.get("item")
+            if not item:
+                continue
+            reason = str(entry.get("error") or "").splitlines()
+            reasons[_norm_path_key(str(item))] = reason[0].strip() if reason else ""
+        return reasons
+    return {}
+
+
+def _norm_path_key(path: str) -> str:
+    """Normalise a path for matching against the SDK's own log files.
+
+    The SDK writes paths with either slash direction and, on Windows, in a case
+    that need not match ours. Mirrors ``normPathKey`` in qt_sandbox.
+    """
+    try:
+        return os.path.normcase(os.path.normpath(path))
+    except Exception:
+        return os.path.normcase(path)
+
+
 def build_embed_specifications(
     images_dir: "pathlib.Path",
     time_limit: Optional[int] = None,
@@ -637,6 +722,120 @@ def build_embed_specifications(
     return specs
 
 
+_PROGRESS_STDERR_LOCK = threading.Lock()
+
+
+class _TqdmProgressStderr:
+    """``sys.stderr`` replacement that parses hoops_ai's tqdm bar.
+
+    ``embed_shape_batch`` renders a tqdm bar on stderr that already carries
+    everything a caller needs::
+
+        Computing embeddings:  70%|####| 28/40 [01:06<00:22, 1.84s/it, pool=1, errors=18, heavy=0]
+
+    Every write is mirrored to the real stderr and then parsed, so the server log
+    is unchanged and the job record gains live counters. Ported from
+    ``_BridgeProgressStderr`` in hoops_ai_native_bridge (hoops_ai_bridge.cpp),
+    including ``isatty() -> True``: tqdm only emits incremental updates when it
+    believes it is writing to a terminal, and the server's stderr may be a pipe
+    or a service log.
+
+    Parsing is strictly best-effort. Any failure is swallowed, because dropping a
+    progress update must never break the embedding run.
+    """
+
+    _re_frac = re.compile(r"(\d+)\s*/\s*(\d+)")
+    _re_err = re.compile(r"errors=(\d+)")
+    _re_heavy = re.compile(r"heavy=(\d+)")
+
+    def __init__(self, real: Any, report: Any) -> None:
+        self._real = real
+        self._report = report
+        self._last: Optional[tuple] = None
+
+    def write(self, s: str) -> int:
+        try:
+            if self._real is not None:
+                self._real.write(s)
+        except Exception:
+            pass
+        try:
+            if s and ("Computing embeddings" in s or "Heavy Files" in s):
+                phase = "heavy" if "Heavy Files" in s else "embedding"
+                m = self._re_frac.search(s)
+                if m:
+                    done, total = int(m.group(1)), int(m.group(2))
+                    me = self._re_err.search(s)
+                    mh = self._re_heavy.search(s)
+                    key = (
+                        phase,
+                        done,
+                        total,
+                        int(me.group(1)) if me else -1,
+                        int(mh.group(1)) if mh else -1,
+                    )
+                    # tqdm redraws the same line many times a second; only report
+                    # when a counter actually moved, so the job record is not
+                    # rewritten on every repaint.
+                    if key != self._last:
+                        self._last = key
+                        self._report(*key)
+        except Exception:
+            pass
+        return len(s) if s else 0
+
+    def flush(self) -> None:
+        try:
+            if self._real is not None:
+                self._real.flush()
+        except Exception:
+            pass
+
+    def isatty(self) -> bool:
+        return True
+
+    def fileno(self) -> int:
+        if self._real is not None:
+            return self._real.fileno()
+        raise OSError("no fileno")
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real, name)
+
+
+@contextmanager
+def capture_embed_progress(report: Optional[Any]):
+    """Install the tqdm-parsing stderr shim for the duration of the block.
+
+    Yields ``True`` when the shim is active. Yields ``False`` when there is
+    nothing to report to, or when another embedding run already holds the shim:
+    ``sys.stderr`` is process-global, so two concurrent runs would interleave
+    into one bar and each would report the other's counters. Registration jobs
+    are serialised by default (see :func:`job_max_concurrency`), so the second
+    case only arises if an operator raised the concurrency; progress is then
+    dropped rather than reported wrongly.
+
+    The original stderr is always restored, including on exceptions.
+    """
+    if report is None:
+        yield False
+        return
+    if not _PROGRESS_STDERR_LOCK.acquire(blocking=False):
+        logger.warning(
+            "another embedding run holds the progress shim; "
+            "live progress is disabled for this one"
+        )
+        yield False
+        return
+    real = sys.stderr
+    try:
+        sys.stderr = _TqdmProgressStderr(real, report)
+        yield True
+    finally:
+        sys.stderr = real
+        _PROGRESS_STDERR_LOCK.release()
+
+
 def _embed_bodies_for_index(
     file_ids: list[str],
     index_name: str,
@@ -644,6 +843,7 @@ def _embed_bodies_for_index(
     num_workers: Optional[int] = None,
     time_limit: Optional[int] = None,
     log_dir: Optional["pathlib.Path"] = None,
+    progress_cb: Optional[Any] = None,
 ) -> tuple[list, list[dict[str, Any]]]:
     """Embed *file_ids* at body granularity and build one VectorRecord per body.
 
@@ -660,6 +860,10 @@ def _embed_bodies_for_index(
     "decide here" (see ``compute_auto_workers`` and ``embed_time_limit``).
     *log_dir* redirects the SDK's ``too_heavy_files.log`` (see
     :func:`build_embed_specifications`).
+
+    *progress_cb* is called as ``cb(phase, done, total, errors, heavy)`` while
+    the batch runs, parsed from the SDK's tqdm bar (see
+    :func:`capture_embed_progress`). ``None`` keeps the bar suppressed.
     """
     import json
     import shutil
@@ -728,7 +932,19 @@ def _embed_bodies_for_index(
             index_name, len(ordered_paths), kwargs.get("num_workers", "sdk-default"),
             specs.get("time_limit_overall", "sdk-default"),
         )
-        batch = embedder.embed_shape_batch(ordered_paths, **kwargs)
+        # Stamp taken before the batch so a leftover error_summary.json from an
+        # earlier run is recognised as stale.
+        batch_started = time.time()
+        with capture_embed_progress(progress_cb) as live:
+            # show_progress is deliberately left False. The bridge sets it True
+            # to make the bar appear, but measured here on hoops_ai 1.1.0 the
+            # parallel executor draws "Computing embeddings: 0/40 ..." on stderr
+            # even with it False, so turning it on risks a second, outer bar
+            # whose counters would interleave with the one we parse. If a future
+            # SDK stops drawing it, progress simply stops advancing -- the run
+            # itself is unaffected.
+            _ = live
+            batch = embedder.embed_shape_batch(ordered_paths, **kwargs)
 
         ids = list(getattr(batch, "ids", []) or [])
         values = np.asarray(getattr(batch, "values", []), dtype=np.float32)
@@ -791,7 +1007,15 @@ def _embed_bodies_for_index(
         missing_fids = [
             fid for fid in file_ids if fid in submitted_fids and fid not in rows_by_fid
         ]
+        # Fallback source for reasons the batch metadata cannot attribute. Read
+        # once per batch, and only when there is something to explain.
+        summary_reasons: dict[str, str] = {}
+        if missing_fids:
+            summary_reasons = read_error_summary_reasons(
+                log_dir, newer_than=batch_started
+            )
         matched_any_reason = False
+        summary_hits = 0
         for fid in missing_fids:
             detail = _embed_error_detail(
                 embed_errors,
@@ -801,18 +1025,34 @@ def _embed_bodies_for_index(
             )
             if detail != _EMBED_ERROR_DEFAULT:
                 matched_any_reason = True
+            elif summary_reasons:
+                reason = summary_reasons.get(_norm_path_key(norm_by_fid.get(fid, "")))
+                if reason:
+                    detail = reason
+                    summary_hits += 1
             errors.append({"file_id": fid, "detail": detail})
+
+        if summary_hits:
+            logger.info(
+                "index '%s': recovered %d of %d failure reason(s) from "
+                "error_summary.json",
+                index_name,
+                summary_hits,
+                len(missing_fids),
+            )
 
         if (
             missing_fids
             and isinstance(embed_errors, list)
             and embed_errors
             and not matched_any_reason
+            and not summary_hits
         ):
             logger.warning(
                 "index '%s': %d file(s) produced no rows but none matched any of "
-                "the %d entries in batch metadata['errors']; its format may have "
-                "changed and embedding failure reasons may be unreliable",
+                "the %d entries in batch metadata['errors'], and error_summary.json "
+                "did not cover them either; embedding failure reasons are unreliable "
+                "for this batch",
                 index_name,
                 len(missing_fids),
                 len(embed_errors),
@@ -939,6 +1179,7 @@ def add_to_index(
     num_workers: Optional[int] = None,
     time_limit: Optional[int] = None,
     log_dir: Optional["pathlib.Path"] = None,
+    progress_cb: Optional[Any] = None,
 ) -> dict[str, Any]:
     """Embed *file_ids* at body granularity and upsert one row per body.
 
@@ -951,6 +1192,7 @@ def add_to_index(
 
     *num_workers* and *time_limit* tune the SDK call; ``None`` keeps this
     module's defaults. *log_dir* redirects the SDK's ``too_heavy_files.log``.
+    *progress_cb* receives live counters parsed from the SDK's progress bar.
     Existing callers that pass none of them are unaffected.
 
     Returns ``added``, ``updated``, ``index_count``, and per-file ``errors``.
@@ -981,6 +1223,7 @@ def add_to_index(
             num_workers=num_workers,
             time_limit=time_limit,
             log_dir=log_dir,
+            progress_cb=progress_cb,
         )
 
         existing_ids: set[str] = set(vs.get_ids())
@@ -3875,9 +4118,33 @@ def run_index_add_job(
             continue
 
     t0 = time.perf_counter()
+
+    # Live counters parsed from the SDK's own progress bar, so a client polling
+    # the job sees it advance instead of 0/N until the batch ends. The bar's own
+    # total is ignored: progress.total is the number of files this job submitted,
+    # which is the number the client asked about.
+    seen_phase = {"value": "embedding"}
+
+    def _on_progress(
+        phase: str, done: int, _bar_total: int, err_count: int, heavy: int
+    ) -> None:
+        fields: dict[str, Any] = {"done": int(done)}
+        if err_count >= 0:
+            fields["errors"] = int(err_count)
+        if heavy >= 0:
+            fields["heavy"] = int(heavy)
+        if phase != seen_phase["value"]:
+            seen_phase["value"] = phase
+            fields["phase"] = phase
+        try:
+            ctx.set_progress(**fields)
+        except Exception:
+            # Persisting progress is best-effort; never fail a run over it.
+            logger.debug("progress update dropped", exc_info=True)
+
     result = add_to_index(
         name, file_ids, model=model, num_workers=workers, time_limit=limit,
-        log_dir=artifacts,
+        log_dir=artifacts, progress_cb=_on_progress,
     )
     timings["embed_seconds"] = round(time.perf_counter() - t0, 3)
 
@@ -3911,8 +4178,9 @@ def run_index_add_job(
         )
 
     ctx.add_errors(errors)
-    ctx.advance(done=total, errors=len(errors))
-    ctx.set_progress(heavy=len(heavy_flagged))
+    # Absolute, not incremental: the live callback above has already been moving
+    # progress.done, so incrementing here would count the batch twice.
+    ctx.set_progress(done=total, errors=len(errors), heavy=len(heavy_flagged))
     ctx.set_summary(
         added=added, updated=updated, failed=len(errors), skipped=0,
         index_count=index_count, heavy_flagged=len(heavy_flagged),

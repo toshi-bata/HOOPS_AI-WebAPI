@@ -344,14 +344,14 @@ class TestEmbedBodiesMissingFiles(unittest.TestCase):
         )
 
     def test_warns_when_no_error_entry_matches_the_failed_file(self):
-        # Non-empty list whose entries reference some other file: the format may
-        # have changed, so the generic fallback must be announced.
+        # Non-empty list whose entries reference some other file, and no
+        # error_summary.json to fall back on: the gap must be announced.
         self._install_embedder(["Failed to compute embedding for /other/file.step: boom"])
         with self.assertLogs(core.logger, level="WARNING") as cm:
             _records, errors = core._embed_bodies_for_index(self.fids, "idx", "signal")
         self.assertTrue(
-            any("format may have changed" in m for m in cm.output),
-            f"expected a format-change warning, got: {cm.output}",
+            any("reasons are unreliable" in m for m in cm.output),
+            f"expected an unattributable-reason warning, got: {cm.output}",
         )
         detail = next(e["detail"] for e in errors if e["file_id"] == self.fids[2])
         self.assertEqual(detail, core._EMBED_ERROR_DEFAULT)
