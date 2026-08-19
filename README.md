@@ -110,6 +110,7 @@ cp .env.example .env
 | `HOOPS_AI_PART_CLASS_LABEL_KEY` | optional | Label array key for dataset queries (default: `part_label`; use `task_A` for custom ETL) |
 | `HOOPS_AI_ENABLE_DEMO_FEATURES` | optional | Set to `true` to expose the demo-only endpoints listed below. Defaults to `false` (disabled) so a public deployment never serves them by accident. |
 | `HOOPS_AI_ASSEMBLY_SEARCH_JOBS` | optional | Thread-pool size for assembly-to-assembly scoring (`POST /similarity/index/{name}/search-assembly`). Defaults to `8`, matching `hoops_ai_native_bridge`. Lower it when assembly searches starve the server's request workers. |
+| `HOOPS_AI_ASSEMBLY_PREWARM` | optional | Rebuild the assembly matcher in the background when a registration job finishes, so the next searcher does not pay for the k-means. Defaults to `true`. Only indexes on which assembly search has actually been used are rebuilt. |
 | `HOOPS_AI_LOG_LEVEL` | optional | Root log level applied at startup (`DEBUG`, `INFO`, `WARNING`, ...). Defaults to `INFO`; an unrecognised value falls back to `INFO`. uvicorn configures only its own loggers, so without this the application's `logger.info()` diagnostics — such as the assembly matcher build time — are dropped. |
 | `HOOPS_AI_MAX_UPLOAD_BYTES` | optional | Per-file upload cap in bytes (default `4294967296`, i.e. 4 GB). Exceeding it returns **413**. |
 | `HOOPS_AI_EXISTS_MAX_IDS` | optional | Maximum ids per `POST /files/exists` request (default `1000`). Exceeding it returns **422**. |
@@ -1397,6 +1398,38 @@ Jobs are serialised by default, so this is normally moot; if you raise
 > spawn-based worker pool in which each worker reloads the ~2 GB checkpoint. At
 > 100 files per chunk that was about 30% of total runtime.
 
+### Assembly matcher prewarming
+
+Assembly-to-assembly search needs an `AssemblyMatcher`, and building one runs a
+FAISS k-means over every body vector in the index — 24 s at 42,098 bodies. It is
+cached per index and invalidated whenever the `.faiss` file changes, so any
+registration job throws it away.
+
+When a job finishes having added or updated anything, the server rebuilds the
+matcher on a background thread, so the cost is paid by the machine right after
+indexing instead of by whoever searches next. On a shared server those are
+different people, which is the whole point.
+
+Only indexes that already had a matcher are rebuilt. Nothing but an assembly
+search puts one in the cache, so a deployment that never uses the feature never
+builds one. Set `HOOPS_AI_ASSEMBLY_PREWARM=false` to switch this off; the first
+search after each job then pays the build time instead.
+
+Only the asynchronous job path prewarms. The synchronous `POST /index/add` is
+called one file at a time (the MCP server does exactly that), so rebuilding on
+every call would make the rebuild cost more than the registration it follows.
+Prewarming that path would need a debounce — one rebuild once the adds have
+stopped — not this hook.
+
+A search that arrives mid-rebuild waits for it and then finds the matcher ready,
+rather than starting a second build of the same corpus. No stale matcher is ever
+served — the cache is keyed by the index's modification time, so an out-of-date
+entry can never be handed out, only rebuilt.
+
+The rebuild reads the index under the index lock and then runs the k-means
+without it, so part search on the same index is blocked for the duration of a
+file read rather than of the whole build.
+
 ### Tuning bulk registration
 
 Both knobs matter more than anything else here, and the right values depend on
@@ -1603,11 +1636,11 @@ by (index path, mtime) — a single entry, because it holds a normalised copy of
 the whole corpus — and is rebuilt automatically after any write to the index.
 
 That cost is paid by whichever request arrives first after a restart or an
-index write, so **the first assembly search on a large index takes ~20 s while
-later ones take well under a second**.  Warm it deliberately after indexing if
-that latency is user-visible.  Stage-2 scoring runs on a thread pool sized by
-`HOOPS_AI_ASSEMBLY_SEARCH_JOBS` (default `8`); lower it if assembly searches
-starve the server's request workers.
+index write.  **After a registration job the server rebuilds it in the
+background** (see [Assembly matcher prewarming](#assembly-matcher-prewarming)),
+so in practice only the first search after a *restart* is slow.  Stage-2 scoring
+runs on a thread pool sized by `HOOPS_AI_ASSEMBLY_SEARCH_JOBS` (default `8`);
+lower it if assembly searches starve the server's request workers.
 
 **Registered queries skip re-embedding.**  A query that is already in the index
 is handed to the matcher by its record id (the `file_id`) rather than by path,
