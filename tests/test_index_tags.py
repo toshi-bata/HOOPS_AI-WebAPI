@@ -621,6 +621,30 @@ class TestSearchTagFilter(_TagsBase):
         self.assertEqual(self.searcher.calls, [])
 
 
+    def test_an_unfiltered_search_omits_the_diagnostics(self):
+        out = core.search_index(self.NAME, self.QUERY_ID, 10)
+        self.assertNotIn("tag_filter", out)
+
+    def test_a_filtered_search_reports_how_many_carry_the_tag(self):
+        # The point of the field: a rare tag can rank outside the candidate
+        # pool, and an empty hit list would otherwise look like a bug.
+        core.set_part_tags(self.NAME, ID_B, ["rare"])
+        core.set_part_tags(self.NAME, ID_C, ["rare"])
+        out = core.search_index(self.NAME, self.QUERY_ID, 10, tags=["rare"])
+        diag = out["tag_filter"]
+        self.assertEqual(diag["matching_parts_in_index"], 2)
+        self.assertEqual(diag["candidates_examined"], 3)
+        self.assertEqual(diag["tags"], ["rare"])
+        self.assertEqual(diag["tag_mode"], "any")
+        self.assertIsNone(diag["tagged"])
+
+    def test_the_diagnostics_distinguish_absent_from_unranked(self):
+        out = core.search_index(self.NAME, self.QUERY_ID, 10, tags=["never-used"])
+        self.assertEqual(out["count"], 0)
+        self.assertEqual(out["tag_filter"]["matching_parts_in_index"], 0)
+        self.assertGreater(out["tag_filter"]["candidates_examined"], 0)
+
+
 class TestListPartsTagFilter(_TagsBase):
     """Tag filtering and tag output on the parts listing."""
 
@@ -784,6 +808,82 @@ class TestTagEndpoints(_TagsBase):
         resp = self.client.get(self.url(f"/parts/{ID_A}/tags"))
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["tags"], [])
+
+
+class TestQtImporter(unittest.TestCase):
+    """The Qt sidecar keys parts by absolute path; this server by content hash.
+
+    Historically the most bug-prone conversion in either project, so the cases
+    that must not abort an import are pinned here.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self._tmp.name)
+        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "tools"))
+        import import_qt_tags
+
+        self.tool = import_qt_tags
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _cad(self, name, payload):
+        path = self.root / name
+        path.write_bytes(payload)
+        return path, self.tool.sha256_of(path)
+
+    def test_a_tag_with_a_slash_is_skipped_not_fatal(self):
+        path, file_id = self._cad("a.stp", b"aaa")
+        by_id, skipped = self.tool.convert(
+            {str(path): ["bracket", "family/child", "v2"]}, {file_id}
+        )
+        self.assertEqual(by_id, {file_id: ["bracket", "v2"]})
+        self.assertEqual(len(skipped), 1)
+        self.assertIn("family/child", skipped[0]["reason"])
+
+    def test_a_backslash_tag_is_skipped_too(self):
+        path, file_id = self._cad("a.stp", b"aaa")
+        by_id, skipped = self.tool.convert({str(path): ["a\\b"]}, {file_id})
+        self.assertEqual(by_id, {})
+        self.assertEqual(len(skipped), 1)
+
+    def test_an_overlong_tag_is_skipped(self):
+        path, file_id = self._cad("a.stp", b"aaa")
+        by_id, skipped = self.tool.convert({str(path): ["x" * 65, "ok"]}, {file_id})
+        self.assertEqual(by_id, {file_id: ["ok"]})
+        self.assertEqual(len(skipped), 1)
+
+    def test_a_missing_file_is_reported(self):
+        by_id, skipped = self.tool.convert(
+            {str(self.root / "gone.stp"): ["bracket"]}, set()
+        )
+        self.assertEqual(by_id, {})
+        self.assertEqual(skipped[0]["reason"], "file_not_found")
+
+    def test_an_unregistered_file_is_reported(self):
+        path, _ = self._cad("a.stp", b"aaa")
+        by_id, skipped = self.tool.convert({str(path): ["bracket"]}, set())
+        self.assertEqual(by_id, {})
+        self.assertEqual(skipped[0]["reason"], "not_registered")
+
+    def test_two_paths_with_identical_contents_merge(self):
+        p1, file_id = self._cad("a.stp", b"same")
+        p2, _ = self._cad("b.stp", b"same")
+        by_id, skipped = self.tool.convert(
+            {str(p1): ["bracket"], str(p2): ["v2"]}, {file_id}
+        )
+        self.assertEqual(by_id, {file_id: ["bracket", "v2"]})
+        self.assertEqual(skipped, [])
+
+    def test_one_bad_entry_does_not_stop_the_others(self):
+        good, good_id = self._cad("a.stp", b"aaa")
+        bad = self.root / "missing.stp"
+        by_id, skipped = self.tool.convert(
+            {str(good): ["bracket"], str(bad): ["v2"]}, {good_id}
+        )
+        self.assertEqual(by_id, {good_id: ["bracket"]})
+        self.assertEqual(len(skipped), 1)
 
 
 if __name__ == "__main__":

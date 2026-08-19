@@ -913,10 +913,26 @@ class IndexSearchHit(BaseModel):
     metadata: Optional[dict] = None
 
 
+class TagFilterInfo(BaseModel):
+    """Why a tag-filtered search returned what it did.
+
+    Present only when a tag filter was applied. ``matching_parts_in_index``
+    against a low ``count`` says the tag exists but did not rank inside
+    ``candidates_examined`` -- which otherwise looks like a bug.
+    """
+
+    tags: list[str] = []
+    tag_mode: str = "any"
+    tagged: Optional[bool] = None
+    candidates_examined: int
+    matching_parts_in_index: int
+
+
 class IndexSearchResponse(BaseModel):
     hits: list[IndexSearchHit]
     count: int
     image_url: Optional[str] = None
+    tag_filter: Optional[TagFilterInfo] = None
 
 
 class AssemblySearchHit(BaseModel):
@@ -934,6 +950,7 @@ class AssemblySearchResponse(BaseModel):
     hits: list[AssemblySearchHit]
     count: int
     image_url: Optional[str] = None
+    tag_filter: Optional[TagFilterInfo] = None
 
 
 class IndexDeleteResponse(BaseModel):
@@ -1245,6 +1262,7 @@ def search_named_index(
             hits=[IndexSearchHit(**h) for h in result["hits"]],
             count=result["count"],
             image_url=image_url,
+            tag_filter=result.get("tag_filter"),
         )
     except HTTPException:
         raise
@@ -1373,6 +1391,7 @@ def search_named_index_assembly(
             hits=[AssemblySearchHit(**h) for h in result["hits"]],
             count=result["count"],
             image_url=image_url,
+            tag_filter=result.get("tag_filter"),
         )
     except HTTPException:
         raise

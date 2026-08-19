@@ -107,7 +107,12 @@ def convert(
             try:
                 cleaned.append(core.normalize_tag(tag))
             except ValueError as exc:
-                skipped.append({"path": cad_path, "reason": f"invalid tag: {exc}"})
+                # A Qt tag may legitimately contain characters this server
+                # rejects (notably '/', which would break the tag URL), so one
+                # bad tag must not abort the import or discard the good ones.
+                skipped.append(
+                    {"path": cad_path, "reason": f"invalid tag {tag!r}: {exc}"}
+                )
         if not cleaned:
             continue
 

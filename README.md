@@ -1916,6 +1916,21 @@ The same three parameters work on `GET .../parts`, `POST .../search` and
 > rather than ranking. The self hit added by `include_self` is filtered too, so
 > a response never contains a part that fails your filter.
 
+A filtered search therefore reports what it did, so an empty result is
+diagnosable rather than mysterious:
+
+```json
+"tag_filter": {
+  "tags": ["bracket"], "tag_mode": "any", "tagged": null,
+  "candidates_examined": 200, "matching_parts_in_index": 7
+}
+```
+
+`matching_parts_in_index: 7` with `count: 0` means the tag exists on seven
+parts but none of them ranked inside the 200 candidates examined — raise
+`top_k` or list by tag. `matching_parts_in_index: 0` means nothing carries it.
+The key is absent when no tag filter was requested.
+
 ```powershell
 curl.exe -X POST "$base/search?top_k=5&tags=bracket,revision-b&tag_mode=all" -F "file=@C:\path\to\query.step"
 curl.exe "$base/parts?tags=bracket&limit=500"

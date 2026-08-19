@@ -1572,6 +1572,7 @@ def search_index(
 
     hit_dicts = _flatten_body_hits(results, fetch_k + 1)
     hit_dicts = [h for h in hit_dicts if h["id"] != file_id]
+    candidates_examined = len(hit_dicts)
     if tag_filter:
         matches = tag_filter_predicate(name, tag_filter)
         hit_dicts = [h for h in hit_dicts if matches(h["id"])]
@@ -1602,7 +1603,17 @@ def search_index(
             _generate_part_thumbnail(file_id, name)
         image_url = _build_search_grid_image(file_id, hit_dicts, name)
 
-    return {"hits": hit_dicts, "count": len(hit_dicts), "image_url": image_url}
+    result: dict[str, Any] = {
+        "hits": hit_dicts,
+        "count": len(hit_dicts),
+        "image_url": image_url,
+    }
+    diagnostics = tag_filter_diagnostics(
+        name, tag_filter, registered_ids, candidates_examined
+    )
+    if diagnostics is not None:
+        result["tag_filter"] = diagnostics
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1908,6 +1919,8 @@ def search_assembly_index(
         if hit is not None and hit["id"] != file_id:
             hit_dicts.append(hit)
 
+    candidates_examined = len(hit_dicts)
+
     if tag_filter:
         matches = tag_filter_predicate(name, tag_filter)
         hit_dicts = [h for h in hit_dicts if matches(h["id"])]
@@ -1926,7 +1939,22 @@ def search_assembly_index(
             _generate_part_thumbnail(file_id, name)
         image_url = _build_search_grid_image(file_id, hit_dicts, name)
 
-    return {"hits": hit_dicts, "count": len(hit_dicts), "image_url": image_url}
+    response: dict[str, Any] = {
+        "hits": hit_dicts,
+        "count": len(hit_dicts),
+        "image_url": image_url,
+    }
+    diagnostics = tag_filter_diagnostics(
+        name,
+        tag_filter,
+        # Only assemblies are searchable here, so counting parts too would
+        # overstate how many results the filter could ever have produced.
+        [pid for pid, meta in meta_by_id.items() if (meta or {}).get("kind") == "assembly"],
+        candidates_examined,
+    )
+    if diagnostics is not None:
+        response["tag_filter"] = diagnostics
+    return response
 
 
 def get_index_stats(name: str) -> dict[str, Any]:
@@ -2692,6 +2720,33 @@ def tag_filter_predicate(name: str, tag_filter: Optional[dict[str, Any]]):
         return bool(wanted_set.intersection(current))
 
     return predicate
+
+
+def tag_filter_diagnostics(
+    name: str,
+    tag_filter: Optional[dict[str, Any]],
+    registered_ids,
+    candidates_examined: int,
+) -> Optional[dict[str, Any]]:
+    """Explain an apparently empty tag-filtered search.
+
+    Filtering runs after ranking over a bounded candidate pool, so a rare tag
+    can produce zero hits even though matching parts exist. Without these two
+    numbers a caller cannot tell "nothing carries this tag" from "seven parts
+    carry it but none of them ranked inside the pool", and the second case
+    looks like a bug. Returns None when no filter was requested, so the key is
+    absent from an ordinary search.
+    """
+    if not tag_filter:
+        return None
+    matches = tag_filter_predicate(name, tag_filter)
+    return {
+        "tags": list(tag_filter.get("tags") or []),
+        "tag_mode": tag_filter.get("tag_mode"),
+        "tagged": tag_filter.get("tagged"),
+        "candidates_examined": int(candidates_examined),
+        "matching_parts_in_index": sum(1 for pid in registered_ids if matches(pid)),
+    }
 
 
 def delete_index(name: str) -> dict[str, Any]:
