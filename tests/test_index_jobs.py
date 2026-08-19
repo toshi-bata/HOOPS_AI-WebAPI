@@ -273,10 +273,12 @@ class _FakeCtx:
     """Records what a job body reports, without touching disk."""
 
     def __init__(self, cancel_after=None):
+        self.job_id = "fakejob"
         self.phases = []
         self.total = 0
         self.done = 0
         self.errors = 0
+        self.heavy = 0
         self.summary = {}
         self.timings = {}
         self.error_items = []
@@ -290,6 +292,9 @@ class _FakeCtx:
 
     def set_phase(self, phase):
         self.phases.append(phase)
+
+    def set_progress(self, **fields):
+        self.heavy = fields.get("heavy", self.heavy)
 
     def set_total(self, total):
         self.total = total
@@ -308,20 +313,48 @@ class _FakeCtx:
         self.error_items.extend(errors)
 
 
+class _FakeStore:
+    """Just enough of JobStore for the job body's artefact directory."""
+
+    def __init__(self, root):
+        self.root = pathlib.Path(root)
+
+    def artifacts_dir(self, job_id):
+        return self.root / job_id
+
+
 class TestRunIndexAddJob(unittest.TestCase):
     def setUp(self):
         self._orig = core.add_to_index
+        self._orig_store = core.get_index_job_store
+        self._orig_heavy = core.read_too_heavy_files
+        self._tmp = tempfile.TemporaryDirectory()
+        core.get_index_job_store = lambda: _FakeStore(self._tmp.name)
+        # The SDK's side-effect log lands next to the job; never read the
+        # developer's leftovers from the working directory.
+        core.read_too_heavy_files = lambda *a, **k: []
         self.calls = []
 
     def tearDown(self):
         core.add_to_index = self._orig
+        core.get_index_job_store = self._orig_store
+        core.read_too_heavy_files = self._orig_heavy
+        self._tmp.cleanup()
 
-    def _fake(self, errors_for=()):
-        def add_to_index(name, file_ids, model=None, num_workers=None, time_limit=None):
+    def _fake(self, errors_for=(), detail="boom"):
+        def add_to_index(
+            name, file_ids, model=None, num_workers=None, time_limit=None,
+            log_dir=None,
+        ):
             self.calls.append(
-                {"files": list(file_ids), "workers": num_workers, "limit": time_limit}
+                {
+                    "files": list(file_ids),
+                    "workers": num_workers,
+                    "limit": time_limit,
+                    "log_dir": log_dir,
+                }
             )
-            errs = [{"file_id": f, "detail": "boom"} for f in file_ids if f in errors_for]
+            errs = [{"file_id": f, "detail": detail} for f in file_ids if f in errors_for]
             return {
                 "name": name,
                 "added": len(file_ids) - len(errs),
@@ -403,6 +436,120 @@ class TestRunIndexAddJob(unittest.TestCase):
         ctx = _FakeCtx()
         core.run_index_add_job(ctx, "idx", [])
         self.assertEqual(ctx.phases[-1], "done")
+
+
+class TestFailureReporting(TestRunIndexAddJob):
+    """The reason and retryable flag that let a client run its own retry pass."""
+
+    def test_a_timeout_is_marked_retryable(self):
+        self._fake(errors_for={"1"}, detail="Timeout (CUMULATIVE) after 120s")
+        ctx = _FakeCtx()
+        core.run_index_add_job(ctx, "idx", ["0", "1"])
+        self.assertTrue(ctx.error_items[0]["retryable"])
+        self.assertEqual(ctx.summary["retryable"], 1)
+
+    def test_a_cad_error_is_not_retryable(self):
+        self._fake(errors_for={"1"}, detail="Failed to load: unsupported entity")
+        ctx = _FakeCtx()
+        core.run_index_add_job(ctx, "idx", ["0", "1"])
+        self.assertFalse(ctx.error_items[0]["retryable"])
+        self.assertEqual(ctx.summary["retryable"], 0)
+
+    def test_the_reason_is_preserved_verbatim(self):
+        self._fake(errors_for={"1"}, detail="Failed to load: NoRootInModel")
+        ctx = _FakeCtx()
+        core.run_index_add_job(ctx, "idx", ["0", "1"])
+        self.assertEqual(ctx.error_items[0]["detail"], "Failed to load: NoRootInModel")
+
+    def test_the_job_stays_a_single_sdk_call(self):
+        # The retry pass belongs to the client, so a timeout must not make the
+        # server embed twice.
+        self._fake(errors_for={"1"}, detail="Timeout (CUMULATIVE) after 120s")
+        core.run_index_add_job(_FakeCtx(), "idx", ["0", "1"])
+        self.assertEqual(len(self.calls), 1)
+
+    def test_heavy_flagged_files_are_counted(self):
+        core.read_too_heavy_files = lambda *a, **k: ["C:/cad/big.stp"]
+        self._fake()
+        ctx = _FakeCtx()
+        core.run_index_add_job(ctx, "idx", ["a"])
+        self.assertEqual(ctx.summary["heavy_flagged"], 1)
+        self.assertEqual(ctx.heavy, 1)
+
+    def test_a_log_dir_is_passed_so_the_heavy_log_can_be_read_back(self):
+        self._fake()
+        core.run_index_add_job(_FakeCtx(), "idx", ["a"])
+        self.assertIsNotNone(self.calls[0]["log_dir"])
+
+    def test_report_lists_the_three_groups(self):
+        self._fake(errors_for={"1"})
+        ctx = _FakeCtx()
+        core.run_index_add_job(ctx, "idx", ["0", "1"])
+        text = (pathlib.Path(self._tmp.name) / ctx.job_id / "report.txt").read_text(
+            encoding="utf-8"
+        )
+        for group in ("[ADDED]", "[FAILED]", "[HEAVY-FLAGGED]"):
+            self.assertIn(group, text)
+        self.assertTrue(ctx.summary.get("report"))
+
+    def test_a_report_failure_does_not_fail_the_job(self):
+        self._fake()
+        core.get_index_job_store = lambda: _FakeStore(
+            pathlib.Path(self._tmp.name) / "nope" / "\0bad"
+        )
+        ctx = _FakeCtx()
+        core.run_index_add_job(ctx, "idx", ["a"])
+        self.assertEqual(ctx.phases[-1], "done")
+        self.assertFalse(ctx.summary.get("report"))
+
+
+class TestFailureClassification(unittest.TestCase):
+    def test_a_timeout_is_retryable(self):
+        out = core.annotate_failures(
+            [{"file_id": "a", "detail": "Timeout (CUMULATIVE) after 120s"}]
+        )
+        self.assertTrue(out[0]["retryable"])
+
+    def test_an_unknown_reason_is_retryable(self):
+        # Safer direction: a file that may just be slow gets its second chance.
+        out = core.annotate_failures(
+            [{"file_id": "a", "detail": core._EMBED_ERROR_DEFAULT}]
+        )
+        self.assertTrue(out[0]["retryable"])
+
+    def test_a_cad_error_is_permanent(self):
+        out = core.annotate_failures(
+            [{"file_id": "a", "detail": "Failed to load: unsupported entity"}]
+        )
+        self.assertFalse(out[0]["retryable"])
+
+    def test_an_empty_reason_falls_back_to_the_placeholder(self):
+        out = core.annotate_failures([{"file_id": "a", "detail": ""}])
+        self.assertEqual(out[0]["detail"], core._EMBED_ERROR_DEFAULT)
+        self.assertTrue(out[0]["retryable"])
+
+    def test_the_input_is_not_modified(self):
+        errors = [{"file_id": "a", "detail": "Timeout"}]
+        core.annotate_failures(errors)
+        self.assertNotIn("retryable", errors[0])
+
+
+class TestArtefactReaders(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = pathlib.Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_a_missing_log_is_not_an_error(self):
+        self.assertEqual(core.read_too_heavy_files(self.dir), [])
+
+    def test_too_heavy_log_skips_comments_and_blanks(self):
+        (self.dir / "too_heavy_files.log").write_text(
+            "# Heavy Files (1 worker)\n\nC:/cad/big.stp\n", encoding="utf-8"
+        )
+        self.assertEqual(core.read_too_heavy_files(self.dir), ["C:/cad/big.stp"])
 
 
 class TestWorkerSizing(unittest.TestCase):
@@ -510,8 +657,8 @@ class TestJobSettings(unittest.TestCase):
                 os.environ[k] = v
 
     def test_jobs_are_serialised_by_default(self):
-        # hoops_ai writes error_summary.json to the CWD with no way to redirect
-        # it, so concurrent registration jobs would corrupt each other's report.
+        # Every worker of every job loads the ~2 GB checkpoint, so concurrent
+        # jobs multiply peak memory and end up slower in total.
         self.assertEqual(core.job_max_concurrency(), 1)
 
     def test_concurrency_is_overridable(self):
@@ -622,6 +769,32 @@ class TestJobEndpoints(unittest.TestCase):
         body = self._wait("idx", job_id)
         self.assertEqual(body["status"], "done")
         self.assertEqual(body["summary"]["added"], 1)
+
+    def test_a_finished_job_advertises_and_serves_its_report(self):
+        job_id = self.client.post(
+            "/similarity/index/idx/jobs/add", json={"file_ids": [self.file_id]}
+        ).json()["job_id"]
+        body = self._wait("idx", job_id)
+        self.assertEqual(
+            body["report_url"], f"/similarity/index/idx/jobs/{job_id}/report"
+        )
+        r = self.client.get(body["report_url"])
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("[ADDED]", r.text)
+
+    def test_report_for_an_unknown_job_is_404(self):
+        r = self.client.get("/similarity/index/idx/jobs/deadbeef/report")
+        self.assertEqual(r.status_code, 404)
+
+    def test_a_jobs_artifacts_are_removed_with_its_record(self):
+        job_id = self.client.post(
+            "/similarity/index/idx/jobs/add", json={"file_ids": [self.file_id]}
+        ).json()["job_id"]
+        self._wait("idx", job_id)
+        artifacts = core._index_job_store.artifacts_dir(job_id)
+        self.assertTrue(artifacts.is_dir())
+        core._index_job_store.collect_garbage(now=time.time() + 10 * 3600)
+        self.assertFalse(artifacts.exists())
 
     def test_unknown_file_id_is_reported_not_silently_dropped(self):
         r = self.client.post(

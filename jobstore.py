@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import pathlib
+import shutil
 import threading
 import time
 import uuid
@@ -73,6 +74,10 @@ class JobContext:
     def set_phase(self, phase: str) -> None:
         self.store.update(self.job_id, progress={"phase": phase})
 
+    def set_progress(self, **fields: Any) -> None:
+        """Merge arbitrary counters into the progress section."""
+        self.store.update(self.job_id, progress=fields)
+
     def set_total(self, total: int) -> None:
         self.store.update(self.job_id, progress={"total": int(total)})
 
@@ -120,6 +125,23 @@ class JobStore:
         if not job_id or "/" in job_id or "\\" in job_id or job_id.startswith("."):
             raise JobNotFound(f"Invalid job id '{job_id}'.")
         return self.root / f"{job_id}.json"
+
+    def artifacts_dir(self, job_id: str) -> pathlib.Path:
+        """Directory for a job's on-disk side files (logs, reports).
+
+        Kept next to the record as ``<root>/<job_id>/`` so that garbage
+        collecting the record also removes its artefacts; nothing else may write
+        into ``root`` with that name because job ids are UUIDs.
+        """
+        self._path(job_id)  # validates the id
+        return self.root / job_id
+
+    def _remove_record(self, path: pathlib.Path) -> None:
+        """Delete a record file together with its artefacts directory."""
+        path.unlink(missing_ok=True)
+        artifacts = path.with_suffix("")
+        if artifacts.is_dir():
+            shutil.rmtree(artifacts, ignore_errors=True)
 
     def _write(self, record: dict) -> None:
         """Persist *record* atomically so a crash never leaves half a record."""
@@ -394,7 +416,7 @@ class JobStore:
                     continue
                 except ValueError:
                     # Malformed JSON can never be served, so drop it.
-                    path.unlink(missing_ok=True)
+                    self._remove_record(path)
                     removed += 1
                     continue
                 except OSError as exc:
@@ -408,7 +430,7 @@ class JobStore:
                 except OSError:
                     mtime = time.time()
                 if terminal and self.ttl_seconds > 0 and mtime < cutoff:
-                    path.unlink(missing_ok=True)
+                    self._remove_record(path)
                     removed += 1
                     continue
                 survivors.append((mtime, path, record))
@@ -419,7 +441,7 @@ class JobStore:
                 terminal = [s for s in survivors if s[2].get("status") in TERMINAL_STATUSES]
                 terminal.sort(key=lambda s: s[0])
                 for _, path, _ in terminal[:overflow]:
-                    path.unlink(missing_ok=True)
+                    self._remove_record(path)
                     removed += 1
                 survivors = [s for s in survivors if s[1].exists()]
 

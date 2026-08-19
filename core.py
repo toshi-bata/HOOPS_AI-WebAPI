@@ -1,4 +1,4 @@
-import ast
+﻿import ast
 import datetime
 import hashlib
 import io
@@ -323,7 +323,7 @@ def list_indexes() -> list[dict[str, Any]]:
     """Return metadata for all known indexes, including the read-only ``default`` index."""
     result: list[dict[str, Any]] = []
 
-    # "default" index  Eread-only, backed by the env-configured FAISS file
+    # "default" index 窶・read-only, backed by the env-configured FAISS file
     load_env_file()
     faiss_name = os.environ.get("HOOPS_AI_FAISS_INDEX_PATH")
     if faiss_name:
@@ -355,7 +355,7 @@ def list_indexes() -> list[dict[str, Any]]:
                 }
             )
 
-    # Named indexes from INDEXES_DIR  Eeach lives in its own subdirectory
+    # Named indexes from INDEXES_DIR 窶・each lives in its own subdirectory
     if INDEXES_DIR.exists():
         for faiss_file in sorted(INDEXES_DIR.glob("*/index.faiss")):
             idx_name = faiss_file.parent.name
@@ -565,8 +565,48 @@ def embed_time_limit() -> int:
     return _env_int("HOOPS_AI_EMBED_TIME_LIMIT", 0, minimum=0)
 
 
+def read_too_heavy_files(
+    directory: Optional["pathlib.Path"] = None,
+) -> list[str]:
+    """Paths hoops_ai deferred to its built-in single-worker RAM fallback.
+
+    ``too_heavy_files.log`` lists them: ``#`` comment lines, then one path per
+    line. It is informational only -- these files are usually embedded
+    successfully, just slowly -- but it is what tells an operator which parts
+    made the run expensive.
+
+    *directory* is the pass's ``log_dir``. The process working directory is
+    tried as well, because ``log_dir`` support was established by inspecting the
+    compiled SDK rather than from documentation; if it is ever ignored, the file
+    still lands in the CWD and is still found.
+    """
+    candidates: list[pathlib.Path] = []
+    if directory is not None:
+        candidates.append(pathlib.Path(directory))
+    candidates.append(pathlib.Path.cwd())
+
+    for base in candidates:
+        path = base / "too_heavy_files.log"
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as fh:
+                lines = fh.read().splitlines()
+        except FileNotFoundError:
+            continue
+        except Exception as exc:
+            logger.warning("Could not read %s: %s", path, exc)
+            continue
+        return [
+            line.strip()
+            for line in lines
+            if line.strip() and not line.strip().startswith("#")
+        ]
+    return []
+
+
 def build_embed_specifications(
-    images_dir: "pathlib.Path", time_limit: Optional[int] = None
+    images_dir: "pathlib.Path",
+    time_limit: Optional[int] = None,
+    log_dir: Optional["pathlib.Path"] = None,
 ) -> dict[str, Any]:
     """Build the ``specifications`` dict for ``embed_shape_batch``.
 
@@ -581,6 +621,12 @@ def build_embed_specifications(
         "generate_images": True,
         "images_out_dir": str(images_dir),
     }
+    if log_dir is not None:
+        # Sends too_heavy_files.log to a per-pass directory so pass 2 does not
+        # overwrite pass 1's list. Established by inspecting the compiled SDK
+        # (ParallelExecutor.write_too_heavy_log), not from documentation, so
+        # readers must tolerate the file landing in the CWD instead.
+        specs["log_dir"] = str(log_dir)
     limit = time_limit if time_limit is not None else embed_time_limit()
     if limit and limit > 0:
         value = float(limit)
@@ -597,6 +643,7 @@ def _embed_bodies_for_index(
     model: str,
     num_workers: Optional[int] = None,
     time_limit: Optional[int] = None,
+    log_dir: Optional["pathlib.Path"] = None,
 ) -> tuple[list, list[dict[str, Any]]]:
     """Embed *file_ids* at body granularity and build one VectorRecord per body.
 
@@ -611,6 +658,8 @@ def _embed_bodies_for_index(
 
     *num_workers* and *time_limit* are forwarded to the SDK; ``None`` means
     "decide here" (see ``compute_auto_workers`` and ``embed_time_limit``).
+    *log_dir* redirects the SDK's ``too_heavy_files.log`` (see
+    :func:`build_embed_specifications`).
     """
     import json
     import shutil
@@ -667,7 +716,7 @@ def _embed_bodies_for_index(
 
     records: list = []
     try:
-        specs = build_embed_specifications(tmp_images, time_limit)
+        specs = build_embed_specifications(tmp_images, time_limit, log_dir=log_dir)
         workers = num_workers if num_workers is not None else compute_auto_workers(
             len(ordered_paths)
         )
@@ -889,6 +938,7 @@ def add_to_index(
     model: Optional[str] = None,
     num_workers: Optional[int] = None,
     time_limit: Optional[int] = None,
+    log_dir: Optional["pathlib.Path"] = None,
 ) -> dict[str, Any]:
     """Embed *file_ids* at body granularity and upsert one row per body.
 
@@ -900,7 +950,8 @@ def add_to_index(
     rebuilt before body-level writes are allowed.
 
     *num_workers* and *time_limit* tune the SDK call; ``None`` keeps this
-    module's defaults. Existing callers that pass neither are unaffected.
+    module's defaults. *log_dir* redirects the SDK's ``too_heavy_files.log``.
+    Existing callers that pass none of them are unaffected.
 
     Returns ``added``, ``updated``, ``index_count``, and per-file ``errors``.
     ``added``/``updated`` count distinct files (not body rows).
@@ -929,6 +980,7 @@ def add_to_index(
             effective_model,
             num_workers=num_workers,
             time_limit=time_limit,
+            log_dir=log_dir,
         )
 
         existing_ids: set[str] = set(vs.get_ids())
@@ -1877,7 +1929,7 @@ def _generate_part_thumbnail(file_id: str, index_name: str) -> Optional[pathlib.
         if png_file and png_file.exists():
             png_file.replace(dest_png)
 
-        # Remove the SCS file  Ewe only need the PNG for thumbnails
+        # Remove the SCS file 窶・we only need the PNG for thumbnails
         for p_str in (scs_result, str(tmp_scs)):
             if p_str:
                 p = pathlib.Path(p_str)
@@ -1959,7 +2011,7 @@ def _build_search_grid_image(
             ax.set_xticks([])
             ax.set_yticks([])
 
-        # Query cell  Elook up embedding cache for filename
+        # Query cell 窶・look up embedding cache for filename
         query_name = "query"
         cached = _embedding_memory_cache.get(f"hoops_embeddings_model__{query_file_id}")
         if cached:
@@ -2469,7 +2521,7 @@ def search_by_shape(cad_file_path: pathlib.Path, top_k: int = 10) -> dict[str, A
 def get_similar_search_index_info() -> dict[str, Any]:
     """Return metadata about the currently loaded FAISS similarity search index.
 
-    Always succeeds  Ereturns ``status: "not_loaded"`` when neither the searcher
+    Always succeeds 窶・returns ``status: "not_loaded"`` when neither the searcher
     nor the index has been initialised yet, so callers never need to treat an
     unloaded state as an error.
     """
@@ -2573,12 +2625,12 @@ def get_embedder(model: str = _EMBEDDER_MODEL_LEGACY):
 
     *model* selects which checkpoint to load:
 
-    * ``'legacy'``  E``HOOPS_AI_EMBEDDINGS_MODEL_NAME`` (1M model), registered
+    * ``'legacy'`` 窶・``HOOPS_AI_EMBEDDINGS_MODEL_NAME`` (1M model), registered
       as ``"hoops_embeddings_model"``.
-    * ``'signal'``  E``HOOPS_AI_EMBEDDINGS_MODEL_NAME_SIGNAL`` (SIGNAL model),
+    * ``'signal'`` 窶・``HOOPS_AI_EMBEDDINGS_MODEL_NAME_SIGNAL`` (SIGNAL model),
       registered as ``"hoops_embeddings_signal"``.
 
-    Safe to call alongside (or after) ``create_cad_searcher_for()``  Ethe model
+    Safe to call alongside (or after) ``create_cad_searcher_for()`` 窶・the model
     registration is guarded so it is never performed twice.
     """
     global _embedder, _embedder_signal
@@ -2697,7 +2749,7 @@ def compute_embedding(file_id: str, model: str = _EMBEDDER_MODEL_LEGACY) -> dict
             _embedding_memory_cache[cache_key] = entry
             return {**entry, "cached": True}
         except Exception:
-            pass  # corrupted cache  Efall through to recompute
+            pass  # corrupted cache 窶・fall through to recompute
 
     # 3. Compute via HOOPS embedder
     cad_path = find_persistent_CAD_file(file_id)
@@ -2747,7 +2799,7 @@ def compute_embedding(file_id: str, model: str = _EMBEDDER_MODEL_LEGACY) -> dict
 
 
 def compare_embeddings(file_ids: list[str], model: str = _EMBEDDER_MODEL_LEGACY) -> dict[str, Any]:
-    """Compute an N×N cosine similarity matrix for the given file_ids.
+    """Compute an Nﾃ湧 cosine similarity matrix for the given file_ids.
 
     All embedding vectors are L2-normalised, so cosine similarity equals their
     dot product.  Diagonal entries are forced to exactly ``1.0``.
@@ -2756,7 +2808,7 @@ def compare_embeddings(file_ids: list[str], model: str = _EMBEDDER_MODEL_LEGACY)
     (SIGNAL model).
 
     Returns a dict with keys:
-      ``count``, ``model_name``, ``files``, ``matrix`` (N×N list of lists),
+      ``count``, ``model_name``, ``files``, ``matrix`` (Nﾃ湧 list of lists),
       ``pairs`` (all i<j combos sorted by score descending).
     """
     import numpy as np
@@ -2806,7 +2858,7 @@ def compare_embeddings(file_ids: list[str], model: str = _EMBEDDER_MODEL_LEGACY)
 def _classical_mds(dist_matrix: "Any") -> tuple:
     """Classical (Torgerson) multidimensional scaling into 3 dimensions.
 
-    Given an ``N×N`` symmetric distance matrix, returns ``(coords, stress)``
+    Given an ``Nﾃ湧`` symmetric distance matrix, returns ``(coords, stress)``
     where ``coords`` has shape ``(N, 3)`` (mean-centred) and ``stress`` is the
     Kruskal stress-1 goodness-of-fit value in ``[0, 1]``.
 
@@ -2822,7 +2874,7 @@ def _classical_mds(dist_matrix: "Any") -> tuple:
     D_squared = D ** 2
     B = -0.5 * H @ D_squared @ H
 
-    # eigh returns eigenvalues in ascending order ↁEtake the largest 3
+    # eigh returns eigenvalues in ascending order 竊・take the largest 3
     eigenvalues, eigenvectors = np.linalg.eigh(B)
     eigenvalues = np.maximum(eigenvalues, 0.0)  # clamp negatives to 0
 
@@ -2858,7 +2910,7 @@ def _classical_mds(dist_matrix: "Any") -> tuple:
 def export_scs_for_part(file_id: str) -> str:
     """Convert a persistent CAD file to an SCS stream cache and return its filename.
 
-    A thin wrapper around the conversion logic in ``create_CAD_viewer``  Eit does
+    A thin wrapper around the conversion logic in ``create_CAD_viewer`` 窶・it does
     NOT touch the per-session viewer cache.  Returns just the SCS filename (served
     under ``/out/``), not a full path or URL.
     """
@@ -2890,7 +2942,7 @@ def compute_shape_map_data(
     """Compute a 3D "Shape Space Map" layout for a set of CAD parts.
 
     Steps:
-      1. Compute the N×N cosine-similarity matrix via ``compare_embeddings``.
+      1. Compute the Nﾃ湧 cosine-similarity matrix via ``compare_embeddings``.
       2. Convert each part to an SCS stream cache (failures are non-fatal and
          collected in ``errors``).
       3. Lay the parts out in 3D with classical MDS so that similar parts sit
@@ -2970,7 +3022,7 @@ def _project_oos_mds(
     """Project a new point into an existing classical-MDS coordinate space.
 
     Uses the out-of-sample extension formula (Bengio et al., 2004).  Given the
-    ``NÁE`` coordinate matrix ``coords`` (mean-centred) and the ``N×N`` distance
+    ``Nﾃ・`` coordinate matrix ``coords`` (mean-centred) and the ``Nﾃ湧`` distance
     matrix ``dist_matrix`` used to produce it, place the new point whose
     distances to the N existing points are ``query_dist`` (length-N array) into
     the same space.
@@ -2991,15 +3043,15 @@ def _project_oos_mds(
     d_sq = dist_matrix ** 2
     d_q_sq = query_dist ** 2
 
-    # Row/column means of D² (symmetric, so equal)
-    row_means = d_sq.mean(axis=0)      # (N,)  E(1/N) Σ_i D²_ij for each j
+    # Row/column means of Dﾂｲ (symmetric, so equal)
+    row_means = d_sq.mean(axis=0)      # (N,) 窶・(1/N) ﾎ｣_i Dﾂｲ_ij for each j
     grand_mean = float(d_sq.mean())
     q_mean = float(d_q_sq.mean())
 
     # Out-of-sample centering: b_j = <x_query, x_j> approximation
     b = -0.5 * (d_q_sq - q_mean - row_means + grand_mean)  # (N,)
 
-    # Solve coords @ x_query ≁Eb  (least-squares, handles rank-deficiency)
+    # Solve coords @ x_query 竕・b  (least-squares, handles rank-deficiency)
     x_q, _, _, _ = np.linalg.lstsq(coords, b, rcond=None)
 
     # Ensure output is exactly length 3
@@ -3028,8 +3080,8 @@ def query_shape_map(map_id: str, query_file_id: str, persist: bool = False) -> d
     ``query_part``, ``nearest_parts`` (top-5), ``persisted``, ``errors``.
 
     Raises:
-      ``KeyError``     Emap *map_id* does not exist.
-      ``RuntimeError`` Eembedding computation fails for the query part.
+      ``KeyError``    窶・map *map_id* does not exist.
+      ``RuntimeError``窶・embedding computation fails for the query part.
     """
     import json
 
@@ -3047,7 +3099,7 @@ def query_shape_map(map_id: str, query_file_id: str, persist: bool = False) -> d
     n = len(existing_parts)
     model: str = map_data.get("model", _EMBEDDER_MODEL_LEGACY)
 
-    # Compute query embedding (raises on failure  Elet caller handle)
+    # Compute query embedding (raises on failure 窶・let caller handle)
     query_emb = compute_embedding(query_file_id, model=model)
     query_vec = query_emb["vector"]
     query_filename = query_emb["filename"]
@@ -3085,7 +3137,7 @@ def query_shape_map(map_id: str, query_file_id: str, persist: bool = False) -> d
         "is_query": True,
     }
 
-    # Build (N+1)ÁEN+1) extended similarity matrix
+    # Build (N+1)ﾃ・N+1) extended similarity matrix
     ext_matrix = [row + [query_sims[i]] for i, row in enumerate(existing_matrix)]
     ext_matrix.append(query_sims + [1.0])
 
@@ -3572,11 +3624,13 @@ def job_max_concurrency() -> int:
     """How many jobs may run at once, from HOOPS_AI_JOB_MAX_CONCURRENCY.
 
     Defaults to 1, i.e. registration jobs are serialised across all indexes.
-    hoops_ai writes ``error_summary.json`` into the process working directory
-    and gives no way to redirect it: ``flowdir`` is a Flow-API attribute that
-    ``embed_shape_batch`` never populates, and no environment override exists
-    (verified against the compiled SDK). Concurrent jobs would therefore read
-    each other's failure summary and misreport which files failed.
+    Each job spawns its own pool of embedding workers, every one of which loads
+    the ~2 GB model checkpoint, so two concurrent jobs multiply peak memory and
+    push the SDK into its single-worker RAM fallback -- slower in total than
+    running them one after the other. hoops_ai also writes ``too_heavy_files.log``
+    next to its work; ``specifications['log_dir']`` keeps each job's copy apart,
+    but that redirection was established by inspecting the compiled SDK rather
+    than from documentation, so concurrency would rest on it holding.
     """
     return _env_int("HOOPS_AI_JOB_MAX_CONCURRENCY", _JOB_MAX_CONCURRENCY_DEFAULT, minimum=1)
 
@@ -3652,6 +3706,117 @@ def resolve_server_paths(paths: list[str]) -> tuple[list[str], list[dict[str, An
     return file_ids, errors
 
 
+_RETRY_REASON_MARKERS = ("timeout", "timed out")
+
+
+def annotate_failures(errors: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Attach a ``retryable`` flag to each embedding failure.
+
+    A file is marked retryable when it timed out, or when no reason could be
+    determined at all. Everything else -- a corrupt file, an unsupported format,
+    a CAD kernel error -- will fail again however long the budget, so retrying it
+    only wastes the budget. Treating an unknown reason as retryable is the safe
+    direction. This is the rule hoops_ai_native_bridge's Qt front end applies.
+
+    The reason itself is already resolved into each error's ``detail`` from
+    ``batch.metadata['errors']``. That front end additionally parses
+    ``error_summary.json`` out of its working directory, but only because the
+    bridge's C ABI drops the reason on the way out; running the SDK in-process,
+    this server gets it directly and needs no such fallback.
+
+    The flag exists because only the server sees the reason. **The decision to
+    retry stays with the client**, which resubmits the retryable file_ids as a
+    second job with a longer ``time_limit`` and fewer ``workers``.
+
+    Returns a new list; the input is not modified.
+    """
+    annotated: list[dict[str, Any]] = []
+    for err in errors:
+        item = dict(err)
+        detail = str(item.get("detail") or "").strip()
+        unknown = not detail or detail == _EMBED_ERROR_DEFAULT
+        low = detail.lower()
+        item["detail"] = detail or _EMBED_ERROR_DEFAULT
+        item["retryable"] = bool(unknown or any(m in low for m in _RETRY_REASON_MARKERS))
+        annotated.append(item)
+    return annotated
+
+
+def _write_add_job_report(
+    path: "pathlib.Path",
+    name: str,
+    added: list[str],
+    failed: list[dict[str, Any]],
+    heavy_flagged: list[str],
+    timings: dict[str, Any],
+) -> None:
+    """Write the three-group registration report (ADDED / FAILED / HEAVY-FLAGGED).
+
+    The groups answer the operator's question directly: which parts are in the
+    index, which are not and why (and whether a longer budget could still save
+    them), and which files made the run slow. Written to disk rather than into
+    the job record because a corpus-sized job would otherwise put tens of
+    thousands of paths into a JSON document that is rewritten on every progress
+    update.
+    """
+    def _fmt(seconds: Any) -> str:
+        try:
+            secs = float(seconds)
+        except (TypeError, ValueError):
+            return "-"
+        total = int(secs + 0.5)
+        h, m, s = total // 3600, (total % 3600) // 60, total % 60
+        if h:
+            hms = f"{h}h {m:02d}m {s:02d}s"
+        elif m:
+            hms = f"{m}m {s:02d}s"
+        else:
+            hms = f"{s}s"
+        return f"{hms} ({secs:.1f}s)"
+
+    retryable = [e for e in failed if e.get("retryable")]
+    lines: list[str] = []
+    lines.append(
+        "# Index registration report - "
+        f"{datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}"
+    )
+    lines.append(f"# Index: {name}")
+    lines.append(
+        f"# Embedding: num_workers={timings.get('num_workers', '-')} "
+        f"time_limit={timings.get('time_limit', '-')}s"
+    )
+    lines.append(f"# Elapsed: {_fmt(timings.get('embed_seconds'))}")
+    lines.append(
+        f"# Totals: input={len(added) + len(failed)} added={len(added)} "
+        f"failed={len(failed)} retryable={len(retryable)} "
+        f"heavy_flagged={len(heavy_flagged)}"
+    )
+
+    lines.append("")
+    lines.append(f"[ADDED] embedded into the index ({len(added)})")
+    lines.extend(added)
+
+    lines.append("")
+    lines.append(
+        f"[FAILED] not in the index ({len(failed)}; {len(retryable)} worth "
+        "resubmitting with a longer time_limit)"
+    )
+    for err in failed:
+        mark = "RETRYABLE" if err.get("retryable") else "PERMANENT"
+        label = err.get("filename") or err.get("file_id") or ""
+        lines.append(f"{mark}\t{label}\t{err.get('detail', '')}")
+
+    lines.append("")
+    lines.append(
+        "[HEAVY-FLAGGED] deferred by hoops_ai to its 1-worker RAM fallback "
+        f"({len(heavy_flagged)})"
+    )
+    lines.extend(heavy_flagged)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def run_index_add_job(
     ctx,
     name: str,
@@ -3662,12 +3827,18 @@ def run_index_add_job(
 ) -> None:
     """Job body: register *file_ids* into index *name* in a single SDK call.
 
-    The whole input goes to one ``embed_shape_batch``. Splitting it into
-    fixed-size chunks was measurably wrong: each call builds a fresh spawn-based
-    process pool whose every worker reloads the ~2 GB checkpoint, which cost
-    ~55-60 s per chunk (~30% of total runtime at 100 files per chunk). The SDK
-    is built for large batches, so parallelism and the per-file time budget are
-    the tuning knobs here, not chunk size.
+    One job is one pass. The whole input goes to one ``embed_shape_batch``:
+    splitting it into fixed-size chunks was measurably wrong, because each call
+    builds a fresh spawn-based process pool whose every worker reloads the ~2 GB
+    checkpoint, ~55-60 s per call.
+
+    **The two-pass strategy is the client's to run, not this server's.** A
+    caller registers a corpus with many workers and a short ``time_limit``,
+    reads the ``retryable`` flag on each reported failure, and resubmits just
+    those files as a second job with few workers and a long ``time_limit``.
+    Splitting it this way keeps the commit granularity and the retry policy in
+    the caller's hands; the server's part is to make the decision possible by
+    reporting *why* each file failed (see :func:`annotate_failures`).
 
     Consequences, both accepted deliberately:
       * Cancellation is only observed before the call starts. ``embed_shape_batch``
@@ -3681,23 +3852,47 @@ def run_index_add_job(
     total = len(file_ids)
     ctx.set_total(total)
     ctx.set_phase("embedding")
-    ctx.set_summary(added=0, updated=0, failed=0, skipped=0)
+    ctx.set_summary(added=0, updated=0, failed=0, skipped=0, heavy_flagged=0)
     ctx.check_canceled()
+
+    store = get_index_job_store()
+    try:
+        artifacts = store.artifacts_dir(ctx.job_id)
+    except Exception:  # a job store that predates artefact directories
+        artifacts = JOBS_DIR / str(ctx.job_id)
 
     workers = num_workers if num_workers is not None else compute_auto_workers(total)
     limit = time_limit if time_limit is not None else embed_time_limit()
-    ctx.set_timings(num_workers=workers, time_limit=limit)
+    timings: dict[str, Any] = {"num_workers": workers, "time_limit": limit}
+    ctx.set_timings(**timings)
+
+    # Resolved once, so the report can name files rather than hashes.
+    path_by_fid: dict[str, str] = {}
+    for fid in file_ids:
+        try:
+            path_by_fid[fid] = str(find_persistent_CAD_file(fid).resolve())
+        except Exception:
+            continue
 
     t0 = time.perf_counter()
     result = add_to_index(
-        name, file_ids, model=model, num_workers=workers, time_limit=limit
+        name, file_ids, model=model, num_workers=workers, time_limit=limit,
+        log_dir=artifacts,
     )
-    embed_seconds = time.perf_counter() - t0
+    timings["embed_seconds"] = round(time.perf_counter() - t0, 3)
 
-    errors = list(result.get("errors") or [])
+    # too_heavy_files.log must be read now: the next embedding call overwrites it.
+    heavy_flagged = read_too_heavy_files(artifacts)
+    errors = annotate_failures(list(result.get("errors") or []))
+    for err in errors:
+        fid = str(err.get("file_id") or "")
+        if fid in path_by_fid:
+            err.setdefault("filename", path_by_fid[fid])
+
     added = int(result.get("added", 0))
     updated = int(result.get("updated", 0))
     index_count = int(result.get("index_count", 0))
+    retryable = sum(1 for e in errors if e.get("retryable"))
 
     # Accounting guard: every submitted file must be added, updated or reported
     # as failed. A silent shortfall means the SDK contract moved.
@@ -3708,14 +3903,37 @@ def run_index_add_job(
             "(added/updated/errors); some inputs were not reported",
             name, total, accounted,
         )
+    if retryable:
+        logger.info(
+            "[JOB] index '%s': %d of %d failure(s) are retryable; resubmit them "
+            "with a longer time_limit and fewer workers",
+            name, retryable, len(errors),
+        )
 
     ctx.add_errors(errors)
     ctx.advance(done=total, errors=len(errors))
+    ctx.set_progress(heavy=len(heavy_flagged))
     ctx.set_summary(
         added=added, updated=updated, failed=len(errors), skipped=0,
-        index_count=index_count,
+        index_count=index_count, heavy_flagged=len(heavy_flagged),
+        retryable=retryable,
     )
-    ctx.set_timings(embed_seconds=round(embed_seconds, 3))
+    ctx.set_timings(**timings)
+
+    failed_ids = {str(e.get("file_id") or "") for e in errors}
+    try:
+        _write_add_job_report(
+            artifacts / "report.txt",
+            name,
+            [path_by_fid.get(f, f) for f in file_ids if f not in failed_ids],
+            errors,
+            heavy_flagged,
+            timings,
+        )
+        ctx.set_summary(report=True)
+    except Exception as exc:  # a missing report must never fail a good job
+        logger.warning("[JOB] could not write report for job %s: %s", ctx.job_id, exc)
+
     ctx.set_phase("done")
 
 
@@ -4333,7 +4551,7 @@ def predict_context(
     the supplied rule configuration, calls ``infer()``, and converts the result
     to a JSON-serialisable dict.
 
-    This function is **stateless** — it performs no network I/O and holds no
+    This function is **stateless** 窶・it performs no network I/O and holds no
     reference to PLM/ERP systems.  The caller is responsible for populating
     *contexts* from whatever metadata store it has access to.
 
@@ -4405,7 +4623,7 @@ def predict_context(
         Parameters
         ----------
         contexts:
-            Part id → metadata dict.  Only ids present here are returned by
+            Part id 竊・metadata dict.  Only ids present here are returned by
             ``get_contexts``; unknown ids yield an empty dict.
         numeric_keys:
             Keys that ``ContextPredictor`` should treat as numeric.

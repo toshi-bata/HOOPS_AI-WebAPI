@@ -118,7 +118,7 @@ cp .env.example .env
 | `HOOPS_AI_CAD_SHARED_DIR` | optional | Location of the **CAD store** (default: `uploads/`). This directory holds the only copy of the payload behind every registered index and is never cleared by the server. |
 | `HOOPS_AI_OUT_TTL_HOURS` | optional | Age at which files under `out/` (viewer streams, result images, shape maps) are swept at startup (default `24`). `0` disables the sweep. |
 | `HOOPS_AI_EMBEDDINGS_CACHE_TTL_DAYS` | optional | Age at which cached embeddings under `embeddings_cache/` are swept at startup (default `0`, i.e. keep forever). Recomputing one entry costs a full CAD load. |
-| `HOOPS_AI_JOB_MAX_CONCURRENCY` | optional | How many registration jobs run at once (default `1`). Serialised because hoops_ai writes `error_summary.json` to the process working directory with no way to redirect it. |
+| `HOOPS_AI_JOB_MAX_CONCURRENCY` | optional | How many registration jobs run at once (default `1`). Serialised because every worker of every job loads the ~2 GB checkpoint, so concurrent jobs multiply peak memory and end up slower in total. |
 | `HOOPS_AI_JOB_TTL_DAYS` | optional | Retention of finished job records under `jobs/` (default `7`). `0` keeps them until the record cap evicts them. |
 | `HOOPS_AI_JOB_MAX_RECORDS` | optional | Hard cap on retained job records (default `1000`). |
 | `HOOPS_AI_MAX_WORKERS` | optional | Cap used **only when `workers` is omitted** (default `8`). Each worker is a spawned interpreter holding its own ~2 GB copy of the checkpoint, so peak RSS grows roughly linearly with this value. An explicit `workers` in the request is passed to the SDK unchanged. |
@@ -1330,10 +1330,11 @@ open for the whole run and gets no progress and no way to stop. For hundreds or
 thousands of files, use the job form instead.
 
 ```
-POST   /similarity/index/{name}/jobs/add       → 202 {"job_id": ...}
-GET    /similarity/index/{name}/jobs/{job_id}  → status + progress + summary
-GET    /similarity/index/{name}/jobs           → list, newest first (paginated)
-DELETE /similarity/index/{name}/jobs/{job_id}  → request cancellation
+POST   /similarity/index/{name}/jobs/add            → 202 {"job_id": ...}
+GET    /similarity/index/{name}/jobs/{job_id}       → status + progress + summary
+GET    /similarity/index/{name}/jobs/{job_id}/report → text/plain audit report
+GET    /similarity/index/{name}/jobs                → list, newest first (paginated)
+DELETE /similarity/index/{name}/jobs/{job_id}       → request cancellation
 ```
 
 Request body (supply at least one input):
@@ -1344,9 +1345,11 @@ Request body (supply at least one input):
 | `zip_file_id` | `file_id` of an uploaded ZIP archive, expanded server-side. |
 | `server_paths` | Paths on the server machine. Disabled by default; returns **403** unless `HOOPS_AI_ALLOW_SERVER_PATHS=true`. Administrator seeding only, since it reads any file the server process can read and bypasses the upload checks. |
 | `workers` | Parallel embedding workers. Omit to size automatically from CPU cores and free RAM. |
-| `time_limit` | Per-file embedding budget in seconds. Omit to use `HOOPS_AI_EMBED_TIME_LIMIT`, or the SDK's 120 s when that is unset. |
+| `time_limit` | Per-file embedding budget in seconds. Omit to use `HOOPS_AI_EMBED_TIME_LIMIT`, or the SDK's 120 s when that is unset. Files that exceed it come back with `retryable: true`. |
 
-Job records are JSON files under `jobs/`, so they survive a restart. Finished
+Job records are JSON files under `jobs/`, so they survive a restart. Each job
+also gets a `jobs/<job_id>/` directory holding its report and the SDK's
+`too_heavy_files.log`; it is deleted together with the record. Finished
 records are swept after `HOOPS_AI_JOB_TTL_DAYS` (default 7) and capped at
 `HOOPS_AI_JOB_MAX_RECORDS` (default 1000). Duplicate `file_id`s in one request
 are collapsed; every rejected input is reported in `errors` rather than dropped.
@@ -1354,10 +1357,11 @@ A job that was still `queued` or `running` when the server stopped is marked
 `failed` at the next startup — nothing resumes it, but everything it had already
 registered is kept, so resubmitting the remainder is safe.
 
-> **Jobs run one at a time by default.** hoops_ai writes `error_summary.json`
-> into the process working directory and offers no way to redirect it, so two
-> concurrent registration jobs would read each other's failure report. Raise
-> `HOOPS_AI_JOB_MAX_CONCURRENCY` only if you accept that.
+> **Jobs run one at a time by default.** Each job spawns its own pool of
+> embedding workers, every one of which loads the ~2 GB model checkpoint, so two
+> concurrent jobs multiply peak memory and push the SDK into its single-worker
+> RAM fallback — slower in total than running them one after the other. Raise
+> `HOOPS_AI_JOB_MAX_CONCURRENCY` only if you have the memory for it.
 
 > **Cancellation only takes effect before a job starts embedding.** The whole
 > input goes to a single `embed_shape_batch` call, which cannot be interrupted,
@@ -1387,16 +1391,36 @@ unchanged**; `HOOPS_AI_MAX_WORKERS` bounds only the automatic choice, which is
 
 `time_limit` — a file that exceeds the budget is dropped with `Timeout` and
 reported in `errors`. The default of 120 s is right for the many light files and
-too short for heavy assemblies, so the effective strategy is two jobs: one over
-everything at the default, then a second over just the timed-out `file_id`s with
-a much larger `time_limit` and a small `workers` (a single heavy file is not
-made faster by more workers; only across-file parallelism helps).
+too short for heavy assemblies, so registering a corpus is a **two-pass client
+loop**:
+
+1. Submit everything with many `workers` and the default `time_limit`.
+2. When the job finishes, collect the `file_id`s whose error carries
+   `retryable: true`, and submit those as a second job with a much larger
+   `time_limit` and a small `workers`.
+
+Each `errors` entry carries `detail` (the reason as hoops_ai reported it, taken
+from `batch.metadata["errors"]`) and `retryable`. A failure is retryable when it
+timed out, or when no reason could be determined at all — the safe direction,
+since a file that is merely slow gets its second chance. Everything else is a
+deterministic CAD error (`NoRootInModel`, a corrupt file, an unsupported entity)
+that will fail again however long the budget, so retrying it only wastes the
+budget.
+
+Use a small `workers` for the second job: a single heavy file is not made faster
+by more workers, only across-file parallelism helps, and heavy assemblies need
+far more memory per worker. `hoops_ai_native_bridge`'s front end sizes its heavy
+pass as `round(free RAM / 4 GB)`.
+
+The retry decision is deliberately the client's, not the server's: it controls
+the commit granularity, and one job stays one embedding pass.
 
 **Windows (PowerShell):**
 ```powershell
-$body = @{ file_ids = @("a3f8c2...", "b71e94...") } | ConvertTo-Json
+$body = @{ file_ids = @("a3f8c2...", "b71e94...") } | ConvertTo-Json -Compress
+$body | Set-Content -Path "$env:TEMP\add.json" -Encoding utf8
 $job = curl.exe -s -X POST "http://127.0.0.1:8000/similarity/index/my-parts/jobs/add" `
-  -H "Content-Type: application/json" -d $body | ConvertFrom-Json
+  -H "Content-Type: application/json" --data-binary "@$env:TEMP\add.json" | ConvertFrom-Json
 
 # Poll until the job settles
 do {
@@ -1404,18 +1428,37 @@ do {
   $s = curl.exe -s "http://127.0.0.1:8000/similarity/index/my-parts/jobs/$($job.job_id)" | ConvertFrom-Json
   "{0} {1}/{2} errors={3}" -f $s.status, $s.progress.done, $s.progress.total, $s.progress.errors
 } while ($s.status -in @("queued", "running"))
+
+# Pass 2: resubmit only what a longer budget can still save
+$retry = $s.errors | Where-Object { $_.retryable } | ForEach-Object { $_.file_id }
+if ($retry) {
+  @{ file_ids = [string[]]$retry; workers = 4; time_limit = 1200 } |
+    ConvertTo-Json -Compress | Set-Content -Path "$env:TEMP\retry.json" -Encoding utf8
+  curl.exe -s -X POST "http://127.0.0.1:8000/similarity/index/my-parts/jobs/add" `
+    -H "Content-Type: application/json" --data-binary "@$env:TEMP\retry.json"
+}
 ```
 
 **Response (status):**
 ```json
 {
   "job_id": "…", "kind": "index_add", "index_name": "my-parts", "status": "done",
-  "progress": {"phase": "done", "done": 240, "total": 240, "errors": 3},
-  "summary": {"added": 235, "updated": 2, "failed": 3, "skipped": 0, "index_count": 1042},
-  "errors": [{"file_id": "…", "detail": "Timeout"}],
-  "timings": {"embed_seconds": 812.4, "total_seconds": 815.1}
+  "progress": {"phase": "done", "done": 240, "total": 240, "errors": 3, "heavy": 5},
+  "summary": {"added": 235, "updated": 2, "failed": 3, "skipped": 0,
+              "index_count": 1042, "retryable": 2, "heavy_flagged": 5, "report": true},
+  "errors": [{"file_id": "…", "detail": "Timeout (CUMULATIVE)", "retryable": true}],
+  "timings": {"num_workers": 8, "time_limit": 0, "embed_seconds": 812.4},
+  "report_url": "/similarity/index/my-parts/jobs/…/report"
 }
 ```
+
+`heavy_flagged` counts the files hoops_ai deferred to its own single-worker RAM
+fallback. They are usually embedded successfully, just slowly — this is what
+tells you which parts made a run expensive.
+
+`report_url` appears once the job has written its report and serves a plain-text
+audit in three groups: `[ADDED]`, `[FAILED]` (each line marked `RETRYABLE` or
+`PERMANENT`, with the reason), and `[HEAVY-FLAGGED]`.
 
 `timings` is recorded so tuning decisions can be based on this server's own
 measurements rather than guesswork.

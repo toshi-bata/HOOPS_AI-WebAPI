@@ -14,6 +14,7 @@ from typing import Any, List, Optional
 import core
 import jobstore
 from fastapi import APIRouter, Body, HTTPException, Query
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
@@ -42,7 +43,8 @@ class IndexAddJobRequest(BaseModel):
         ge=1,
         description=(
             "Parallel embedding workers. Omit to size automatically from CPU "
-            "cores and free RAM (capped by HOOPS_AI_MAX_WORKERS, default 8)."
+            "cores and free RAM (capped by HOOPS_AI_MAX_WORKERS, default 8). "
+            "For a retry job over heavy assemblies, use a small number."
         ),
     )
     time_limit: Optional[int] = Field(
@@ -51,7 +53,8 @@ class IndexAddJobRequest(BaseModel):
         description=(
             "Per-file embedding budget in seconds. Omit to use "
             "HOOPS_AI_EMBED_TIME_LIMIT, or the SDK's own 120 s when that is "
-            "unset. Raise it to let heavy assemblies finish."
+            "unset. Files that exceed it are reported with retryable=true; "
+            "resubmit them as a second job with a longer budget."
         ),
     )
 
@@ -61,6 +64,7 @@ class JobProgress(BaseModel):
     done: int
     total: int
     errors: int
+    heavy: int = 0
 
 
 class JobAcceptedResponse(BaseModel):
@@ -101,6 +105,13 @@ def _public_job(record: dict) -> JobStatusResponse:
     record later without leaking into the API.
     """
     progress = record.get("progress") or {}
+    summary = record.get("summary") or {}
+    # Only advertise the report once the job has actually written one.
+    report_url = record.get("report_url")
+    if report_url is None and summary.get("report") and record.get("index_name"):
+        report_url = (
+            f"/similarity/index/{record['index_name']}/jobs/{record['job_id']}/report"
+        )
     return JobStatusResponse(
         job_id=record["job_id"],
         kind=record.get("kind", ""),
@@ -111,6 +122,7 @@ def _public_job(record: dict) -> JobStatusResponse:
             done=int(progress.get("done", 0)),
             total=int(progress.get("total", 0)),
             errors=int(progress.get("errors", 0)),
+            heavy=int(progress.get("heavy", 0)),
         ),
         summary=record.get("summary") or {},
         errors=record.get("errors") or [],
@@ -121,7 +133,7 @@ def _public_job(record: dict) -> JobStatusResponse:
         started_at=record.get("started_at"),
         finished_at=record.get("finished_at"),
         cancel_requested=bool(record.get("cancel_requested", False)),
-        report_url=record.get("report_url"),
+        report_url=report_url,
     )
 
 
@@ -222,6 +234,14 @@ def create_index_add_job(
     Poll ``GET /similarity/index/{name}/jobs/{job_id}`` for progress. Jobs run
     one at a time by default, so a job may sit in ``queued`` for a while.
 
+    One job is one embedding pass. To register a large corpus efficiently, run
+    the documented two-pass client loop: submit everything with many ``workers``
+    and a short ``time_limit``, then resubmit the failures whose ``retryable``
+    flag is true as a second job with few workers and a long ``time_limit``.
+    Failures that are not retryable are deterministic CAD errors and will never
+    succeed, however long the budget. When the job finishes, ``report_url``
+    points at a plain-text breakdown.
+
     **Cancellation only takes effect before a job starts embedding.** The whole
     input goes to one ``embed_shape_batch`` call, which cannot be interrupted,
     so cancelling a running job leaves it to finish. Split a large corpus into
@@ -317,6 +337,34 @@ def get_index_job(name: str, job_id: str):
     _validate_name_or_raise(name)
     record = _load_job_or_404(name, job_id)
     return _public_job(record)
+
+
+@router.get(
+    "/index/{name}/jobs/{job_id}/report",
+    response_class=PlainTextResponse,
+    responses={200: {"content": {"text/plain": {}}}},
+)
+def get_index_job_report(name: str, job_id: str):
+    """Return the job's registration report as plain text.
+
+    Three groups: files embedded into the index (ADDED), files that are not in
+    the index with their reason and whether they are worth resubmitting
+    (FAILED), and files hoops_ai deferred to its single-worker RAM fallback
+    (HEAVY-FLAGGED).
+
+    Returns 404 until the job has finished and written one.
+    """
+    _validate_name_or_raise(name)
+    _load_job_or_404(name, job_id)
+    try:
+        path = core.get_index_job_store().artifacts_dir(job_id) / "report.txt"
+        text = path.read_text(encoding="utf-8")
+    except (OSError, jobstore.JobNotFound) as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No report available for job '{job_id}'.",
+        ) from exc
+    return PlainTextResponse(text)
 
 
 @router.delete("/index/{name}/jobs/{job_id}", response_model=JobStatusResponse)
