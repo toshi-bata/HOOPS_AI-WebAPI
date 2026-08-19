@@ -10,6 +10,8 @@ Covers:
 Nothing here touches the SDK: add_to_index is replaced by a fake.
 """
 
+import io
+import json
 import os
 import pathlib
 import sys
@@ -282,6 +284,7 @@ class _FakeCtx:
         self.summary = {}
         self.timings = {}
         self.error_items = []
+        self.on_progress = None
         self._checks = 0
         self._cancel_after = cancel_after
 
@@ -294,7 +297,14 @@ class _FakeCtx:
         self.phases.append(phase)
 
     def set_progress(self, **fields):
+        # Mirrors JobContext.set_progress: absolute values merged in.
+        if self.on_progress is not None:
+            self.on_progress(**fields)
         self.heavy = fields.get("heavy", self.heavy)
+        self.done = fields.get("done", self.done)
+        self.errors = fields.get("errors", self.errors)
+        if "phase" in fields:
+            self.phases.append(fields["phase"])
 
     def set_total(self, total):
         self.total = total
@@ -341,10 +351,10 @@ class TestRunIndexAddJob(unittest.TestCase):
         core.read_too_heavy_files = self._orig_heavy
         self._tmp.cleanup()
 
-    def _fake(self, errors_for=(), detail="boom"):
+    def _fake(self, errors_for=(), detail="boom", progress=()):
         def add_to_index(
             name, file_ids, model=None, num_workers=None, time_limit=None,
-            log_dir=None,
+            log_dir=None, progress_cb=None,
         ):
             self.calls.append(
                 {
@@ -352,8 +362,11 @@ class TestRunIndexAddJob(unittest.TestCase):
                     "workers": num_workers,
                     "limit": time_limit,
                     "log_dir": log_dir,
+                    "progress_cb": progress_cb,
                 }
             )
+            for tick in progress:
+                progress_cb(*tick)
             errs = [{"file_id": f, "detail": detail} for f in file_ids if f in errors_for]
             return {
                 "name": name,
@@ -503,6 +516,48 @@ class TestFailureReporting(TestRunIndexAddJob):
         self.assertFalse(ctx.summary.get("report"))
 
 
+class TestLiveProgress(TestRunIndexAddJob):
+    """Counters parsed from the SDK's bar reach the job record while it runs."""
+
+    def test_the_sdk_call_receives_a_progress_callback(self):
+        self._fake()
+        core.run_index_add_job(_FakeCtx(), "idx", ["0", "1"])
+        self.assertIsNotNone(self.calls[0]["progress_cb"])
+
+    def test_counters_advance_before_the_batch_ends(self):
+        seen = []
+        self._fake(progress=[("embedding", 1, 2, 0, 0)])
+        ctx = _FakeCtx()
+        ctx.on_progress = lambda **f: seen.append(dict(f))
+        core.run_index_add_job(ctx, "idx", ["0", "1"])
+        self.assertIn({"done": 1, "errors": 0, "heavy": 0}, seen)
+
+    def test_the_final_count_is_absolute_not_incremental(self):
+        # The live callback already moved done/errors; the closing update must
+        # set them, not add to them.
+        self._fake(
+            errors_for={"1"},
+            progress=[("embedding", 1, 2, 0, 0), ("embedding", 2, 2, 1, 0)],
+        )
+        ctx = _FakeCtx()
+        core.run_index_add_job(ctx, "idx", ["0", "1"])
+        self.assertEqual((ctx.done, ctx.errors), (2, 1))
+
+    def test_the_heavy_fallback_is_surfaced_as_a_phase(self):
+        self._fake(progress=[("heavy", 1, 2, 0, 1)])
+        ctx = _FakeCtx()
+        core.run_index_add_job(ctx, "idx", ["0", "1"])
+        self.assertIn("heavy", ctx.phases)
+
+    def test_a_bar_total_never_overrides_the_submitted_count(self):
+        # The bar counts whatever the SDK iterates; progress.total stays the
+        # number of files the client submitted.
+        self._fake(progress=[("embedding", 1, 999, 0, 0)])
+        ctx = _FakeCtx()
+        core.run_index_add_job(ctx, "idx", ["0", "1"])
+        self.assertEqual(ctx.total, 2)
+
+
 class TestFailureClassification(unittest.TestCase):
     def test_a_timeout_is_retryable(self):
         out = core.annotate_failures(
@@ -538,8 +593,16 @@ class TestArtefactReaders(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.dir = pathlib.Path(self._tmp.name)
+        # Both readers fall back to the process working directory, so run from
+        # an empty one: a real error_summary.json left in the repo by a live
+        # server run must not leak into these assertions.
+        self._cwd = os.getcwd()
+        self._cwd_tmp = tempfile.TemporaryDirectory()
+        os.chdir(self._cwd_tmp.name)
 
     def tearDown(self):
+        os.chdir(self._cwd)
+        self._cwd_tmp.cleanup()
         self._tmp.cleanup()
 
     def test_a_missing_log_is_not_an_error(self):
@@ -550,6 +613,122 @@ class TestArtefactReaders(unittest.TestCase):
             "# Heavy Files (1 worker)\n\nC:/cad/big.stp\n", encoding="utf-8"
         )
         self.assertEqual(core.read_too_heavy_files(self.dir), ["C:/cad/big.stp"])
+
+    def _write_summary(self, payload):
+        (self.dir / "error_summary.json").write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
+
+    def test_error_summary_maps_each_path_to_its_reason(self):
+        self._write_summary(
+            [
+                {"item_index": 0, "item": "C:/cad/a.stp", "error": "Timeout (CUMULATIVE)"},
+                {"item_index": 1, "item": "C:/cad/b.stp", "error": "NoRootInModel"},
+            ]
+        )
+        reasons = core.read_error_summary_reasons(self.dir, newer_than=0)
+        self.assertEqual(reasons[core._norm_path_key("C:/cad/a.stp")], "Timeout (CUMULATIVE)")
+        self.assertEqual(reasons[core._norm_path_key("C:/cad/b.stp")], "NoRootInModel")
+
+    def test_error_summary_matches_across_slash_direction_and_case(self):
+        # The SDK writes its own spelling of the path; ours comes from pathlib.
+        self._write_summary([{"item": "C:\\CAD\\A.stp", "error": "boom"}])
+        reasons = core.read_error_summary_reasons(self.dir, newer_than=0)
+        self.assertEqual(reasons.get(core._norm_path_key("c:/cad/a.stp")), "boom")
+
+    def test_error_summary_keeps_only_the_first_reason_line(self):
+        self._write_summary([{"item": "C:/cad/a.stp", "error": "boom\nTraceback..."}])
+        reasons = core.read_error_summary_reasons(self.dir, newer_than=0)
+        self.assertEqual(reasons[core._norm_path_key("C:/cad/a.stp")], "boom")
+
+    def test_a_stale_error_summary_is_ignored(self):
+        # Written before this batch started, so it describes a previous run.
+        self._write_summary([{"item": "C:/cad/a.stp", "error": "boom"}])
+        self.assertEqual(
+            core.read_error_summary_reasons(self.dir, newer_than=time.time() + 3600), {}
+        )
+
+    def test_a_malformed_error_summary_is_not_fatal(self):
+        (self.dir / "error_summary.json").write_text("{not json", encoding="utf-8")
+        with self.assertLogs(core.logger, level="WARNING"):
+            reasons = core.read_error_summary_reasons(self.dir, newer_than=0)
+        self.assertEqual(reasons, {})
+
+
+class TestProgressShim(unittest.TestCase):
+    """The tqdm-parsing stderr shim ported from hoops_ai_native_bridge."""
+
+    _BAR = (
+        "Computing embeddings:  70%|####| 28/40 "
+        "[01:06<00:22,  1.84s/it, pool=1, errors=18, heavy=2]"
+    )
+
+    def test_a_bar_line_is_parsed_into_counters(self):
+        seen = []
+        with core.capture_embed_progress(lambda *a: seen.append(a)) as live:
+            self.assertTrue(live)
+            sys.stderr.write(self._BAR)
+        self.assertEqual(seen, [("embedding", 28, 40, 18, 2)])
+
+    def test_the_heavy_fallback_phase_is_recognised(self):
+        seen = []
+        with core.capture_embed_progress(lambda *a: seen.append(a)):
+            sys.stderr.write("Heavy Files (1 worker): 1/3 [00:10<00:20]")
+        self.assertEqual(seen[0][0], "heavy")
+
+    def test_a_repeated_bar_is_reported_once(self):
+        seen = []
+        with core.capture_embed_progress(lambda *a: seen.append(a)):
+            sys.stderr.write(self._BAR)
+            sys.stderr.write(self._BAR)
+        self.assertEqual(len(seen), 1)
+
+    def test_unrelated_output_is_not_parsed(self):
+        seen = []
+        with core.capture_embed_progress(lambda *a: seen.append(a)):
+            sys.stderr.write("INFO: loaded 3/4 modules\n")
+        self.assertEqual(seen, [])
+
+    def test_writes_are_mirrored_to_the_real_stderr(self):
+        real, buf = sys.stderr, io.StringIO()
+        sys.stderr = buf
+        try:
+            with core.capture_embed_progress(lambda *a: None):
+                sys.stderr.write(self._BAR)
+        finally:
+            sys.stderr = real
+        self.assertIn("28/40", buf.getvalue())
+
+    def test_it_claims_to_be_a_tty_so_tqdm_emits_updates(self):
+        with core.capture_embed_progress(lambda *a: None):
+            self.assertTrue(sys.stderr.isatty())
+
+    def test_a_failing_callback_never_breaks_the_run(self):
+        def boom(*_a):
+            raise RuntimeError("callback exploded")
+
+        with core.capture_embed_progress(boom):
+            sys.stderr.write(self._BAR)
+
+    def test_stderr_is_restored_even_on_an_exception(self):
+        real = sys.stderr
+        with self.assertRaises(ValueError):
+            with core.capture_embed_progress(lambda *a: None):
+                raise ValueError("boom")
+        self.assertIs(sys.stderr, real)
+
+    def test_without_a_callback_the_bar_stays_off(self):
+        real = sys.stderr
+        with core.capture_embed_progress(None) as live:
+            self.assertFalse(live)
+            self.assertIs(sys.stderr, real)
+
+    def test_a_second_concurrent_run_reports_nothing_rather_than_wrongly(self):
+        # sys.stderr is process-global; two runs would interleave into one bar.
+        with core.capture_embed_progress(lambda *a: None):
+            with self.assertLogs(core.logger, level="WARNING"):
+                with core.capture_embed_progress(lambda *a: None) as live:
+                    self.assertFalse(live)
 
 
 class TestWorkerSizing(unittest.TestCase):

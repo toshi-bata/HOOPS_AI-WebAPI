@@ -1369,6 +1369,27 @@ registered is kept, so resubmitting the remainder is safe.
 > several jobs to keep the commit and cancellation granularity under your
 > control.
 
+### Live progress
+
+`progress.done`, `progress.errors` and `progress.heavy` advance while the batch
+runs, so polling the job shows real movement rather than `0/N` until the end.
+The numbers come from hoops_ai's own tqdm bar: the server temporarily replaces
+`sys.stderr` with a shim that mirrors every write to the server log and parses
+the bar line, the same technique `hoops_ai_native_bridge` uses for its native
+callers. The shim reports `isatty() == True`, because tqdm only emits
+incremental updates when it believes it is writing to a terminal.
+`progress.phase` is `embedding` while the batch runs, `heavy` while the SDK
+works through the files it deferred to its single-worker RAM fallback, and
+`done` at the end.
+
+`progress.total` always stays the number of files you submitted, even if the
+bar counts something else.
+
+Because `sys.stderr` is process-global, only one job can be parsed at a time.
+Jobs are serialised by default, so this is normally moot; if you raise
+`HOOPS_AI_JOB_MAX_CONCURRENCY`, the extra jobs simply report no live progress
+(a warning is logged) rather than reporting each other's counters.
+
 > **One SDK call per job, deliberately.** Chunking a job into fixed-size batches
 > was measured to cost ~55-60 s per chunk, because every chunk builds a fresh
 > spawn-based worker pool in which each worker reloads the ~2 GB checkpoint. At
@@ -1399,13 +1420,19 @@ loop**:
    `retryable: true`, and submit those as a second job with a much larger
    `time_limit` and a small `workers`.
 
-Each `errors` entry carries `detail` (the reason as hoops_ai reported it, taken
-from `batch.metadata["errors"]`) and `retryable`. A failure is retryable when it
-timed out, or when no reason could be determined at all — the safe direction,
-since a file that is merely slow gets its second chance. Everything else is a
-deterministic CAD error (`NoRootInModel`, a corrupt file, an unsupported entity)
-that will fail again however long the budget, so retrying it only wastes the
-budget.
+Each `errors` entry carries `detail` (the reason as hoops_ai reported it) and
+`retryable`. A failure is retryable when it timed out, or when no reason could
+be determined at all — the safe direction, since a file that is merely slow gets
+its second chance. Everything else is a deterministic CAD error
+(`NoRootInModel`, a corrupt file, an unsupported entity) that will fail again
+however long the budget, so retrying it only wastes the budget.
+
+`detail` is taken from `batch.metadata["errors"]` where that names the file, and
+otherwise from the `error_summary.json` hoops_ai writes next to the running
+process, which lists each failed path with its reason. Both are needed: a
+parallel run that times out reports reasons with no path in them, and in
+completion rather than submission order, so only the summary file can attribute
+them. This is the same source `hoops_ai_native_bridge`'s front end reads.
 
 Use a small `workers` for the second job: a single heavy file is not made faster
 by more workers, only across-file parallelism helps, and heavy assemblies need
