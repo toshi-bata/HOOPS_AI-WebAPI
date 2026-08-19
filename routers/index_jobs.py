@@ -38,10 +38,21 @@ class IndexAddJobRequest(BaseModel):
         ),
     )
     workers: Optional[int] = Field(
-        None, description="Reserved for the two-pass strategy; ignored for now."
+        None,
+        ge=1,
+        description=(
+            "Parallel embedding workers. Omit to size automatically from CPU "
+            "cores and free RAM (capped by HOOPS_AI_MAX_WORKERS, default 8)."
+        ),
     )
     time_limit: Optional[int] = Field(
-        None, description="Reserved for the two-pass strategy; ignored for now."
+        None,
+        ge=1,
+        description=(
+            "Per-file embedding budget in seconds. Omit to use "
+            "HOOPS_AI_EMBED_TIME_LIMIT, or the SDK's own 120 s when that is "
+            "unset. Raise it to let heavy assemblies finish."
+        ),
     )
 
 
@@ -211,9 +222,11 @@ def create_index_add_job(
     Poll ``GET /similarity/index/{name}/jobs/{job_id}`` for progress. Jobs run
     one at a time by default, so a job may sit in ``queued`` for a while.
 
-    **Cancellation is only observed at batch boundaries.** The underlying
-    ``embed_shape_batch`` call cannot be interrupted, so a job stops after the
-    batch in flight completes (``HOOPS_AI_JOB_BATCH_SIZE`` files, default 100).
+    **Cancellation only takes effect before a job starts embedding.** The whole
+    input goes to one ``embed_shape_batch`` call, which cannot be interrupted,
+    so cancelling a running job leaves it to finish. Split a large corpus into
+    several jobs to keep both the commit granularity and the cancellation
+    granularity under your control.
     """
     _validate_name_or_raise(name)
     _require_writable_index(name)
@@ -249,7 +262,12 @@ def create_index_add_job(
     store = core.get_index_job_store()
     record = store.create(
         kind=core.JOB_KIND_INDEX_ADD,
-        params={"files": len(unique_ids), "duplicates_dropped": duplicates},
+        params={
+            "files": len(unique_ids),
+            "duplicates_dropped": duplicates,
+            "workers": payload.workers,
+            "time_limit": payload.time_limit,
+        },
         index_name=name,
     )
     if errors:
@@ -258,7 +276,13 @@ def create_index_add_job(
 
     store.submit(
         record["job_id"],
-        lambda ctx: core.run_index_add_job(ctx, name, unique_ids),
+        lambda ctx: core.run_index_add_job(
+            ctx,
+            name,
+            unique_ids,
+            num_workers=payload.workers,
+            time_limit=payload.time_limit,
+        ),
     )
     logger.info(
         "[JOB %s] queued: index '%s', %d file(s), %d rejected",

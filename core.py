@@ -461,10 +461,108 @@ def _embed_error_detail(
     return default
 
 
+# --- Embedding tuning: worker count and per-file time budget -----------------
+#
+# Ported from hoops_ai_native_bridge's ComputeAutoWorkers. Every worker is a
+# spawned interpreter holding its own copy of the ~2 GB checkpoint, so peak RSS
+# grows roughly linearly with the worker count while throughput reaches a
+# plateau and then declines once RAM-bound. Measured on the bridge: light
+# single-body parts plateau near the physical core count (12 was the peak on a
+# 14-core machine, 8..cores within +/-5%); heavy assemblies plateau lower (12
+# peaked on a 16-core machine, and 16/20/24 were each slower than 8). So aim at
+# the plateau rather than a single "best" value -- run-to-run noise exceeds the
+# difference between neighbouring counts.
+#
+# The default cap of 8 is a conservative floor chosen for an 8-core laptop with
+# heavy files. Raise HOOPS_AI_MAX_WORKERS on a large machine with light CAD.
+# The three variable names below are the ones hoops_ai and the bridge already
+# use, deliberately kept identical so one environment configures both.
+_MAX_WORKERS_DEFAULT = 8
+_MODEL_FOOTPRINT_MB_DEFAULT = 2048
+_MIN_FILES_PARALLEL_DEFAULT = 32
+_HOST_RAM_RESERVE_BYTES = 2 * 1024 * 1024 * 1024
+
+
+def compute_auto_workers(file_count: int) -> int:
+    """Choose a worker count for *file_count* files.
+
+    ``min(HOOPS_AI_MAX_WORKERS, logical_cpus / 2, usable_RAM / model_footprint)``,
+    or 1 when the batch is too small for spawn overhead to pay off. Half the
+    logical CPUs approximates the physical/performance cores and avoids E-core
+    and SMT oversubscription.
+
+    Deliberately never returns ``None`` (which would let the SDK auto-detect
+    across all logical cores): that oversubscribes RAM, and on this corpus a
+    20-worker run was ~2x slower per file than the bridge's 12.
+    """
+    max_workers = _env_int("HOOPS_AI_MAX_WORKERS", _MAX_WORKERS_DEFAULT, minimum=1)
+    model_mb = _env_int(
+        "HOOPS_AI_MODEL_FOOTPRINT_MB", _MODEL_FOOTPRINT_MB_DEFAULT, minimum=1
+    )
+    min_parallel = _env_int(
+        "HOOPS_AI_MIN_FILES_PARALLEL", _MIN_FILES_PARALLEL_DEFAULT, minimum=1
+    )
+    if file_count < min_parallel:
+        return 1
+
+    logical = os.cpu_count() or 2
+    core_cap = max(1, logical // 2)
+
+    ram_cap = max_workers
+    try:
+        import psutil
+
+        available = int(psutil.virtual_memory().available)
+        usable = max(0, available - _HOST_RAM_RESERVE_BYTES)
+        ram_cap = usable // (model_mb * 1024 * 1024)
+    except Exception:
+        # No psutil (or an unsupported platform): fall back to the core cap
+        # alone rather than guessing at memory.
+        logger.debug("[EMBED] RAM probe unavailable; sizing workers by cores only")
+
+    return max(1, min(max_workers, core_cap, ram_cap))
+
+
+def embed_time_limit() -> int:
+    """Per-file embedding budget in seconds, from HOOPS_AI_EMBED_TIME_LIMIT.
+
+    ``0`` (the default) leaves the SDK's own 120 s in place.
+    """
+    return _env_int("HOOPS_AI_EMBED_TIME_LIMIT", 0, minimum=0)
+
+
+def build_embed_specifications(
+    images_dir: "pathlib.Path", time_limit: Optional[int] = None
+) -> dict[str, Any]:
+    """Build the ``specifications`` dict for ``embed_shape_batch``.
+
+    All four time-limit keys are set to the same value. ``time_limit_overall``
+    is the one that governs the per-item "Timeout (CUMULATIVE)" that drops heavy
+    assemblies; setting only the size buckets leaves it at the 120 s default, so
+    a nominally longer pass would still be killed at 120 s. This was verified
+    empirically in hoops_ai_native_bridge, and a large per-item value does not
+    abort the whole batch.
+    """
+    specs: dict[str, Any] = {
+        "generate_images": True,
+        "images_out_dir": str(images_dir),
+    }
+    limit = time_limit if time_limit is not None else embed_time_limit()
+    if limit and limit > 0:
+        value = float(limit)
+        specs["time_limit_overall"] = value
+        specs["time_limit_small"] = value
+        specs["time_limit_medium"] = value
+        specs["time_limit_large"] = value
+    return specs
+
+
 def _embed_bodies_for_index(
     file_ids: list[str],
     index_name: str,
     model: str,
+    num_workers: Optional[int] = None,
+    time_limit: Optional[int] = None,
 ) -> tuple[list, list[dict[str, Any]]]:
     """Embed *file_ids* at body granularity and build one VectorRecord per body.
 
@@ -476,6 +574,9 @@ def _embed_bodies_for_index(
 
     Returns ``(records, errors)`` where *records* is a flat list of VectorRecord
     (multiple rows share the same file_id) and *errors* is a per-file error list.
+
+    *num_workers* and *time_limit* are forwarded to the SDK; ``None`` means
+    "decide here" (see ``compute_auto_workers`` and ``embed_time_limit``).
     """
     import json
     import shutil
@@ -532,11 +633,19 @@ def _embed_bodies_for_index(
 
     records: list = []
     try:
-        batch = embedder.embed_shape_batch(
-            ordered_paths,
-            show_progress=False,
-            specifications={"generate_images": True, "images_out_dir": str(tmp_images)},
+        specs = build_embed_specifications(tmp_images, time_limit)
+        workers = num_workers if num_workers is not None else compute_auto_workers(
+            len(ordered_paths)
         )
+        kwargs: dict[str, Any] = {"show_progress": False, "specifications": specs}
+        if workers and workers > 0:
+            kwargs["num_workers"] = int(workers)
+        logger.info(
+            "[EMBED] index '%s': %d file(s), num_workers=%s, time_limit=%s",
+            index_name, len(ordered_paths), kwargs.get("num_workers", "sdk-default"),
+            specs.get("time_limit_overall", "sdk-default"),
+        )
+        batch = embedder.embed_shape_batch(ordered_paths, **kwargs)
 
         ids = list(getattr(batch, "ids", []) or [])
         values = np.asarray(getattr(batch, "values", []), dtype=np.float32)
@@ -744,6 +853,8 @@ def add_to_index(
     name: str,
     file_ids: list[str],
     model: Optional[str] = None,
+    num_workers: Optional[int] = None,
+    time_limit: Optional[int] = None,
 ) -> dict[str, Any]:
     """Embed *file_ids* at body granularity and upsert one row per body.
 
@@ -753,6 +864,9 @@ def add_to_index(
 
     Raises ``SchemaVersionError`` for legacy (schema v1) indexes, which must be
     rebuilt before body-level writes are allowed.
+
+    *num_workers* and *time_limit* tune the SDK call; ``None`` keeps this
+    module's defaults. Existing callers that pass neither are unaffected.
 
     Returns ``added``, ``updated``, ``index_count``, and per-file ``errors``.
     ``added``/``updated`` count distinct files (not body rows).
@@ -775,7 +889,13 @@ def add_to_index(
                 f"before adding parts."
             )
 
-        records, errors = _embed_bodies_for_index(file_ids, name, effective_model)
+        records, errors = _embed_bodies_for_index(
+            file_ids,
+            name,
+            effective_model,
+            num_workers=num_workers,
+            time_limit=time_limit,
+        )
 
         existing_ids: set[str] = set(vs.get_ids())
         distinct_fids: list[str] = []
@@ -3409,7 +3529,6 @@ JOB_KIND_INDEX_ADD = "index_add"
 _JOB_MAX_CONCURRENCY_DEFAULT = 1
 _JOB_TTL_DAYS_DEFAULT = 7
 _JOB_MAX_RECORDS_DEFAULT = 1000
-_JOB_BATCH_SIZE_DEFAULT = 100
 
 _index_job_store: Any = None
 _index_job_store_lock = threading.Lock()
@@ -3436,16 +3555,6 @@ def job_ttl_seconds() -> int:
 def job_max_records() -> int:
     """Hard cap on retained job records, from HOOPS_AI_JOB_MAX_RECORDS."""
     return _env_int("HOOPS_AI_JOB_MAX_RECORDS", _JOB_MAX_RECORDS_DEFAULT, minimum=1)
-
-
-def job_batch_size() -> int:
-    """Files per ``add_to_index`` call inside a job, from HOOPS_AI_JOB_BATCH_SIZE.
-
-    A job splits its input into batches so that progress advances and a
-    cancellation request is observed without waiting for thousands of files.
-    Each batch commits the index, so a crash keeps everything already embedded.
-    """
-    return _env_int("HOOPS_AI_JOB_BATCH_SIZE", _JOB_BATCH_SIZE_DEFAULT, minimum=1)
 
 
 def server_paths_enabled() -> bool:
@@ -3514,57 +3623,65 @@ def run_index_add_job(
     name: str,
     file_ids: list[str],
     model: Optional[str] = None,
-    batch_size: Optional[int] = None,
+    num_workers: Optional[int] = None,
+    time_limit: Optional[int] = None,
 ) -> None:
-    """Job body: register *file_ids* into index *name*, in batches.
+    """Job body: register *file_ids* into index *name* in a single SDK call.
 
-    Progress is reported per batch. Cancellation is observed only at batch
-    boundaries: ``embed_shape_batch`` is a single blocking SDK call that cannot
-    be interrupted, so a request made mid-batch takes effect once that batch
-    finishes. Failures are recorded per file with the reason reported by the
-    SDK, never dropped.
+    The whole input goes to one ``embed_shape_batch``. Splitting it into
+    fixed-size chunks was measurably wrong: each call builds a fresh spawn-based
+    process pool whose every worker reloads the ~2 GB checkpoint, which cost
+    ~55-60 s per chunk (~30% of total runtime at 100 files per chunk). The SDK
+    is built for large batches, so parallelism and the per-file time budget are
+    the tuning knobs here, not chunk size.
+
+    Consequences, both accepted deliberately:
+      * Cancellation is only observed before the call starts. ``embed_shape_batch``
+        is a single blocking call that cannot be interrupted.
+      * A crash mid-job loses that job's work. Callers control the commit
+        granularity by splitting a large corpus across several jobs.
+
+    Failures are recorded per file with the reason reported by the SDK, never
+    dropped.
     """
     total = len(file_ids)
     ctx.set_total(total)
     ctx.set_phase("embedding")
     ctx.set_summary(added=0, updated=0, failed=0, skipped=0)
+    ctx.check_canceled()
 
-    size = batch_size if batch_size is not None else job_batch_size()
-    added = updated = failed = 0
-    embed_seconds = 0.0
-    index_count = 0
+    workers = num_workers if num_workers is not None else compute_auto_workers(total)
+    limit = time_limit if time_limit is not None else embed_time_limit()
+    ctx.set_timings(num_workers=workers, time_limit=limit)
 
-    for start in range(0, total, size):
-        ctx.check_canceled()
-        batch = file_ids[start:start + size]
-        t0 = time.perf_counter()
-        result = add_to_index(name, batch, model=model)
-        embed_seconds += time.perf_counter() - t0
+    t0 = time.perf_counter()
+    result = add_to_index(
+        name, file_ids, model=model, num_workers=workers, time_limit=limit
+    )
+    embed_seconds = time.perf_counter() - t0
 
-        errors = list(result.get("errors") or [])
-        added += int(result.get("added", 0))
-        updated += int(result.get("updated", 0))
-        failed += len(errors)
-        index_count = int(result.get("index_count", index_count))
+    errors = list(result.get("errors") or [])
+    added = int(result.get("added", 0))
+    updated = int(result.get("updated", 0))
+    index_count = int(result.get("index_count", 0))
 
-        # Accounting guard: every submitted file must be added, updated or
-        # reported as failed. A silent shortfall means the SDK contract moved.
-        accounted = int(result.get("added", 0)) + int(result.get("updated", 0)) + len(errors)
-        if accounted != len(batch):
-            logger.warning(
-                "[JOB] index '%s': batch of %d files accounted for only %d "
-                "(added/updated/errors); some inputs were not reported",
-                name, len(batch), accounted,
-            )
-
-        ctx.add_errors(errors)
-        ctx.advance(done=len(batch), errors=len(errors))
-        ctx.set_summary(
-            added=added, updated=updated, failed=failed, skipped=0,
-            index_count=index_count,
+    # Accounting guard: every submitted file must be added, updated or reported
+    # as failed. A silent shortfall means the SDK contract moved.
+    accounted = added + updated + len(errors)
+    if accounted != total:
+        logger.warning(
+            "[JOB] index '%s': %d files submitted but only %d accounted for "
+            "(added/updated/errors); some inputs were not reported",
+            name, total, accounted,
         )
-        ctx.set_timings(embed_seconds=round(embed_seconds, 3))
 
+    ctx.add_errors(errors)
+    ctx.advance(done=total, errors=len(errors))
+    ctx.set_summary(
+        added=added, updated=updated, failed=len(errors), skipped=0,
+        index_count=index_count,
+    )
+    ctx.set_timings(embed_seconds=round(embed_seconds, 3))
     ctx.set_phase("done")
 
 
