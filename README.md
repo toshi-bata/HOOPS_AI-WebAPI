@@ -121,9 +121,9 @@ cp .env.example .env
 | `HOOPS_AI_JOB_MAX_CONCURRENCY` | optional | How many registration jobs run at once (default `1`). Serialised because hoops_ai writes `error_summary.json` to the process working directory with no way to redirect it. |
 | `HOOPS_AI_JOB_TTL_DAYS` | optional | Retention of finished job records under `jobs/` (default `7`). `0` keeps them until the record cap evicts them. |
 | `HOOPS_AI_JOB_MAX_RECORDS` | optional | Hard cap on retained job records (default `1000`). |
-| `HOOPS_AI_MAX_WORKERS` | optional | Cap on parallel embedding workers (default `8`). Each worker is a spawned interpreter holding its own ~2 GB copy of the checkpoint, so peak RSS grows roughly linearly with this value. Raise it on a large machine with light CAD. |
-| `HOOPS_AI_MODEL_FOOTPRINT_MB` | optional | Assumed per-worker memory footprint used to bound the worker count by free RAM (default `2048`). |
-| `HOOPS_AI_MIN_FILES_PARALLEL` | optional | Below this many files a job runs with a single worker (default `32`), because spawning a pool costs ~55-60 s in checkpoint loads. |
+| `HOOPS_AI_MAX_WORKERS` | optional | Cap used **only when `workers` is omitted** (default `8`). Each worker is a spawned interpreter holding its own ~2 GB copy of the checkpoint, so peak RSS grows roughly linearly with this value. An explicit `workers` in the request is passed to the SDK unchanged. |
+| `HOOPS_AI_MODEL_FOOTPRINT_MB` | optional | Assumed per-worker memory footprint used to bound the automatic worker count by free RAM (default `2048`). |
+| `HOOPS_AI_MIN_FILES_PARALLEL` | optional | Force a single worker below this many files. Defaults to `1`, i.e. disabled: a file-count threshold ignores how heavy each file is, and a few heavy assemblies are faster on several workers. Set it if your corpus is uniformly light. |
 | `HOOPS_AI_EMBED_TIME_LIMIT` | optional | Per-file embedding budget in seconds. Unset (the default) leaves the SDK's own 120 s. Raise it to let heavy assemblies finish instead of failing with `Timeout`. |
 | `HOOPS_AI_ALLOW_SERVER_PATHS` | optional | Set to `true` to let jobs read CAD from `server_paths` on the server machine. Defaults to `false`: it reads any file the server process can read and bypasses the upload size and extension checks. |
 
@@ -1381,9 +1381,9 @@ declines once RAM-bound. Measured on `hoops_ai_native_bridge`: light single-body
 parts plateau near the physical core count, heavy assemblies plateau lower (on a
 16-core machine 12 was the peak, and 16/20/24 were each slower than 8). Aim for
 the plateau, not a single "best" value — run-to-run noise exceeds the difference
-between neighbouring counts. When omitted the server uses
-`min(HOOPS_AI_MAX_WORKERS, logical_cpus / 2, usable_RAM / HOOPS_AI_MODEL_FOOTPRINT_MB)`,
-or 1 when the job has fewer than `HOOPS_AI_MIN_FILES_PARALLEL` files.
+between neighbouring counts. **An explicit `workers` is sent to the SDK
+unchanged**; `HOOPS_AI_MAX_WORKERS` bounds only the automatic choice, which is
+`min(HOOPS_AI_MAX_WORKERS, logical_cpus / 2, usable_RAM / HOOPS_AI_MODEL_FOOTPRINT_MB, file_count)`.
 
 `time_limit` — a file that exceeds the budget is dropped with `Timeout` and
 reported in `errors`. The default of 120 s is right for the many light files and

@@ -477,19 +477,31 @@ def _embed_error_detail(
 # heavy files. Raise HOOPS_AI_MAX_WORKERS on a large machine with light CAD.
 # The three variable names below are the ones hoops_ai and the bridge already
 # use, deliberately kept identical so one environment configures both.
+#
+# HOOPS_AI_MIN_FILES_PARALLEL defaults to 1 here, i.e. disabled, unlike the
+# bridge's 32. That threshold judges by file count and ignores how much work
+# each file is: six heavy assemblies are measurably faster on three workers,
+# and forcing them onto one would be a large regression. Its stated rationale
+# -- that pool startup does not pay off for a few files -- is also weak, since
+# the ~55-60 s startup measured here was for a 20-worker pool and scales with
+# the worker count. Set it if your corpus is uniformly light.
 _MAX_WORKERS_DEFAULT = 8
 _MODEL_FOOTPRINT_MB_DEFAULT = 2048
-_MIN_FILES_PARALLEL_DEFAULT = 32
+_MIN_FILES_PARALLEL_DEFAULT = 1
 _HOST_RAM_RESERVE_BYTES = 2 * 1024 * 1024 * 1024
 
 
 def compute_auto_workers(file_count: int) -> int:
     """Choose a worker count for *file_count* files.
 
-    ``min(HOOPS_AI_MAX_WORKERS, logical_cpus / 2, usable_RAM / model_footprint)``,
-    or 1 when the batch is too small for spawn overhead to pay off. Half the
-    logical CPUs approximates the physical/performance cores and avoids E-core
-    and SMT oversubscription.
+    ``min(HOOPS_AI_MAX_WORKERS, logical_cpus / 2, usable_RAM / model_footprint,
+    file_count)``. Half the logical CPUs approximates the physical/performance
+    cores and avoids E-core and SMT oversubscription; never exceeding the file
+    count keeps idle workers from paying the checkpoint load for nothing.
+
+    This is only consulted when the caller passes no explicit worker count. An
+    explicit value is forwarded to the SDK unchanged, cap included -- the caps
+    here exist to pick a safe default, not to overrule a deliberate choice.
 
     Deliberately never returns ``None`` (which would let the SDK auto-detect
     across all logical cores): that oversubscribes RAM, and on this corpus a
@@ -520,7 +532,7 @@ def compute_auto_workers(file_count: int) -> int:
         # alone rather than guessing at memory.
         logger.debug("[EMBED] RAM probe unavailable; sizing workers by cores only")
 
-    return max(1, min(max_workers, core_cap, ram_cap))
+    return max(1, min(max_workers, core_cap, ram_cap, max(1, file_count)))
 
 
 def embed_time_limit() -> int:

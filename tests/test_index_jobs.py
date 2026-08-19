@@ -380,6 +380,12 @@ class TestRunIndexAddJob(unittest.TestCase):
         self.assertEqual(self.calls[0]["workers"], 3)
         self.assertEqual(self.calls[0]["limit"], 900)
 
+    def test_explicit_tuning_is_not_clamped_by_the_cap(self):
+        # The cap picks a safe default; it must not overrule a deliberate choice.
+        self._fake()
+        core.run_index_add_job(_FakeCtx(), "idx", ["a"], num_workers=12)
+        self.assertEqual(self.calls[0]["workers"], 12)
+
     def test_workers_are_sized_automatically_when_unset(self):
         self._fake()
         core.run_index_add_job(_FakeCtx(), "idx", ["a"])
@@ -419,14 +425,20 @@ class TestWorkerSizing(unittest.TestCase):
             else:
                 os.environ[k] = v
 
-    def test_small_batches_run_sequentially(self):
-        # Spawning workers costs ~55-60 s in checkpoint loads; it cannot pay off
-        # for a handful of files.
+    def test_small_batches_are_still_parallel(self):
+        # A file-count threshold judges by count, not by work: a handful of
+        # heavy assemblies is measurably faster on several workers. Only the
+        # file count itself bounds the pool, so no worker sits idle.
         self.assertEqual(core.compute_auto_workers(1), 1)
+        self.assertGreaterEqual(core.compute_auto_workers(6), 1)
 
-    def test_min_files_parallel_is_overridable(self):
-        os.environ["HOOPS_AI_MIN_FILES_PARALLEL"] = "2"
-        self.assertGreaterEqual(core.compute_auto_workers(4), 1)
+    def test_workers_never_exceed_the_file_count(self):
+        os.environ["HOOPS_AI_MAX_WORKERS"] = "16"
+        self.assertLessEqual(core.compute_auto_workers(3), 3)
+
+    def test_min_files_parallel_still_forces_sequential_when_set(self):
+        os.environ["HOOPS_AI_MIN_FILES_PARALLEL"] = "32"
+        self.assertEqual(core.compute_auto_workers(10), 1)
 
     def test_auto_workers_never_exceeds_the_cap(self):
         os.environ["HOOPS_AI_MAX_WORKERS"] = "2"
