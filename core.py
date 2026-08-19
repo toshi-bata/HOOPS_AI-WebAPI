@@ -577,9 +577,10 @@ def read_too_heavy_files(
     made the run expensive.
 
     *directory* is the pass's ``log_dir``. The process working directory is
-    tried as well, because ``log_dir`` support was established by inspecting the
-    compiled SDK rather than from documentation; if it is ever ignored, the file
-    still lands in the CWD and is still found.
+    tried as well: ``log_dir`` defaults to ``'.'``, so should a release ever stop
+    honouring it, the file still lands in the CWD and is still found. That
+    fallback is also what makes an empty result trustworthy -- a run reporting no
+    heavy files has been checked in both places, not just the redirected one.
     """
     candidates: list[pathlib.Path] = []
     if directory is not None:
@@ -708,9 +709,10 @@ def build_embed_specifications(
     }
     if log_dir is not None:
         # Sends too_heavy_files.log to a per-pass directory so pass 2 does not
-        # overwrite pass 1's list. Established by inspecting the compiled SDK
-        # (ParallelExecutor.write_too_heavy_log), not from documentation, so
-        # readers must tolerate the file landing in the CWD instead.
+        # overwrite pass 1's list. 'log_dir' is a documented specification key
+        # (hoops_ai 1.1.0, HOOPSEmbeddings._embed_shape_batch_parallel, default
+        # '.'). Its effect is still unverified live: every run so far flagged no
+        # heavy files at all, so readers keep the CWD fallback.
         specs["log_dir"] = str(log_dir)
     limit = time_limit if time_limit is not None else embed_time_limit()
     if limit and limit > 0:
@@ -3883,9 +3885,9 @@ def job_max_concurrency() -> int:
       ``sys.stderr``; a second job reports nothing rather than the wrong thing.
 
     ``too_heavy_files.log`` is kept apart per job via
-    ``specifications['log_dir']``, but that redirection was established by
-    inspecting the compiled SDK rather than from documentation, so concurrency
-    would rest on it holding.
+    ``specifications['log_dir']`` -- a documented key (hoops_ai 1.1.0,
+    HOOPSEmbeddings._embed_shape_batch_parallel) whose effect is nonetheless
+    still unverified live, so concurrency would rest on it holding.
     """
     return _env_int("HOOPS_AI_JOB_MAX_CONCURRENCY", _JOB_MAX_CONCURRENCY_DEFAULT, minimum=1)
 
