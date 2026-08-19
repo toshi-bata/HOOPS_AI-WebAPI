@@ -174,6 +174,20 @@ HOOPS_AI_PART_CLASS_FLOW_NAME=ETL_Fabwave_training_b2
 
 ### 4. Start the server
 
+> **Run manual `curl` calls from a directory outside the repository.** A POST
+> body has to be written to a file on Windows, and the shell starts in the
+> repository root, so those scratch files land next to the source and get
+> committed by an unguarded `git add -A`. This repository is public and a
+> commit cannot be removed from its history — a request body holding a license
+> key, a token or a customer path would be there permanently. `.gitignore`
+> covers the common names (`/t.json`, `/*.tmp.json`, `/scratch/`) as a backstop,
+> but the habit is the actual defence:
+>
+> ```powershell
+> New-Item -ItemType Directory -Force "$env:USERPROFILE\hoops-scratch" | Out-Null
+> Set-Location "$env:USERPROFILE\hoops-scratch"
+> ```
+
 Run the following command from the repository root, using the Python executable from your HOOPS AI virtual environment.
 
 **Windows:**

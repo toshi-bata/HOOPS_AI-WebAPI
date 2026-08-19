@@ -23,3 +23,16 @@ poc_searcher_coldstart.py
 
 # Throwaway probe: decides whether index tags can live in record metadata
 poc_tag_metadata.py
+
+# Scratch files from manual curl sessions, which land in the repository root
+# because that is where the shell starts. Anchored with a leading slash so the
+# real indexes/<name>/tags.json is never matched. A license key pasted into one
+# of these and committed cannot be removed from a public repository's history,
+# so prefer a working directory outside the repository entirely.
+/t.json
+/tags.json
+/body.json
+/payload.json
+/*.tmp.json
+/curl-*.json
+/scratch/
