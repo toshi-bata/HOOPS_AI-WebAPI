@@ -118,7 +118,7 @@ cp .env.example .env
 | `HOOPS_AI_CAD_SHARED_DIR` | optional | Location of the **CAD store** (default: `uploads/`). This directory holds the only copy of the payload behind every registered index and is never cleared by the server. |
 | `HOOPS_AI_OUT_TTL_HOURS` | optional | Age at which files under `out/` (viewer streams, result images, shape maps) are swept at startup (default `24`). `0` disables the sweep. |
 | `HOOPS_AI_EMBEDDINGS_CACHE_TTL_DAYS` | optional | Age at which cached embeddings under `embeddings_cache/` are swept at startup (default `0`, i.e. keep forever). Recomputing one entry costs a full CAD load. |
-| `HOOPS_AI_JOB_MAX_CONCURRENCY` | optional | How many registration jobs run at once (default `1`). Serialised because every worker of every job loads the ~2 GB checkpoint, so concurrent jobs multiply peak memory and end up slower in total. |
+| `HOOPS_AI_JOB_MAX_CONCURRENCY` | optional | How many registration jobs run at once (default `1`). Serialised because of worker memory, because hoops_ai's `error_summary.json` is per-process, and because the live-progress shim replaces the process-wide `sys.stderr`. |
 | `HOOPS_AI_JOB_TTL_DAYS` | optional | Retention of finished job records under `jobs/` (default `7`). `0` keeps them until the record cap evicts them. |
 | `HOOPS_AI_JOB_MAX_RECORDS` | optional | Hard cap on retained job records (default `1000`). |
 | `HOOPS_AI_MAX_WORKERS` | optional | Cap used **only when `workers` is omitted** (default `8`). Each worker is a spawned interpreter holding its own ~2 GB copy of the checkpoint, so peak RSS grows roughly linearly with this value. An explicit `workers` in the request is passed to the SDK unchanged. |
@@ -1357,11 +1357,13 @@ A job that was still `queued` or `running` when the server stopped is marked
 `failed` at the next startup — nothing resumes it, but everything it had already
 registered is kept, so resubmitting the remainder is safe.
 
-> **Jobs run one at a time by default.** Each job spawns its own pool of
-> embedding workers, every one of which loads the ~2 GB model checkpoint, so two
-> concurrent jobs multiply peak memory and push the SDK into its single-worker
-> RAM fallback — slower in total than running them one after the other. Raise
-> `HOOPS_AI_JOB_MAX_CONCURRENCY` only if you have the memory for it.
+> **Jobs run one at a time by default.** Three reasons: each job spawns its own
+> pool of embedding workers, every one of which loads the ~2 GB model
+> checkpoint, so concurrent jobs multiply peak memory and end up slower in
+> total; hoops_ai writes `error_summary.json` to the process working directory
+> with no way to redirect it, so concurrent jobs would read each other's failure
+> reasons; and the live-progress shim replaces the process-wide `sys.stderr`.
+> Raise `HOOPS_AI_JOB_MAX_CONCURRENCY` only if you accept those.
 
 > **Cancellation only takes effect before a job starts embedding.** The whole
 > input goes to a single `embed_shape_batch` call, which cannot be interrupted,

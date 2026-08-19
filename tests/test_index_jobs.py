@@ -836,8 +836,8 @@ class TestJobSettings(unittest.TestCase):
                 os.environ[k] = v
 
     def test_jobs_are_serialised_by_default(self):
-        # Every worker of every job loads the ~2 GB checkpoint, so concurrent
-        # jobs multiply peak memory and end up slower in total.
+        # Worker memory, the per-process error_summary.json, and the
+        # process-wide stderr shim all break under concurrency.
         self.assertEqual(core.job_max_concurrency(), 1)
 
     def test_concurrency_is_overridable(self):

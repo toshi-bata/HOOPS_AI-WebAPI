@@ -577,9 +577,10 @@ def read_too_heavy_files(
     made the run expensive.
 
     *directory* is the pass's ``log_dir``. The process working directory is
-    tried as well, because ``log_dir`` support was established by inspecting the
-    compiled SDK rather than from documentation; if it is ever ignored, the file
-    still lands in the CWD and is still found.
+    tried as well: ``log_dir`` defaults to ``'.'``, so should a release ever stop
+    honouring it, the file still lands in the CWD and is still found. That
+    fallback is also what makes an empty result trustworthy -- a run reporting no
+    heavy files has been checked in both places, not just the redirected one.
     """
     candidates: list[pathlib.Path] = []
     if directory is not None:
@@ -708,9 +709,10 @@ def build_embed_specifications(
     }
     if log_dir is not None:
         # Sends too_heavy_files.log to a per-pass directory so pass 2 does not
-        # overwrite pass 1's list. Established by inspecting the compiled SDK
-        # (ParallelExecutor.write_too_heavy_log), not from documentation, so
-        # readers must tolerate the file landing in the CWD instead.
+        # overwrite pass 1's list. 'log_dir' is a documented specification key
+        # (hoops_ai 1.1.0, HOOPSEmbeddings._embed_shape_batch_parallel, default
+        # '.'). Its effect is still unverified live: every run so far flagged no
+        # heavy files at all, so readers keep the CWD fallback.
         specs["log_dir"] = str(log_dir)
     limit = time_limit if time_limit is not None else embed_time_limit()
     if limit and limit > 0:
@@ -3866,14 +3868,26 @@ _index_job_store_lock = threading.Lock()
 def job_max_concurrency() -> int:
     """How many jobs may run at once, from HOOPS_AI_JOB_MAX_CONCURRENCY.
 
-    Defaults to 1, i.e. registration jobs are serialised across all indexes.
-    Each job spawns its own pool of embedding workers, every one of which loads
-    the ~2 GB model checkpoint, so two concurrent jobs multiply peak memory and
-    push the SDK into its single-worker RAM fallback -- slower in total than
-    running them one after the other. hoops_ai also writes ``too_heavy_files.log``
-    next to its work; ``specifications['log_dir']`` keeps each job's copy apart,
-    but that redirection was established by inspecting the compiled SDK rather
-    than from documentation, so concurrency would rest on it holding.
+    Defaults to 1, i.e. registration jobs are serialised across all indexes, for
+    three reasons:
+
+    * Memory. Each job spawns its own pool of embedding workers, every one of
+      which loads the ~2 GB model checkpoint, so two concurrent jobs multiply
+      peak memory and push the SDK into its single-worker RAM fallback --
+      slower in total than running them one after the other.
+    * ``error_summary.json``. hoops_ai writes it to the process working
+      directory and overwrites it on every ``embed_shape_batch`` call, with no
+      way to redirect it (it logs ``Undefined flowdir ... Using path [.]``), so
+      concurrent jobs would read each other's failure reasons. The mtime guard
+      in :func:`read_error_summary_reasons` catches a stale file, not a
+      concurrent one.
+    * Live progress. :func:`capture_embed_progress` replaces the process-wide
+      ``sys.stderr``; a second job reports nothing rather than the wrong thing.
+
+    ``too_heavy_files.log`` is kept apart per job via
+    ``specifications['log_dir']`` -- a documented key (hoops_ai 1.1.0,
+    HOOPSEmbeddings._embed_shape_batch_parallel) whose effect is nonetheless
+    still unverified live, so concurrency would rest on it holding.
     """
     return _env_int("HOOPS_AI_JOB_MAX_CONCURRENCY", _JOB_MAX_CONCURRENCY_DEFAULT, minimum=1)
 
