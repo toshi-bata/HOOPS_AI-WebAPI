@@ -521,18 +521,40 @@ def compute_auto_workers(file_count: int) -> int:
     core_cap = max(1, logical // 2)
 
     ram_cap = max_workers
+    ram_bound = False
+    available_gb = None
     try:
         import psutil
 
         available = int(psutil.virtual_memory().available)
+        available_gb = available / (1024 ** 3)
         usable = max(0, available - _HOST_RAM_RESERVE_BYTES)
         ram_cap = usable // (model_mb * 1024 * 1024)
+        ram_bound = True
     except Exception:
         # No psutil (or an unsupported platform): fall back to the core cap
         # alone rather than guessing at memory.
         logger.debug("[EMBED] RAM probe unavailable; sizing workers by cores only")
 
-    return max(1, min(max_workers, core_cap, ram_cap, max(1, file_count)))
+    chosen = max(1, min(max_workers, core_cap, ram_cap, max(1, file_count)))
+
+    # Free RAM is sampled at job start and fluctuates -- a preceding job's
+    # workers may not have been reclaimed yet -- so a surprisingly low count
+    # must be explainable from the log rather than looking arbitrary.
+    logger.info(
+        "[EMBED] auto workers=%d (cap=%d, cores=%d, ram=%s, files=%d)",
+        chosen, max_workers, core_cap, ram_cap if ram_bound else "n/a", file_count,
+    )
+    if ram_bound and ram_cap <= 1 and min(max_workers, core_cap, file_count) > 1:
+        logger.warning(
+            "[EMBED] falling back to sequential embedding: only %.1f GB free, "
+            "and each worker needs %d MB on top of a %.1f GB host reserve. "
+            "Cores would allow %d. Wait for the previous job's workers to be "
+            "reclaimed, or pass an explicit 'workers' to override.",
+            available_gb, model_mb, _HOST_RAM_RESERVE_BYTES / (1024 ** 3),
+            min(max_workers, core_cap),
+        )
+    return chosen
 
 
 def embed_time_limit() -> int:
